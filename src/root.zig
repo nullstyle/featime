@@ -61,6 +61,7 @@ const std = @import("std");
 
 pub const timeline = @import("timeline.zig");
 pub const rebuild = @import("rebuild.zig");
+pub const persistence = @import("persistence.zig");
 
 pub const Timeline = timeline.Timeline;
 
@@ -191,4 +192,5 @@ pub fn validateDomain(comptime Domain: type) void {
 test {
     _ = timeline;
     _ = rebuild;
+    _ = persistence;
 }
