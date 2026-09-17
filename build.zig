@@ -133,12 +133,24 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Differential tests: the cached timeline vs a naive replay model.
+    const oracle_mod = b.createModule(.{
+        .root_source_file = b.path("tests/oracle.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "featuretree_zig", .module = mod },
+        },
+    });
+    const oracle_tests = b.addTest(.{ .root_module = oracle_mod });
+    const run_oracle_tests = b.addRunArtifact(oracle_tests);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_oracle_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

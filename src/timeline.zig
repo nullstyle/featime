@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const ft = @import("root.zig");
+const checkpoint = @import("checkpoint.zig");
 
 /// Mixes into feature-id salts so separately created timelines (including in
 /// different processes / peers) are unlikely to assign colliding ids.
@@ -30,23 +31,23 @@ pub fn Timeline(comptime Domain: type) type {
 
         /// Pristine seed document (position 0, before any feature).
         seed_doc: Doc,
-        /// The visible document. Reflects `built_pos` features as of
-        /// `built_version` (see `dirty`), or the last good state if broken.
+        /// The visible document: the seed with `features[0..built_pos]`
+        /// applied (when `!live_stale and broken == null`), or the last good
+        /// state if a rebuild is pending or failed.
         live_doc: Doc,
 
         /// Marker position: the document is the state after applying
         /// `features[0..marker]`. This is Fusion's timeline marker.
         marker_pos: u32 = 0,
 
-        /// Bumped on every structural change (commit/edit/remove/suppress/
-        /// reorder). Cached state records the version it was built at.
-        version: u64 = 0,
-        built_version: u64 = 0,
-        /// Number of features applied to `live_doc` when `built_version` was
-        /// current. While `broken == null` and versions match, a forward move
-        /// of the marker can extend this incrementally; anything else
-        /// rebuilds from a checkpoint or the seed.
+        /// Number of features applied to `live_doc`. While `!live_stale`,
+        /// moving the marker forward can extend this incrementally.
         built_pos: u32 = 0,
+
+        /// True when a structural change touched a feature below `built_pos`:
+        /// the old suffix effects are baked into `live_doc` and it cannot be
+        /// extended; a checkpoint/seed rebuild is required.
+        live_stale: bool = false,
 
         /// Set when a rebuild aborted with a hard error. The live document
         /// may be mid-mutation and untrusted; the next rebuild attempt starts
@@ -54,6 +55,9 @@ pub fn Timeline(comptime Domain: type) type {
         broken: ?anyerror = null,
 
         next_id: ft.FeatureId,
+
+        /// Document checkpoint cache (internal).
+        cps: checkpoint.Checkpoints(Domain),
 
         // ------------------------------------------------------------------
         // Lifecycle
@@ -70,6 +74,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .seed_doc = seed_doc,
                 .live_doc = live,
                 .next_id = prng.random().int(ft.FeatureId) | 1,
+                .cps = checkpoint.Checkpoints(Domain).init(gpa, config.max_checkpoints),
             };
         }
 
@@ -81,6 +86,7 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn deinit(self: *Self) void {
             self.resetStatuses(0);
             self.list.deinit(self.gpa);
+            self.cps.deinit();
             Domain.deinitDoc(&self.seed_doc, self.gpa);
             Domain.deinitDoc(&self.live_doc, self.gpa);
         }
@@ -101,17 +107,23 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         /// Move the marker (clamped to `[0, len]`). Rebuilding happens lazily
-        /// on the next `state()`.
+        /// on the next `state()`. When leaving a clean position, the current
+        /// state is snapshotted so scrubbing back to it costs nothing.
         pub fn setMarker(self: *Self, pos: u32) void {
-            self.marker_pos = @min(pos, self.list.items.len);
+            const target = @min(pos, self.list.items.len);
+            if (target == self.marker_pos) return;
+            if (self.config.checkpoint_on_scrub and !self.dirty()) {
+                self.cps.add(self.marker_pos, &self.live_doc, self.list.items);
+            }
+            self.marker_pos = target;
         }
 
         /// True when the visible document does not reflect `features[0..marker]`
-        /// at the current version — i.e. `state()` has rebuild work to do.
-        /// Also true while broken, so a broken timeline keeps retrying.
+        /// — i.e. `state()` has rebuild work to do. Also true while broken,
+        /// so a broken timeline keeps retrying.
         pub fn dirty(self: *const Self) bool {
             return self.broken != null or
-                self.built_version != self.version or
+                self.live_stale or
                 self.built_pos != self.marker_pos;
         }
 
@@ -140,17 +152,17 @@ pub fn Timeline(comptime Domain: type) type {
             const at = self.marker_pos;
 
             try self.list.insert(self.gpa, at, .{ .id = id, .op = op });
+            self.cps.noteMutation(at);
 
             // The inserted feature is `.pending` by default and the shifted
             // features now sit at/after the advanced marker; their old
             // statuses are meaningless. Free any failure messages they held.
             self.resetStatuses(at + 1);
 
-            const prev_version = self.version;
-            self.version += 1;
             self.marker_pos = at + 1;
+            if (at < self.built_pos) self.live_stale = true;
 
-            if (self.broken == null and self.built_version == prev_version and self.built_pos == at) {
+            if (self.broken == null and !self.live_stale and self.built_pos == at) {
                 var applied: u32 = at;
                 ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.gpa, &applied) catch |err| {
                     // Hard failure: features before `at` are still good on the
@@ -160,9 +172,28 @@ pub fn Timeline(comptime Domain: type) type {
                     return id;
                 };
                 self.built_pos = at + 1;
-                self.built_version = self.version;
             }
             return id;
+        }
+
+        /// Replace a feature's parameters (Fusion's "edit feature"). The
+        /// feature keeps its id and position; the document recomputes lazily
+        /// from the nearest surviving checkpoint. No-op if absent.
+        pub fn edit(self: *Self, id: ft.FeatureId, new_op: Op) void {
+            const idx = self.indexOf(id) orelse return;
+            self.list.items[idx].op = new_op;
+            self.invalidate(idx);
+        }
+
+        /// Remove a feature from the timeline. The marker adjusts so the
+        /// visible document stays consistent. No-op if absent.
+        pub fn remove(self: *Self, id: ft.FeatureId) void {
+            const idx = self.indexOf(id) orelse return;
+            // The shifted features' statuses refer to the old document.
+            self.resetStatuses(idx);
+            _ = self.list.orderedRemove(idx);
+            if (idx < self.marker_pos) self.marker_pos -= 1;
+            self.invalidate(idx);
         }
 
         /// Suppress or unsuppress a feature. A suppressed feature stays on
@@ -172,7 +203,17 @@ pub fn Timeline(comptime Domain: type) type {
             const idx = self.indexOf(id) orelse return;
             if (self.list.items[idx].suppressed == suppressed) return;
             self.list.items[idx].suppressed = suppressed;
-            self.version += 1;
+            self.invalidate(idx);
+        }
+
+        /// Shared tail for structural mutations at `idx`: statuses from `idx`
+        /// on are stale, checkpoints past `idx` are invalid, and the live
+        /// document is stale if the mutation sits below the applied region
+        /// (its old suffix effects are baked in and cannot be un-applied).
+        fn invalidate(self: *Self, idx: u32) void {
+            self.resetStatuses(idx);
+            self.cps.noteMutation(idx);
+            if (idx < self.built_pos) self.live_stale = true;
         }
 
         // ------------------------------------------------------------------
@@ -232,12 +273,25 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         fn ensureRebuilt(self: *Self) void {
-            if (self.broken == null and self.built_version == self.version and self.built_pos == self.marker_pos)
-                return; // clean
+            if (!self.dirty()) return; // clean
 
-            if (self.broken == null and self.built_version == self.version and self.built_pos < self.marker_pos) {
-                // Incremental forward pass on the live document: the prefix
-                // is valid, just apply the new suffix.
+            // 1. Exact checkpoint restore — the slider fast path. Scrubbing
+            //    back to a snapshotted position costs zero applies.
+            if (self.cps.takeExact(self.marker_pos)) |taken| {
+                Domain.deinitDoc(&self.live_doc, self.gpa);
+                self.live_doc = taken.doc;
+                self.resetStatuses(0);
+                for (taken.statuses, 0..) |s, i| self.list.items[i].status = s;
+                self.gpa.free(taken.statuses);
+                self.built_pos = self.marker_pos;
+                self.live_stale = false;
+                self.broken = null;
+                return;
+            }
+
+            // 2. Incremental forward pass on the live document: the prefix
+            //    is valid, just apply the new suffix.
+            if (self.broken == null and !self.live_stale and self.built_pos < self.marker_pos) {
                 self.resetStatuses(self.built_pos);
                 var applied: u32 = self.built_pos;
                 ft.rebuild.applyRange(Domain, self.list.items, self.built_pos, self.marker_pos, &self.live_doc, self.gpa, &applied) catch |err| {
@@ -249,23 +303,44 @@ pub fn Timeline(comptime Domain: type) type {
                 return;
             }
 
-            // Full rebuild into a scratch document so a hard failure leaves
-            // the live document (last good state) untouched.
-            var scratch = Domain.cloneDoc(&self.seed_doc, self.gpa) catch |err| {
+            // 3. Rebuild into a scratch document from the best checkpoint (or
+            //    the seed), so a hard failure leaves the live document (last
+            //    good state) untouched. Interval checkpoints taken along the
+            //    way keep future dirty-range replays short.
+            var start: u32 = 0;
+            var base: *const Doc = &self.seed_doc;
+            if (self.cps.bestBefore(self.marker_pos)) |e| {
+                if (e.pos > start) {
+                    start = e.pos;
+                    base = &e.doc;
+                }
+            }
+            var scratch = Domain.cloneDoc(base, self.gpa) catch |err| {
                 self.broken = err;
                 return;
             };
-            self.resetStatuses(0);
-            var applied: u32 = 0;
-            ft.rebuild.applyRange(Domain, self.list.items, 0, self.marker_pos, &scratch, self.gpa, &applied) catch |err| {
-                Domain.deinitDoc(&scratch, self.gpa);
-                self.broken = err;
-                return; // live_doc still holds the last good state
-            };
+            self.resetStatuses(start);
+            var pos: u32 = start;
+            while (pos < self.marker_pos) {
+                const end = if (self.config.checkpoint_interval > 0)
+                    @min(pos + self.config.checkpoint_interval, self.marker_pos)
+                else
+                    self.marker_pos;
+                var applied: u32 = pos;
+                ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.gpa, &applied) catch |err| {
+                    Domain.deinitDoc(&scratch, self.gpa);
+                    self.broken = err;
+                    return; // live_doc still holds the last good state
+                };
+                pos = end;
+                if (end < self.marker_pos) {
+                    self.cps.add(end, &scratch, self.list.items);
+                }
+            }
             Domain.deinitDoc(&self.live_doc, self.gpa);
             self.live_doc = scratch;
             self.built_pos = self.marker_pos;
-            self.built_version = self.version;
+            self.live_stale = false;
             self.broken = null;
         }
     };
@@ -274,6 +349,10 @@ pub fn Timeline(comptime Domain: type) type {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Global count of successful feature applications, for asserting that the
+/// checkpoint cache avoids replay work.
+var g_applies: usize = 0;
 
 const TestDomain = struct {
     pub const Doc = struct {
@@ -294,12 +373,14 @@ const TestDomain = struct {
                 const sum = std.math.add(i64, doc.value, n) catch
                     return ctx.fail("add would overflow", .{});
                 doc.value = sum;
+                g_applies += 1;
                 try doc.steps.append(ctx.alloc, '+');
             },
             .mul => |n| {
                 const product = std.math.mul(i64, doc.value, n) catch
                     return ctx.fail("mul would overflow", .{});
                 doc.value = product;
+                g_applies += 1;
                 try doc.steps.append(ctx.alloc, '*');
             },
             .fail => |msg| return ctx.fail("{s}", .{msg}),
@@ -478,4 +559,117 @@ test "dirty transitions" {
     try std.testing.expect(tl.dirty());
     _ = tl.state();
     try std.testing.expect(!tl.dirty());
+}
+
+test "edit recomputes downstream, keeping id and position" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const first = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+    try std.testing.expectEqual(@as(i64, 6), tl.state().value);
+
+    tl.edit(first, .{ .add = 10 });
+    try std.testing.expectEqual(@as(i64, 15), tl.state().value);
+
+    const f = tl.featureById(first).?;
+    try std.testing.expectEqual(TestDomain.Op{ .add = 10 }, f.op.*);
+}
+
+test "edit replays only the dirty suffix from a checkpoint" {
+    const gpa = std.testing.allocator;
+    var tl = try TestTimeline.init(gpa, .{}, .{
+        .checkpoint_interval = 2,
+        .max_checkpoints = 8,
+        .checkpoint_on_scrub = true,
+    });
+    defer tl.deinit();
+
+    var ids: [8]ft.FeatureId = undefined;
+    for (&ids, 0..) |*slot, i| {
+        slot.* = try tl.commit(.{ .add = @intCast(i + 1) });
+    }
+    try std.testing.expectEqual(@as(i64, 36), tl.state().value);
+    g_applies = 0;
+
+    // Edit feature 0: nothing below any checkpoint survives, so the rebuild
+    // replays all 8 — and lays down interval checkpoints at 2, 4, 6.
+    tl.edit(ids[0], .{ .add = 100 });
+    _ = tl.state();
+    try std.testing.expectEqual(@as(i64, 135), tl.state().value);
+    try std.testing.expectEqual(@as(usize, 8), g_applies);
+
+    // Edit feature 5: the checkpoint at 4 survives; only features 4..7 replay.
+    g_applies = 0;
+    tl.edit(ids[5], .{ .add = 50 });
+    _ = tl.state();
+    try std.testing.expectEqual(@as(usize, 4), g_applies);
+
+    // Scrub back to 6: an exact checkpoint exists (taken at 6) — zero applies.
+    g_applies = 0;
+    tl.setMarker(6);
+    _ = tl.state();
+    try std.testing.expectEqual(@as(usize, 0), g_applies);
+
+    // And forward to 8: the snapshot at 8 restores instantly.
+    g_applies = 0;
+    tl.setMarker(8);
+    _ = tl.state();
+    try std.testing.expectEqual(@as(usize, 0), g_applies);
+}
+
+test "remove adjusts marker and state" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const first = try tl.commit(.{ .add = 1 });
+    const second = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+    try std.testing.expectEqual(@as(i64, 6), tl.state().value);
+
+    tl.remove(second);
+    try std.testing.expectEqual(@as(u32, 2), tl.len());
+    try std.testing.expectEqual(@as(u32, 2), tl.marker());
+    try std.testing.expectEqual(@as(i64, 4), tl.state().value);
+
+    // Remove while rolled back so the removal is below the marker.
+    tl.setMarker(2);
+    tl.remove(first);
+    try std.testing.expectEqual(@as(u32, 1), tl.len());
+    try std.testing.expectEqual(@as(u32, 1), tl.marker());
+    try std.testing.expectEqual(@as(i64, 3), tl.state().value);
+
+    try std.testing.expect(tl.featureById(first) == null);
+}
+
+test "scrub ping-pong is free after the snapshot" {
+    const gpa = std.testing.allocator;
+    var tl = try TestTimeline.init(gpa, .{}, .{ .checkpoint_on_scrub = true, .max_checkpoints = 4 });
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+    _ = tl.state();
+
+    g_applies = 0;
+    tl.setMarker(1);
+    _ = tl.state(); // backward to an unsnapshotted position: replays from seed
+    try std.testing.expectEqual(@as(usize, 1), g_applies);
+
+    g_applies = 0;
+    tl.setMarker(3); // snapshot at 3 was taken when leaving it: exact restore
+    _ = tl.state();
+    try std.testing.expectEqual(@as(usize, 0), g_applies);
+
+    g_applies = 0;
+    tl.setMarker(1); // and back to 1: exact restore again — ping-pong is free
+    _ = tl.state();
+    try std.testing.expectEqual(@as(usize, 0), g_applies);
+    tl.setMarker(3);
+    _ = tl.state();
+    try std.testing.expectEqual(@as(usize, 0), g_applies);
 }
