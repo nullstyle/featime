@@ -49,6 +49,90 @@ pub fn applyRange(
     }
 }
 
+/// A background rebuild: a pure, self-contained computation of the document
+/// at a captured marker position. `Timeline.beginRebuild` produces one (the
+/// base document comes from a consumed checkpoint or a seed clone, so heavy
+/// documents are not copied), `run` may execute on any thread, and
+/// `Timeline.integrate` installs the result on the owner thread — rejecting
+/// anything stale via the generation captured at begin time.
+///
+/// `cancel` is safe to call from any thread; `run` notices between features.
+pub fn Job(comptime Domain: type) type {
+    const Feature = ft.Feature(Domain.Op);
+
+    return struct {
+        const Self = @This();
+
+        pub const State = enum {
+            pending,
+            running,
+            done,
+            failed,
+            cancelled,
+            consumed,
+        };
+
+        gpa: std.mem.Allocator,
+        /// Timeline generation at begin time; a mismatch at integrate time
+        /// means the plan changed and the result must be discarded.
+        generation: u64,
+        /// Marker position this job computes the document for.
+        target: u32,
+        /// Features `[0..start_pos)` are already baked into `base`.
+        start_pos: u32,
+        /// Working document: `base` with `[0..target)` applied on success.
+        base: Domain.Doc,
+        /// Private copy of the feature list with statuses zeroed; statuses in
+        /// `[start_pos..target)` are produced by this job.
+        features: []Feature,
+        applied: u32 = 0,
+        state: State = .pending,
+        err: ?anyerror = null,
+        cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        /// Apply features `[start_pos..target)` to `base`. Thread-safe against
+        /// `cancel`; touches nothing but this job.
+        pub fn run(self: *Self) void {
+            self.state = .running;
+            while (self.applied < self.target) {
+                if (self.cancel_requested.load(.acquire)) {
+                    self.state = .cancelled;
+                    return;
+                }
+                var applied: u32 = self.applied;
+                ft.rebuild.applyRange(Domain, self.features, self.applied, self.applied + 1, &self.base, self.gpa, &applied) catch |err| {
+                    self.state = .failed;
+                    self.err = err;
+                    return;
+                };
+                self.applied = applied;
+            }
+            self.state = .done;
+        }
+
+        /// Request cancellation (any thread). A running `run` stops before the
+        /// next feature; a finished one is simply discarded at integrate time.
+        pub fn cancel(self: *Self) void {
+            self.cancel_requested.store(true, .release);
+        }
+
+        /// Free everything this job owns. After `Timeline.integrate` the job
+        /// is already consumed; calling this is still safe.
+        pub fn deinit(self: *Self) void {
+            if (self.state == .consumed) return;
+            for (self.features[@min(self.start_pos, self.features.len)..]) |*f| {
+                switch (f.status) {
+                    .failed => |msg| self.gpa.free(msg),
+                    else => {},
+                }
+            }
+            self.gpa.free(self.features);
+            Domain.deinitDoc(&self.base, self.gpa);
+            self.state = .consumed;
+        }
+    };
+}
+
 test "applyRange records soft failures and continues" {
     const Domain = struct {
         pub const Doc = struct { value: i64 = 0 };

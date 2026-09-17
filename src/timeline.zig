@@ -57,6 +57,11 @@ pub fn Timeline(comptime Domain: type) type {
 
         next_id: ft.FeatureId,
 
+        /// Generation counter: bumped by every mutation (structural edits and
+        /// marker moves). Background jobs capture it at begin time;
+        /// `integrate` rejects results whose generation went stale.
+        gen: u64 = 0,
+
         /// Document checkpoint cache (internal).
         cps: checkpoint.Checkpoints(Domain),
 
@@ -118,6 +123,7 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn setMarker(self: *Self, pos: u32) void {
             const target = @min(pos, self.list.items.len);
             if (target == self.marker_pos) return;
+            self.touch();
             if (self.config.checkpoint_on_scrub and !self.dirty()) {
                 self.cps.add(self.marker_pos, &self.live_doc, self.list.items);
             }
@@ -153,6 +159,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// immediately; otherwise (or if a hard error occurs) the work is
         /// deferred to the next `state()`.
         pub fn commit(self: *Self, op: Op) error{OutOfMemory}!ft.FeatureId {
+            self.touch();
             const id = self.next_id;
             self.next_id +%= 1;
             const at = self.marker_pos;
@@ -191,6 +198,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// feature keeps its id and position; the document recomputes lazily
         /// from the nearest surviving checkpoint. No-op if absent.
         pub fn edit(self: *Self, id: ft.FeatureId, new_op: Op) void {
+            self.touch();
             const idx = self.indexOf(id) orelse return;
             const old_op = self.list.items[idx].op;
             self.journal.record(.{ .edit = .{ .id = id, .old_op = old_op, .new_op = new_op } });
@@ -201,6 +209,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// Remove a feature from the timeline. The marker adjusts so the
         /// visible document stays consistent. No-op if absent.
         pub fn remove(self: *Self, id: ft.FeatureId) void {
+            self.touch();
             const idx = self.indexOf(id) orelse return;
             const f = self.list.items[idx];
             self.journal.record(.{ .remove = .{
@@ -220,6 +229,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// the timeline but is skipped by rebuilds. No-op if absent or
         /// already in the requested state.
         pub fn setSuppressed(self: *Self, id: ft.FeatureId, suppressed: bool) void {
+            self.touch();
             const idx = self.indexOf(id) orelse return;
             const prev = self.list.items[idx].suppressed;
             if (prev == suppressed) return;
@@ -238,6 +248,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// allowed and breakage surfaces as failed features on rebuild,
         /// exactly like Fusion. No-op if absent or already in position.
         pub fn move(self: *Self, id: ft.FeatureId, new_pos: u32) MoveError!void {
+            self.touch();
             const from = self.indexOf(id) orelse return;
             const to = @min(new_pos, @as(u32, @intCast(self.list.items.len - 1)));
             if (from == to) return;
@@ -327,6 +338,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// Returns false when there is nothing to undo.
         pub fn undo(self: *Self) bool {
             const entry = self.journal.nextUndo() orelse return false;
+            self.touch();
             self.reverse(entry);
             return true;
         }
@@ -335,6 +347,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// is nothing to redo.
         pub fn redo(self: *Self) bool {
             const entry = self.journal.nextRedo() orelse return false;
+            self.touch();
             self.forward(entry);
             return true;
         }
@@ -447,8 +460,96 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         // ------------------------------------------------------------------
+        // Background rebuild
+        // ------------------------------------------------------------------
+
+        /// Capture the current rebuild as a pure job (heavy documents: the
+        /// base comes from a consumed checkpoint, not a copy). `run()` it on
+        /// any thread, then `integrate()` here. The timeline stays dirty until
+        /// integration; the synchronous `state()` remains available as a
+        /// fallback and produces identical results.
+        pub fn beginRebuild(self: *Self) anyerror!ft.rebuild.Job(Domain) {
+            var start_pos: u32 = 0;
+            var base: Domain.Doc = undefined;
+            var have_base = false;
+            if (self.cps.bestBefore(self.marker_pos)) |e| {
+                if (e.pos > 0) {
+                    const taken = self.cps.takeExact(e.pos).?;
+                    // The checkpoint's doc transfers to the job; its status
+                    // copies are simply dropped.
+                    for (taken.statuses) |st| switch (st) {
+                        .failed => |msg| self.gpa.free(msg),
+                        else => {},
+                    };
+                    self.gpa.free(taken.statuses);
+                    base = taken.doc;
+                    start_pos = taken.pos;
+                    have_base = true;
+                }
+            }
+            if (!have_base) base = try Domain.cloneDoc(&self.seed_doc, self.gpa);
+            errdefer Domain.deinitDoc(&base, self.gpa);
+
+            const features_copy = try self.gpa.dupe(ft.Feature(Op), self.list.items);
+            errdefer self.gpa.free(features_copy);
+            for (features_copy) |*f| f.status = .pending;
+
+            return .{
+                .gpa = self.gpa,
+                .generation = self.gen,
+                .target = self.marker_pos,
+                .start_pos = start_pos,
+                .applied = start_pos,
+                .base = base,
+                .features = features_copy,
+            };
+        }
+
+        /// Install a finished job's result (owner thread only). The job is
+        /// consumed either way. True when installed; false when stale,
+        /// cancelled, or failed — a failed-but-fresh job marks the timeline
+        /// broken, exactly like a synchronous rebuild.
+        pub fn integrate(self: *Self, job: *ft.rebuild.Job(Domain)) bool {
+            if (job.generation != self.gen) {
+                job.deinit();
+                return false;
+            }
+            switch (job.state) {
+                .done => {},
+                .failed => {
+                    self.broken = job.err;
+                    job.deinit();
+                    return false;
+                },
+                else => {
+                    job.deinit();
+                    return false;
+                },
+            }
+            Domain.deinitDoc(&self.live_doc, self.gpa);
+            self.live_doc = job.base;
+            self.resetStatuses(job.start_pos);
+            var i: u32 = job.start_pos;
+            while (i < job.target) : (i += 1) {
+                // Status message ownership transfers to the timeline.
+                self.list.items[i].status = job.features[i].status;
+            }
+            self.gpa.free(job.features);
+            job.features = &.{};
+            job.state = .consumed;
+            self.built_pos = self.marker_pos;
+            self.live_stale = false;
+            self.broken = null;
+            return true;
+        }
+
+        // ------------------------------------------------------------------
         // Rebuild internals
         // ------------------------------------------------------------------
+
+        fn touch(self: *Self) void {
+            self.gen += 1;
+        }
 
         fn indexOf(self: *const Self, id: ft.FeatureId) ?u32 {
             for (self.list.items, 0..) |f, i| {
@@ -1145,4 +1246,125 @@ test "dependent feature fails when its dependency is removed" {
         "base feature is not applied before this offset",
         offset_status.failed,
     );
+}
+
+test "background rebuild matches the synchronous path" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const first = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+    tl.setMarker(1);
+    _ = tl.state();
+    tl.edit(first, .{ .add = 10 });
+    try std.testing.expect(tl.dirty());
+
+    var job = try tl.beginRebuild();
+    job.run();
+    try std.testing.expect(tl.integrate(&job));
+    try std.testing.expect(!tl.dirty());
+    try std.testing.expectEqual(@as(i64, 10), tl.state().value);
+    try std.testing.expectEqual(ft.Status.ok, tl.featureById(first).?.status);
+}
+
+test "stale background jobs are rejected" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const first = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    tl.setMarker(1);
+    _ = tl.state();
+    tl.edit(first, .{ .add = 10 });
+
+    var job = try tl.beginRebuild();
+    _ = try tl.commit(.{ .add = 100 }); // plan changed under the job
+    try std.testing.expect(!tl.integrate(&job));
+    // The synchronous path still resolves the state.
+    try std.testing.expectEqual(@as(i64, 110), tl.state().value);
+}
+
+test "cancelled background jobs are rejected" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    tl.setMarker(1);
+
+    var job = try tl.beginRebuild();
+    job.cancel();
+    job.run();
+    try std.testing.expect(!tl.integrate(&job));
+    try std.testing.expect(tl.dirty());
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+}
+
+test "hard failure in a background job breaks the timeline, keeps last good" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const first = try tl.commit(.{ .add = 5 });
+    _ = try tl.commit(.{ .add = 1 });
+    tl.setMarker(1);
+    _ = tl.state();
+    tl.edit(first, .{ .poison = {} });
+
+    var job = try tl.beginRebuild();
+    defer job.deinit();
+    job.run();
+    try std.testing.expect(!tl.integrate(&job));
+    try std.testing.expect(tl.broken != null);
+    // Last good state: the document at marker 1 before the poisoned edit.
+    try std.testing.expectEqual(@as(i64, 5), tl.state().value);
+}
+
+test "background rebuild replays only the dirty suffix from a checkpoint" {
+    const gpa = std.testing.allocator;
+    var tl = try TestTimeline.init(gpa, .{}, .{
+        .checkpoint_interval = 2,
+        .max_checkpoints = 8,
+        .checkpoint_on_scrub = true,
+    });
+    defer tl.deinit();
+
+    var ids: [8]ft.FeatureId = undefined;
+    for (&ids, 0..) |*slot, i| {
+        slot.* = try tl.commit(.{ .add = @intCast(i + 1) });
+    }
+    // Force one chunked full rebuild to lay down interval checkpoints at
+    // 2, 4, 6 (fast-path commits never create them).
+    tl.edit(ids[0], .{ .add = 1 }); // same value, still invalidates
+    _ = tl.state();
+    tl.edit(ids[5], .{ .add = 50 });
+
+    g_applies = 0;
+    var job = try tl.beginRebuild(); // consumes the checkpoint at 4
+    defer job.deinit();
+    job.run();
+    try std.testing.expectEqual(@as(usize, 4), g_applies);
+    try std.testing.expect(tl.integrate(&job));
+    try std.testing.expectEqual(@as(i64, 1 + 2 + 3 + 4 + 5 + 50 + 7 + 8), tl.state().value);
+}
+
+test "background rebuild runs on a real worker thread" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .mul = 21 });
+    tl.setMarker(1);
+
+    var job = try tl.beginRebuild();
+    const thread = try std.Thread.spawn(.{}, ft.rebuild.Job(TestDomain).run, .{&job});
+    thread.join();
+    try std.testing.expect(tl.integrate(&job));
+    try std.testing.expectEqual(@as(i64, 2), tl.state().value);
+    try std.testing.expect(!tl.dirty());
 }

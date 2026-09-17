@@ -70,8 +70,15 @@ pub fn Checkpoints(comptime Domain: type) type {
 
         /// Snapshot `doc` at `pos`, taking statuses from `features[0..pos]`.
         /// Best effort: silently skips on capacity 0 or allocation failure.
+        /// An existing entry at the same position is replaced.
         pub fn add(self: *Self, pos: u32, doc: *const Doc, features: []const ft.Feature(Domain.Op)) void {
             if (self.max == 0) return;
+            // Replace any existing entry at this position (positions stay
+            // unique so `takeExact` is unambiguous).
+            if (self.indexOfPos(pos)) |i| {
+                var dead = self.entries.orderedRemove(i);
+                self.destroyEntry(&dead);
+            }
             var entry: Entry = .{
                 .pos = pos,
                 .doc = Domain.cloneDoc(doc, self.gpa) catch return,
@@ -90,6 +97,13 @@ pub fn Checkpoints(comptime Domain: type) type {
                 var full = entry;
                 self.destroyEntry(&full);
             };
+        }
+
+        fn indexOfPos(self: *const Self, pos: u32) ?usize {
+            for (self.entries.items, 0..) |e, i| {
+                if (e.pos == pos) return i;
+            }
+            return null;
         }
 
         fn destroyEntry(self: *Self, e: *Entry) void {
