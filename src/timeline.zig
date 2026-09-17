@@ -8,6 +8,7 @@
 const std = @import("std");
 const ft = @import("root.zig");
 const checkpoint = @import("checkpoint.zig");
+const journaling = @import("journal.zig");
 
 /// Mixes into feature-id salts so separately created timelines (including in
 /// different processes / peers) are unlikely to assign colliding ids.
@@ -59,6 +60,9 @@ pub fn Timeline(comptime Domain: type) type {
         /// Document checkpoint cache (internal).
         cps: checkpoint.Checkpoints(Domain),
 
+        /// Undo/redo journal (internal).
+        journal: journaling.Journal(Op),
+
         // ------------------------------------------------------------------
         // Lifecycle
         // ------------------------------------------------------------------
@@ -75,6 +79,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .live_doc = live,
                 .next_id = prng.random().int(ft.FeatureId) | 1,
                 .cps = checkpoint.Checkpoints(Domain).init(gpa, config.max_checkpoints),
+                .journal = journaling.Journal(Op).init(gpa, config.max_journal),
             };
         }
 
@@ -87,6 +92,7 @@ pub fn Timeline(comptime Domain: type) type {
             self.resetStatuses(0);
             self.list.deinit(self.gpa);
             self.cps.deinit();
+            self.journal.deinit();
             Domain.deinitDoc(&self.seed_doc, self.gpa);
             Domain.deinitDoc(&self.live_doc, self.gpa);
         }
@@ -152,13 +158,19 @@ pub fn Timeline(comptime Domain: type) type {
             const at = self.marker_pos;
 
             try self.list.insert(self.gpa, at, .{ .id = id, .op = op });
-            self.cps.noteMutation(at);
+            self.journal.record(.{ .commit = .{ .id = id, .op = op, .at = at } });
+            self.afterInsert(at);
+            return id;
+        }
 
+        /// Bookkeeping after a feature lands at `at` (shared by commit and
+        /// journal redo).
+        fn afterInsert(self: *Self, at: u32) void {
+            self.cps.noteMutation(at);
             // The inserted feature is `.pending` by default and the shifted
             // features now sit at/after the advanced marker; their old
             // statuses are meaningless. Free any failure messages they held.
             self.resetStatuses(at + 1);
-
             self.marker_pos = at + 1;
             if (at < self.built_pos) self.live_stale = true;
 
@@ -169,11 +181,10 @@ pub fn Timeline(comptime Domain: type) type {
                     // live doc, but this op may have partially mutated it.
                     // Flag broken so nothing touches it before a full rebuild.
                     self.broken = err;
-                    return id;
+                    return;
                 };
                 self.built_pos = at + 1;
             }
-            return id;
         }
 
         /// Replace a feature's parameters (Fusion's "edit feature"). The
@@ -181,6 +192,8 @@ pub fn Timeline(comptime Domain: type) type {
         /// from the nearest surviving checkpoint. No-op if absent.
         pub fn edit(self: *Self, id: ft.FeatureId, new_op: Op) void {
             const idx = self.indexOf(id) orelse return;
+            const old_op = self.list.items[idx].op;
+            self.journal.record(.{ .edit = .{ .id = id, .old_op = old_op, .new_op = new_op } });
             self.list.items[idx].op = new_op;
             self.invalidate(idx);
         }
@@ -189,7 +202,14 @@ pub fn Timeline(comptime Domain: type) type {
         /// visible document stays consistent. No-op if absent.
         pub fn remove(self: *Self, id: ft.FeatureId) void {
             const idx = self.indexOf(id) orelse return;
-            // The shifted features' statuses refer to the old document.
+            const f = self.list.items[idx];
+            self.journal.record(.{ .remove = .{
+                .id = id,
+                .op = f.op,
+                .at = idx,
+                .suppressed = f.suppressed,
+                .marker_pre = self.marker_pos,
+            } });
             self.resetStatuses(idx);
             _ = self.list.orderedRemove(idx);
             if (idx < self.marker_pos) self.marker_pos -= 1;
@@ -201,9 +221,98 @@ pub fn Timeline(comptime Domain: type) type {
         /// already in the requested state.
         pub fn setSuppressed(self: *Self, id: ft.FeatureId, suppressed: bool) void {
             const idx = self.indexOf(id) orelse return;
-            if (self.list.items[idx].suppressed == suppressed) return;
+            const prev = self.list.items[idx].suppressed;
+            if (prev == suppressed) return;
+            self.journal.record(.{ .suppress = .{ .id = id, .prev = prev } });
             self.list.items[idx].suppressed = suppressed;
             self.invalidate(idx);
+        }
+
+        // ------------------------------------------------------------------
+        // Undo / redo
+        // ------------------------------------------------------------------
+
+        pub fn canUndo(self: *const Self) bool {
+            return self.journal.canUndo();
+        }
+
+        pub fn canRedo(self: *const Self) bool {
+            return self.journal.canRedo();
+        }
+
+        /// Undo the most recent timeline edit. The marker restores to where
+        /// it was when that edit was made (marker moves themselves are not
+        /// journaled — scrubbing is free and never erodes undo depth).
+        /// Returns false when there is nothing to undo.
+        pub fn undo(self: *Self) bool {
+            const entry = self.journal.nextUndo() orelse return false;
+            self.reverse(entry);
+            return true;
+        }
+
+        /// Re-apply the most recently undone edit. Returns false when there
+        /// is nothing to redo.
+        pub fn redo(self: *Self) bool {
+            const entry = self.journal.nextRedo() orelse return false;
+            self.forward(entry);
+            return true;
+        }
+
+        fn reverse(self: *Self, entry: journaling.Journal(Op).Entry) void {
+            switch (entry) {
+                .commit => |e| {
+                    const idx = self.indexOf(e.id) orelse return;
+                    self.resetStatuses(idx);
+                    _ = self.list.orderedRemove(idx);
+                    self.marker_pos = e.at;
+                    self.invalidate(idx);
+                },
+                .edit => |e| {
+                    const idx = self.indexOf(e.id) orelse return;
+                    self.list.items[idx].op = e.old_op;
+                    self.invalidate(idx);
+                },
+                .remove => |e| {
+                    self.list.insert(self.gpa, e.at, .{
+                        .id = e.id,
+                        .op = e.op,
+                        .suppressed = e.suppressed,
+                    }) catch return;
+                    self.afterInsert(e.at);
+                    self.marker_pos = @min(e.marker_pre, @as(u32, @intCast(self.list.items.len)));
+                },
+                .suppress => |e| {
+                    const idx = self.indexOf(e.id) orelse return;
+                    self.list.items[idx].suppressed = e.prev;
+                    self.invalidate(idx);
+                },
+            }
+        }
+
+        fn forward(self: *Self, entry: journaling.Journal(Op).Entry) void {
+            switch (entry) {
+                .commit => |e| {
+                    self.list.insert(self.gpa, e.at, .{ .id = e.id, .op = e.op }) catch return;
+                    self.afterInsert(e.at);
+                },
+                .edit => |e| {
+                    const idx = self.indexOf(e.id) orelse return;
+                    self.list.items[idx].op = e.new_op;
+                    self.invalidate(idx);
+                },
+                .remove => |e| {
+                    const idx = self.indexOf(e.id) orelse return;
+                    self.resetStatuses(idx);
+                    _ = self.list.orderedRemove(idx);
+                    self.marker_pos = if (e.at < e.marker_pre) e.marker_pre - 1 else e.marker_pre;
+                    self.invalidate(idx);
+                },
+                .suppress => |e| {
+                    const idx = self.indexOf(e.id) orelse return;
+                    self.list.items[idx].suppressed = !e.prev;
+                    self.invalidate(idx);
+                },
+            }
         }
 
         /// Shared tail for structural mutations at `idx`: statuses from `idx`
@@ -672,4 +781,148 @@ test "scrub ping-pong is free after the snapshot" {
     tl.setMarker(3);
     _ = tl.state();
     try std.testing.expectEqual(@as(usize, 0), g_applies);
+}
+
+test "undo/redo commits" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+    try std.testing.expectEqual(@as(i64, 6), tl.state().value);
+
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(u32, 2), tl.len());
+    try std.testing.expectEqual(@as(i64, 3), tl.state().value);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(u32, 0), tl.len());
+    try std.testing.expectEqual(@as(i64, 0), tl.state().value);
+    try std.testing.expect(!tl.undo());
+
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 3), tl.state().value);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 6), tl.state().value);
+    try std.testing.expect(!tl.redo());
+}
+
+test "new edit clears the redo stack" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = tl.undo();
+    try std.testing.expect(tl.canRedo());
+    _ = try tl.commit(.{ .mul = 10 });
+    try std.testing.expect(!tl.canRedo());
+    try std.testing.expectEqual(@as(u32, 2), tl.len());
+    try std.testing.expectEqual(@as(i64, 10), tl.state().value);
+}
+
+test "undo/redo edit and suppress" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const first = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+
+    tl.edit(first, .{ .add = 10 });
+    try std.testing.expectEqual(@as(i64, 12), tl.state().value);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 3), tl.state().value);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 12), tl.state().value);
+
+    tl.setSuppressed(first, true);
+    try std.testing.expectEqual(@as(i64, 2), tl.state().value);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 12), tl.state().value);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 2), tl.state().value);
+}
+
+test "undo remove restores feature id and marker" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const first = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+    tl.setMarker(1);
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+
+    tl.remove(first);
+    try std.testing.expectEqual(@as(u32, 2), tl.len());
+    try std.testing.expectEqual(@as(u32, 0), tl.marker());
+
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(u32, 3), tl.len());
+    try std.testing.expectEqual(@as(u32, 1), tl.marker());
+    const restored = tl.featureById(first).?;
+    try std.testing.expectEqual(TestDomain.Op{ .add = 1 }, restored.op.*);
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(u32, 2), tl.len());
+    try std.testing.expectEqual(@as(u32, 0), tl.marker());
+}
+
+test "undo commit restores marker position" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+    tl.setMarker(1);
+    _ = tl.state();
+
+    _ = try tl.commit(.{ .mul = 10 });
+    try std.testing.expectEqual(@as(u32, 2), tl.marker());
+    try std.testing.expectEqual(@as(i64, 10), tl.state().value);
+
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(u32, 1), tl.marker());
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(u32, 2), tl.marker());
+    try std.testing.expectEqual(@as(i64, 10), tl.state().value);
+}
+
+test "journal depth cap" {
+    const gpa = std.testing.allocator;
+    var tl = try TestTimeline.init(gpa, .{}, .{ .max_journal = 2 });
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 3), tl.state().value);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+    try std.testing.expect(!tl.undo());
+}
+
+test "journal disabled" {
+    const gpa = std.testing.allocator;
+    var tl = try TestTimeline.init(gpa, .{}, .{ .max_journal = 0 });
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    try std.testing.expect(!tl.canUndo());
+    try std.testing.expect(!tl.undo());
 }

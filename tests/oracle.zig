@@ -45,6 +45,15 @@ const Domain = struct {
 const Timeline = ft.Timeline(Domain);
 const NaiveFeature = ft.Feature(Domain.Op);
 
+/// The naive model's own undo log — an independent reimplementation of the
+/// journal semantics (insert-at-marker, marker restore, redo truncation).
+const NaiveEntry = union(enum) {
+    commit: struct { idx: u32, op: Domain.Op },
+    edit: struct { idx: u32, old: Domain.Op, new: Domain.Op },
+    remove: struct { idx: u32, op: Domain.Op, suppressed: bool, marker_pre: u32 },
+    suppress: struct { idx: u32, prev: bool },
+};
+
 /// The reference model: no caching, no incremental anything. Mirrors the
 /// timeline's structural semantics (insert-at-marker, marker/mutation index
 /// adjustments) and recomputes by replay from the seed.
@@ -52,10 +61,14 @@ const Naive = struct {
     gpa: std.mem.Allocator,
     features: std.ArrayList(NaiveFeature) = .empty,
     marker: u32 = 0,
+    log: std.ArrayList(NaiveEntry) = .empty,
+    log_head: usize = 0,
+    journal_max: u32,
 
     fn deinit(self: *Naive) void {
         for (self.features.items) |*f| self.freeStatus(f);
         self.features.deinit(self.gpa);
+        self.log.deinit(self.gpa);
     }
 
     fn freeStatus(self: *Naive, f: *NaiveFeature) void {
@@ -69,6 +82,7 @@ const Naive = struct {
     fn commit(self: *Naive, op: Domain.Op) !void {
         try self.features.insert(self.gpa, self.marker, .{ .id = 0, .op = op });
         for (self.features.items[self.marker + 1 ..]) |*f| self.freeStatus(f);
+        self.record(.{ .commit = .{ .idx = self.marker, .op = op } });
         self.marker += 1;
     }
 
@@ -77,19 +91,107 @@ const Naive = struct {
     }
 
     fn edit(self: *Naive, idx: u32, op: Domain.Op) void {
+        const old = self.features.items[idx].op;
         self.features.items[idx].op = op;
         for (self.features.items[idx..]) |*f| self.freeStatus(f);
+        self.record(.{ .edit = .{ .idx = idx, .old = old, .new = op } });
     }
 
     fn remove(self: *Naive, idx: u32) void {
-        for (self.features.items[idx..]) |*f| self.freeStatus(f);
+        const f = self.features.items[idx];
+        self.record(.{ .remove = .{
+            .idx = idx,
+            .op = f.op,
+            .suppressed = f.suppressed,
+            .marker_pre = self.marker,
+        } });
+        for (self.features.items[idx..]) |*f2| self.freeStatus(f2);
         _ = self.features.orderedRemove(idx);
         if (idx < self.marker) self.marker -= 1;
     }
 
     fn toggleSuppress(self: *Naive, idx: u32) void {
-        self.features.items[idx].suppressed = !self.features.items[idx].suppressed;
+        const prev = self.features.items[idx].suppressed;
+        self.features.items[idx].suppressed = !prev;
         for (self.features.items[idx..]) |*f| self.freeStatus(f);
+        self.record(.{ .suppress = .{ .idx = idx, .prev = prev } });
+    }
+
+    fn record(self: *Naive, e: NaiveEntry) void {
+        if (self.journal_max == 0) return;
+        self.log.shrinkRetainingCapacity(self.log_head);
+        self.log.append(self.gpa, e) catch return;
+        self.log_head += 1;
+        if (self.log.items.len > self.journal_max) {
+            _ = self.log.orderedRemove(0);
+            self.log_head -= 1;
+        }
+    }
+
+    fn canUndo(self: *const Naive) bool {
+        return self.log_head > 0;
+    }
+
+    fn canRedo(self: *const Naive) bool {
+        return self.log_head < self.log.items.len;
+    }
+
+    fn undo(self: *Naive) bool {
+        if (self.log_head == 0) return false;
+        self.log_head -= 1;
+        const e = self.log.items[self.log_head];
+        switch (e) {
+            .commit => |c| {
+                for (self.features.items[c.idx..]) |*f| self.freeStatus(f);
+                _ = self.features.orderedRemove(c.idx);
+                self.marker = c.idx;
+            },
+            .edit => |ed| {
+                self.features.items[ed.idx].op = ed.old;
+                for (self.features.items[ed.idx..]) |*f| self.freeStatus(f);
+            },
+            .remove => |r| {
+                self.features.insert(self.gpa, r.idx, .{
+                    .id = 0,
+                    .op = r.op,
+                    .suppressed = r.suppressed,
+                }) catch return false;
+                for (self.features.items[r.idx..]) |*f| self.freeStatus(f);
+                self.marker = r.marker_pre;
+            },
+            .suppress => |s| {
+                self.features.items[s.idx].suppressed = s.prev;
+                for (self.features.items[s.idx..]) |*f| self.freeStatus(f);
+            },
+        }
+        return true;
+    }
+
+    fn redo(self: *Naive) bool {
+        if (self.log_head >= self.log.items.len) return false;
+        const e = self.log.items[self.log_head];
+        self.log_head += 1;
+        switch (e) {
+            .commit => |c| {
+                self.features.insert(self.gpa, c.idx, .{ .id = 0, .op = c.op }) catch return false;
+                for (self.features.items[c.idx + 1 ..]) |*f| self.freeStatus(f);
+                self.marker = c.idx + 1;
+            },
+            .edit => |ed| {
+                self.features.items[ed.idx].op = ed.new;
+                for (self.features.items[ed.idx..]) |*f| self.freeStatus(f);
+            },
+            .remove => |r| {
+                for (self.features.items[r.idx..]) |*f| self.freeStatus(f);
+                _ = self.features.orderedRemove(r.idx);
+                self.marker = if (r.idx < r.marker_pre) r.marker_pre - 1 else r.marker_pre;
+            },
+            .suppress => |s| {
+                self.features.items[s.idx].suppressed = !s.prev;
+                for (self.features.items[s.idx..]) |*f| self.freeStatus(f);
+            },
+        }
+        return true;
     }
 
     /// Recompute from scratch. Uses the library's own pure apply core — the
@@ -126,7 +228,11 @@ fn randomConfig(random: std.Random) ft.Config {
             else => 8,
         },
         .checkpoint_on_scrub = random.boolean(),
-        .max_journal = 0,
+        .max_journal = switch (random.uintAtMost(u2, 3)) {
+            0 => 0,
+            1 => 3,
+            2...3 => 1000,
+        },
     };
 }
 
@@ -146,6 +252,8 @@ fn compare(tl: *Timeline, naive: *Naive, gpa: std.mem.Allocator) !void {
 
     try expectEqual(naive.features.items.len, tl.len());
     try expectEqual(naive.marker, tl.marker());
+    try expectEqual(naive.canUndo(), tl.canUndo());
+    try expectEqual(naive.canRedo(), tl.canRedo());
 
     const got_state = tl.state();
     const want = try naive.recompute();
@@ -180,7 +288,7 @@ fn runSequence(seed: u64, steps: u16) !void {
 
     var tl = try Timeline.init(gpa, .{}, randomConfig(random));
     defer tl.deinit();
-    var naive = Naive{ .gpa = gpa };
+    var naive = Naive{ .gpa = gpa, .journal_max = tl.config.max_journal };
     defer naive.deinit();
 
     var step: u16 = 0;
@@ -190,31 +298,37 @@ fn runSequence(seed: u64, steps: u16) !void {
         // too short for index-based ones.
         const action = if (len == 0) 0 else random.uintLessThan(u7, 100);
         switch (action) {
-            0...44 => {
+            0...39 => {
                 const op = randomOp(random);
                 _ = try tl.commit(op);
                 try naive.commit(op);
             },
-            45...64 => {
+            40...54 => {
                 const pos = random.uintAtMost(u32, len);
                 tl.setMarker(pos);
                 naive.setMarker(pos);
             },
-            65...79 => {
+            55...64 => {
                 const idx = random.uintAtMost(u32, len - 1);
                 tl.setSuppressed(idAt(&tl, idx), !naive.features.items[idx].suppressed);
                 naive.toggleSuppress(idx);
             },
-            80...89 => {
+            65...74 => {
                 const idx = random.uintAtMost(u32, len - 1);
                 const op = randomOp(random);
                 tl.edit(idAt(&tl, idx), op);
                 naive.edit(idx, op);
             },
-            else => {
+            75...79 => {
                 const idx = random.uintAtMost(u32, len - 1);
                 tl.remove(idAt(&tl, idx));
                 naive.remove(idx);
+            },
+            80...89 => {
+                try std.testing.expectEqual(naive.undo(), tl.undo());
+            },
+            else => {
+                try std.testing.expectEqual(naive.redo(), tl.redo());
             },
         }
         try compare(&tl, &naive, gpa);
