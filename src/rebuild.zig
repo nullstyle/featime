@@ -35,7 +35,7 @@ pub fn applyRange(
             applied.* = i + 1;
             continue;
         }
-        var ctx: ft.ApplyContext = .{ .alloc = gpa };
+        var ctx: ft.ApplyContext = .{ .alloc = gpa, .feature_id = feature.id };
         Domain.apply(feature.op, doc, &ctx) catch |err| switch (err) {
             error.FeatureFailed => {
                 feature.status = .{ .failed = ctx.message orelse "feature failed" };

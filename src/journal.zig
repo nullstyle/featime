@@ -21,6 +21,7 @@ pub fn Journal(comptime Op: type) type {
             edit: struct { id: ft.FeatureId, old_op: Op, new_op: Op },
             remove: struct { id: ft.FeatureId, op: Op, at: u32, suppressed: bool, marker_pre: u32 },
             suppress: struct { id: ft.FeatureId, prev: bool },
+            move: struct { id: ft.FeatureId, from: u32, to: u32, marker_pre: u32 },
         };
 
         gpa: std.mem.Allocator,

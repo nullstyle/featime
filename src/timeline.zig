@@ -228,6 +228,87 @@ pub fn Timeline(comptime Domain: type) type {
             self.invalidate(idx);
         }
 
+        /// Reorder a feature to `new_pos` (clamped to the list; interpreted
+        /// as the index in the resulting list, Fusion's drag semantics).
+        ///
+        /// When the Domain provides the optional `dependencies` hook, the
+        /// move is validated first and `error.DependencyViolation` is
+        /// returned — before any mutation — if it would place a dependency
+        /// after a feature that reads it. Without the hook every move is
+        /// allowed and breakage surfaces as failed features on rebuild,
+        /// exactly like Fusion. No-op if absent or already in position.
+        pub fn move(self: *Self, id: ft.FeatureId, new_pos: u32) MoveError!void {
+            const from = self.indexOf(id) orelse return;
+            const to = @min(new_pos, @as(u32, @intCast(self.list.items.len - 1)));
+            if (from == to) return;
+
+            if (comptime hasDeps(Domain)) {
+                if (self.depsViolated(from, to)) return error.DependencyViolation;
+            }
+
+            self.journal.record(.{ .move = .{
+                .id = id,
+                .from = from,
+                .to = to,
+                .marker_pre = self.marker_pos,
+            } });
+            self.rawMove(id, to);
+        }
+
+        pub const MoveError = error{ DependencyViolation, OutOfMemory };
+
+        fn hasDeps(comptime D: type) bool {
+            return @hasDecl(D, "dependencies");
+        }
+
+        /// Would moving `from -> to` put any feature after one of its
+        /// dependencies? Simulates the reorder with an index remap.
+        fn depsViolated(self: *Self, from: u32, to: u32) bool {
+            var collector: ft.DepCollector = .{ .gpa = self.gpa };
+            defer collector.ids.deinit(self.gpa);
+            for (self.list.items, 0..) |f, i| {
+                collector.ids.clearRetainingCapacity();
+                Domain.dependencies(f.op, &collector);
+                if (collector.failed) return false; // can't validate: allow
+                const mapped_i = remapIndex(@intCast(i), from, to);
+                for (collector.ids.items) |dep_id| {
+                    const j = self.indexOf(dep_id) orelse continue;
+                    if (j == i) continue; // self-reference is not ordering
+                    if (remapIndex(j, from, to) >= mapped_i) return true;
+                }
+            }
+            return false;
+        }
+
+        fn remapIndex(i: u32, from: u32, to: u32) u32 {
+            if (i == from) return to;
+            if (from < to) return if (i > from and i <= to) i - 1 else i;
+            return if (i >= to and i < from) i + 1 else i;
+        }
+
+        /// Reorder without validation or journaling (also used by undo/redo).
+        fn rawMove(self: *Self, id: ft.FeatureId, to: u32) void {
+            const from = self.indexOf(id) orelse return;
+            if (from == to) return;
+            const lo = @min(from, to);
+            self.resetStatuses(lo);
+            const feature = self.list.orderedRemove(from);
+            self.list.insert(self.gpa, to, feature) catch {
+                // Out of memory re-inserting: restore it where it was.
+                self.list.insert(self.gpa, from, feature) catch unreachable;
+                return;
+            };
+            // The marker counts applied features: adjust when the feature
+            // crosses the applied/unapplied boundary.
+            if (from < self.marker_pos and to >= self.marker_pos) {
+                self.marker_pos -= 1;
+            } else if (from >= self.marker_pos and to < self.marker_pos) {
+                self.marker_pos += 1;
+            }
+            self.cps.noteMutation(lo);
+            if (lo < self.built_pos) self.live_stale = true;
+        }
+
         // ------------------------------------------------------------------
         // Undo / redo
         // ------------------------------------------------------------------
@@ -286,6 +367,12 @@ pub fn Timeline(comptime Domain: type) type {
                     self.list.items[idx].suppressed = e.prev;
                     self.invalidate(idx);
                 },
+                .move => |e| {
+                    self.rawMove(e.id, e.from);
+                    // Restore the pre-move marker (rawMove's crossing
+                    // adjustment started from the post-undo marker).
+                    self.marker_pos = e.marker_pre;
+                },
             }
         }
 
@@ -312,6 +399,7 @@ pub fn Timeline(comptime Domain: type) type {
                     self.list.items[idx].suppressed = !e.prev;
                     self.invalidate(idx);
                 },
+                .move => |e| self.rawMove(e.id, e.to),
             }
         }
 
@@ -925,4 +1013,136 @@ test "journal disabled" {
     _ = try tl.commit(.{ .add = 1 });
     try std.testing.expect(!tl.canUndo());
     try std.testing.expect(!tl.undo());
+}
+
+// ---------------------------------------------------------------------------
+// Dependency-aware domain for move validation tests
+// ---------------------------------------------------------------------------
+
+const DepDomain = struct {
+    pub const Doc = struct {
+        value: i64 = 0,
+        bases: std.ArrayList(ft.FeatureId) = .empty,
+    };
+    pub const Op = union(enum) {
+        base: struct { v: i64 },
+        offset: struct { base_id: ft.FeatureId, amount: i64 },
+    };
+    pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
+        switch (op) {
+            .base => |b| {
+                doc.value += b.v;
+                try doc.bases.append(ctx.alloc, ctx.feature_id);
+            },
+            .offset => |o| {
+                for (doc.bases.items) |id| {
+                    if (id == o.base_id) {
+                        doc.value += o.amount;
+                        return;
+                    }
+                }
+                return ctx.fail("base feature is not applied before this offset", .{});
+            },
+        }
+    }
+    pub fn dependencies(op: Op, out: *ft.DepCollector) void {
+        switch (op) {
+            .base => {},
+            .offset => |o| out.dep(o.base_id),
+        }
+    }
+    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
+        return .{ .value = doc.value, .bases = try doc.bases.clone(gpa) };
+    }
+    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
+        doc.bases.deinit(gpa);
+    }
+};
+
+test "move reorders and recomputes" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 5 });
+    _ = try tl.commit(.{ .mul = 2 });
+    const last = try tl.commit(.{ .add = 1 });
+    try std.testing.expectEqual(@as(i64, 11), tl.state().value);
+
+    try tl.move(last, 0);
+    try std.testing.expectEqual(@as(i64, 12), tl.state().value);
+    try std.testing.expectEqual(@as(u32, 3), tl.len());
+
+    // Undo restores order and marker; redo re-moves.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 11), tl.state().value);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 12), tl.state().value);
+}
+
+test "move across the marker adjusts the marker" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    const second = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+    tl.setMarker(2);
+    try std.testing.expectEqual(@as(i64, 3), tl.state().value);
+
+    // Move the applied `second` past the marker: applied count drops.
+    try tl.move(second, 2);
+    try std.testing.expectEqual(@as(u32, 1), tl.marker());
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+
+    // Undo restores the marker to its pre-move position.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(u32, 2), tl.marker());
+    try std.testing.expectEqual(@as(i64, 3), tl.state().value);
+}
+
+test "move refuses dependency violations before mutating" {
+    const gpa = std.testing.allocator;
+    var tl = try Timeline(DepDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    const b1 = try tl.commit(.{ .base = .{ .v = 10 } });
+    _ = try tl.commit(.{ .base = .{ .v = 100 } });
+    const off = try tl.commit(.{ .offset = .{ .base_id = b1, .amount = 5 } });
+    try std.testing.expectEqual(@as(i64, 115), tl.state().value);
+
+    try std.testing.expectError(error.DependencyViolation, tl.move(off, 0));
+    try std.testing.expectEqual(@as(u32, 3), tl.len());
+    try std.testing.expectEqual(@as(u32, 2), tl.indexOf(off).?);
+
+    // Moving a base later (after its dependent is not allowed either).
+    try std.testing.expectError(error.DependencyViolation, tl.move(b1, 2));
+
+    // Moving something with no dependency relation is fine.
+    try tl.move(off, 1);
+    try std.testing.expectEqual(@as(u32, 1), tl.indexOf(off).?);
+    try std.testing.expectEqual(@as(i64, 115), tl.state().value);
+}
+
+test "dependent feature fails when its dependency is removed" {
+    const gpa = std.testing.allocator;
+    var tl = try Timeline(DepDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    const b1 = try tl.commit(.{ .base = .{ .v = 10 } });
+    _ = try tl.commit(.{ .base = .{ .v = 100 } });
+    _ = try tl.commit(.{ .offset = .{ .base_id = b1, .amount = 5 } });
+
+    tl.remove(b1);
+    try std.testing.expectEqual(@as(i64, 100), tl.state().value);
+
+    // b1 removed: remaining features are the second base and the offset.
+    var it = tl.features();
+    _ = it.next().?;
+    const offset_status = it.next().?.status;
+    try std.testing.expectEqualStrings(
+        "base feature is not applied before this offset",
+        offset_status.failed,
+    );
 }

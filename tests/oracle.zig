@@ -52,6 +52,7 @@ const NaiveEntry = union(enum) {
     edit: struct { idx: u32, old: Domain.Op, new: Domain.Op },
     remove: struct { idx: u32, op: Domain.Op, suppressed: bool, marker_pre: u32 },
     suppress: struct { idx: u32, prev: bool },
+    move: struct { idx: u32, to: u32, marker_pre: u32 },
 };
 
 /// The reference model: no caching, no incremental anything. Mirrors the
@@ -128,6 +129,27 @@ const Naive = struct {
         }
     }
 
+    fn moveFeature(self: *Naive, idx: u32, to: u32) void {
+        const to_c = @min(to, @as(u32, @intCast(self.features.items.len - 1)));
+        if (idx == to_c) return;
+        const lo = @min(idx, to_c);
+        for (self.features.items[lo..]) |*f| self.freeStatus(f);
+        const f = self.features.orderedRemove(idx);
+        self.features.insert(self.gpa, to_c, f) catch unreachable;
+        if (idx < self.marker and to_c >= self.marker) {
+            self.marker -= 1;
+        } else if (idx >= self.marker and to_c < self.marker) {
+            self.marker += 1;
+        }
+    }
+
+    fn move(self: *Naive, idx: u32, to: u32) void {
+        const to_c = @min(to, @as(u32, @intCast(self.features.items.len - 1)));
+        if (idx == to_c) return;
+        self.record(.{ .move = .{ .idx = idx, .to = to_c, .marker_pre = self.marker } });
+        self.moveFeature(idx, to_c);
+    }
+
     fn canUndo(self: *const Naive) bool {
         return self.log_head > 0;
     }
@@ -163,6 +185,10 @@ const Naive = struct {
                 self.features.items[s.idx].suppressed = s.prev;
                 for (self.features.items[s.idx..]) |*f| self.freeStatus(f);
             },
+            .move => |m| {
+                self.moveFeature(m.to, m.idx);
+                self.marker = m.marker_pre;
+            },
         }
         return true;
     }
@@ -190,6 +216,7 @@ const Naive = struct {
                 self.features.items[s.idx].suppressed = !s.prev;
                 for (self.features.items[s.idx..]) |*f| self.freeStatus(f);
             },
+            .move => |m| self.moveFeature(m.idx, m.to),
         }
         return true;
     }
@@ -298,12 +325,12 @@ fn runSequence(seed: u64, steps: u16) !void {
         // too short for index-based ones.
         const action = if (len == 0) 0 else random.uintLessThan(u7, 100);
         switch (action) {
-            0...39 => {
+            0...34 => {
                 const op = randomOp(random);
                 _ = try tl.commit(op);
                 try naive.commit(op);
             },
-            40...54 => {
+            35...49 => {
                 const pos = random.uintAtMost(u32, len);
                 tl.setMarker(pos);
                 naive.setMarker(pos);
@@ -324,11 +351,17 @@ fn runSequence(seed: u64, steps: u16) !void {
                 tl.remove(idAt(&tl, idx));
                 naive.remove(idx);
             },
-            80...89 => {
+            80...86 => {
                 try std.testing.expectEqual(naive.undo(), tl.undo());
             },
-            else => {
+            87...92 => {
                 try std.testing.expectEqual(naive.redo(), tl.redo());
+            },
+            else => {
+                const idx = random.uintAtMost(u32, len - 1);
+                const to = random.uintAtMost(u32, len - 1);
+                tl.move(idAt(&tl, idx), to) catch unreachable;
+                naive.move(idx, to);
             },
         }
         try compare(&tl, &naive, gpa);

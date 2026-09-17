@@ -118,6 +118,11 @@ pub const ApplyContext = struct {
     /// arena and free it before returning.
     alloc: std.mem.Allocator,
 
+    /// Id of the feature being applied. Ops that create named entities in
+    /// the document (Fusion-style "the body this extrude produced") can
+    /// stamp this id into the document so later ops can reference it.
+    feature_id: FeatureId = 0,
+
     message: ?[]const u8 = null,
 
     /// Record a soft failure for the feature being applied and return
@@ -128,6 +133,21 @@ pub const ApplyContext = struct {
     pub fn fail(self: *ApplyContext, comptime fmt: []const u8, args: anytype) error{FeatureFailed} {
         self.message = std.fmt.allocPrint(self.alloc, fmt, args) catch "feature failed";
         return error.FeatureFailed;
+    }
+};
+
+/// Handed to the optional `Domain.dependencies` hook. Call `dep` once per
+/// feature id the op reads from; `Timeline.move` refuses reorders that would
+/// place a dependency after its dependent.
+pub const DepCollector = struct {
+    gpa: std.mem.Allocator,
+    ids: std.ArrayList(FeatureId) = .empty,
+    failed: bool = false,
+
+    pub fn dep(self: *DepCollector, id: FeatureId) void {
+        self.ids.append(self.gpa, id) catch {
+            self.failed = true;
+        };
     }
 };
 
