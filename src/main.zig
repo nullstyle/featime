@@ -340,6 +340,9 @@ pub fn main(init: std.process.Init) !void {
     const integrated = app.tl.integrate(&job);
     try out.print("9. background rebuild to marker 2 on a worker thread: integrated = {}\n", .{integrated});
 
+    // -- 10. Hierarchical timelines: globe + region sub-timeline ----------
+    try @import("nested_demo.zig").run(out, arena);
+
     try out.flush();
 }
 

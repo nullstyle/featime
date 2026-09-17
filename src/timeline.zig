@@ -28,6 +28,12 @@ pub fn Timeline(comptime Domain: type) type {
         gpa: std.mem.Allocator,
         config: ft.Config,
 
+        /// Opaque environment reachable from `Domain.apply` as `ctx.env`.
+        /// The seam for hierarchical timelines: point it at a registry of
+        /// sub-timelines and parent features can read their computed state.
+        /// Set via `setEnv` (or directly); read at apply time.
+        env: ?*anyopaque = null,
+
         list: std.ArrayList(Feature) = .empty,
 
         /// Pristine seed document (position 0, before any feature).
@@ -183,7 +189,7 @@ pub fn Timeline(comptime Domain: type) type {
 
             if (self.broken == null and !self.live_stale and self.built_pos == at) {
                 var applied: u32 = at;
-                ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.gpa, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.gpa, self.env, &applied) catch |err| {
                     // Hard failure: features before `at` are still good on the
                     // live doc, but this op may have partially mutated it.
                     // Flag broken so nothing touches it before a full rebuild.
@@ -276,14 +282,21 @@ pub fn Timeline(comptime Domain: type) type {
         /// dependencies? Simulates the reorder with an index remap.
         fn depsViolated(self: *Self, from: u32, to: u32) bool {
             var collector: ft.DepCollector = .{ .gpa = self.gpa };
-            defer collector.ids.deinit(self.gpa);
+            defer collector.deps.deinit(self.gpa);
             for (self.list.items, 0..) |f, i| {
-                collector.ids.clearRetainingCapacity();
+                collector.deps.clearRetainingCapacity();
                 Domain.dependencies(f.op, &collector);
                 if (collector.failed) return false; // can't validate: allow
                 const mapped_i = remapIndex(@intCast(i), from, to);
-                for (collector.ids.items) |dep_id| {
-                    const j = self.indexOf(dep_id) orelse continue;
+                for (collector.deps.items) |d| {
+                    // A dependency inside a sub-timeline is anchored at the
+                    // feature that introduces that sub-timeline; deeper
+                    // ordering belongs to the sub-timeline's own validation.
+                    const anchor: ft.FeatureId = switch (d) {
+                        .feature => |id| id,
+                        .in_timeline => |ns| ns.timeline_feature,
+                    };
+                    const j = self.indexOf(anchor) orelse continue;
                     if (j == i) continue; // self-reference is not ordering
                     if (remapIndex(j, from, to) >= mapped_i) return true;
                 }
@@ -318,6 +331,22 @@ pub fn Timeline(comptime Domain: type) type {
             }
             self.cps.noteMutation(lo);
             if (lo < self.built_pos) self.live_stale = true;
+        }
+
+        /// Register the environment handed to `Domain.apply` as `ctx.env`.
+        pub fn setEnv(self: *Self, env: *anyopaque) void {
+            self.env = env;
+        }
+
+        /// Re-run a feature and everything after it because inputs the
+        /// library cannot see changed — for example, a sub-timeline read
+        /// through `ctx.env` recomputed. Nothing is journaled: the timeline
+        /// structure is untouched; this is invalidation, not an edit. No-op
+        /// if absent.
+        pub fn refresh(self: *Self, id: ft.FeatureId) void {
+            const idx = self.indexOf(id) orelse return;
+            self.touch();
+            self.invalidate(idx);
         }
 
         // ------------------------------------------------------------------
@@ -502,6 +531,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .applied = start_pos,
                 .base = base,
                 .features = features_copy,
+                .env = self.env,
             };
         }
 
@@ -592,7 +622,7 @@ pub fn Timeline(comptime Domain: type) type {
             if (self.broken == null and !self.live_stale and self.built_pos < self.marker_pos) {
                 self.resetStatuses(self.built_pos);
                 var applied: u32 = self.built_pos;
-                ft.rebuild.applyRange(Domain, self.list.items, self.built_pos, self.marker_pos, &self.live_doc, self.gpa, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.list.items, self.built_pos, self.marker_pos, &self.live_doc, self.gpa, self.env, &applied) catch |err| {
                     self.broken = err;
                     self.built_pos = applied;
                     return;
@@ -625,7 +655,7 @@ pub fn Timeline(comptime Domain: type) type {
                 else
                     self.marker_pos;
                 var applied: u32 = pos;
-                ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.gpa, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.gpa, self.env, &applied) catch |err| {
                     Domain.deinitDoc(&scratch, self.gpa);
                     self.broken = err;
                     return; // live_doc still holds the last good state
@@ -664,6 +694,8 @@ const TestDomain = struct {
         fail: []const u8,
         /// Hard-failing feature (simulates OutOfMemory-class trouble).
         poison: void,
+        /// Reads an external value through `ctx.env` (hierarchical-input test).
+        read_env: void,
     };
     pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
         switch (op) {
@@ -683,6 +715,11 @@ const TestDomain = struct {
             },
             .fail => |msg| return ctx.fail("{s}", .{msg}),
             .poison => return error.Poison,
+            .read_env => {
+                const external: *const i64 = @ptrCast(@alignCast(ctx.env orelse
+                    return ctx.fail("no environment registered", .{})));
+                doc.value += external.*;
+            },
         }
     }
     pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
@@ -1128,6 +1165,9 @@ const DepDomain = struct {
     pub const Op = union(enum) {
         base: struct { v: i64 },
         offset: struct { base_id: ft.FeatureId, amount: i64 },
+        /// Reads a feature inside the "sub-timeline" introduced by
+        /// `occurrence` — stands in for hierarchical references.
+        audit: struct { occurrence: ft.FeatureId },
     };
     pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
         switch (op) {
@@ -1144,12 +1184,14 @@ const DepDomain = struct {
                 }
                 return ctx.fail("base feature is not applied before this offset", .{});
             },
+            .audit => doc.value += 1,
         }
     }
     pub fn dependencies(op: Op, out: *ft.DepCollector) void {
         switch (op) {
             .base => {},
             .offset => |o| out.dep(o.base_id),
+            .audit => |a| out.depIn(a.occurrence, 0xDEAD),
         }
     }
     pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
@@ -1367,4 +1409,46 @@ test "background rebuild runs on a real worker thread" {
     try std.testing.expect(tl.integrate(&job));
     try std.testing.expectEqual(@as(i64, 2), tl.state().value);
     try std.testing.expect(!tl.dirty());
+}
+
+test "refresh re-runs features whose external inputs changed" {
+    const gpa = std.testing.allocator;
+    var external: i64 = 5;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+    tl.setEnv(&external);
+
+    const watcher = try tl.commit(.{ .read_env = {} });
+    _ = try tl.commit(.{ .add = 1 });
+    try std.testing.expectEqual(@as(i64, 6), tl.state().value);
+
+    // External state changes; the timeline cannot know, so it stays cached.
+    external = 50;
+    try std.testing.expectEqual(@as(i64, 6), tl.state().value);
+
+    // refresh re-runs the feature and everything after it.
+    tl.refresh(watcher);
+    try std.testing.expectEqual(@as(i64, 51), tl.state().value);
+
+    // refresh is invalidation, not an edit: undo still lands on the commit.
+    _ = tl.undo();
+    try std.testing.expectEqual(@as(i64, 50), tl.state().value);
+}
+
+test "depIn anchors ordering at the sub-timeline feature" {
+    const gpa = std.testing.allocator;
+    var tl = try Timeline(DepDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    const b1 = try tl.commit(.{ .base = .{ .v = 10 } });
+    _ = try tl.commit(.{ .offset = .{ .base_id = b1, .amount = 5 } });
+    const aud = try tl.commit(.{ .audit = .{ .occurrence = b1 } });
+
+    // Moving the audit before the feature that introduces its sub-timeline
+    // is refused...
+    try std.testing.expectError(error.DependencyViolation, tl.move(aud, 0));
+    // ...but moving it to just after that feature is fine.
+    try tl.move(aud, 1);
+    try std.testing.expectEqual(@as(u32, 1), tl.indexOf(aud).?);
+    try std.testing.expectEqual(@as(i64, 16), tl.state().value);
 }

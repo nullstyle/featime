@@ -124,6 +124,13 @@ pub const ApplyContext = struct {
     /// stamp this id into the document so later ops can reference it.
     feature_id: FeatureId = 0,
 
+    /// Opaque per-timeline environment set via `Timeline.setEnv`, or null.
+    /// The primary use is hierarchical timelines: an environment holding a
+    /// sub-timeline registry lets a parent feature's `apply` read their
+    /// computed state. Environments must be acyclic — see the README section
+    /// on hierarchical timelines.
+    env: ?*anyopaque = null,
+
     message: ?[]const u8 = null,
 
     /// Record a soft failure for the feature being applied and return
@@ -137,16 +144,39 @@ pub const ApplyContext = struct {
     }
 };
 
-/// Handed to the optional `Domain.dependencies` hook. Call `dep` once per
-/// feature id the op reads from; `Timeline.move` refuses reorders that would
-/// place a dependency after its dependent.
+/// One dependency edge declared through the optional `Domain.dependencies`
+/// hook. `Timeline.move` refuses reorders that would place a dependency
+/// after its dependent.
+pub const Dep = union(enum) {
+    /// A dependency on another feature of the same timeline.
+    feature: FeatureId,
+    /// A dependency on a feature *inside* a sub-timeline. Ordering at this
+    /// timeline's level is anchored at `timeline_feature` — the feature that
+    /// introduces the sub-timeline; deeper ordering belongs to the
+    /// sub-timeline's own validation.
+    in_timeline: struct { timeline_feature: FeatureId, feature: FeatureId },
+};
+
+/// Handed to the optional `Domain.dependencies` hook.
 pub const DepCollector = struct {
     gpa: std.mem.Allocator,
-    ids: std.ArrayList(FeatureId) = .empty,
+    deps: std.ArrayList(Dep) = .empty,
     failed: bool = false,
 
+    /// Declare a dependency on another feature of this timeline.
     pub fn dep(self: *DepCollector, id: FeatureId) void {
-        self.ids.append(self.gpa, id) catch {
+        self.deps.append(self.gpa, .{ .feature = id }) catch {
+            self.failed = true;
+        };
+    }
+
+    /// Declare a dependency on a feature inside the sub-timeline introduced
+    /// by `timeline_feature` (hierarchical references).
+    pub fn depIn(self: *DepCollector, timeline_feature: FeatureId, id: FeatureId) void {
+        self.deps.append(self.gpa, .{ .in_timeline = .{
+            .timeline_feature = timeline_feature,
+            .feature = id,
+        } }) catch {
             self.failed = true;
         };
     }

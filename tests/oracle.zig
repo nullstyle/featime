@@ -227,7 +227,7 @@ const Naive = struct {
         for (self.features.items) |*f| self.freeStatus(f);
         var doc: Domain.Doc = .{};
         var applied: u32 = 0;
-        try ft.rebuild.applyRange(Domain, self.features.items, 0, self.marker, &doc, self.gpa, &applied);
+        try ft.rebuild.applyRange(Domain, self.features.items, 0, self.marker, &doc, self.gpa, null, &applied);
         return .{ .value = doc.value, .trace = try doc.trace.toOwnedSlice(self.gpa) };
     }
 };

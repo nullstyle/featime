@@ -8,6 +8,9 @@ const ft = @import("root.zig");
 
 /// Applies `features[from..to]` to `doc`, writing each feature's status.
 ///
+/// `env` is opaque to the library and reaches `Domain.apply` as
+/// `ApplyContext.env` (see `Timeline.setEnv`).
+///
 /// Suppressed features are skipped and marked `.suppressed`. A soft failure
 /// (`error.FeatureFailed` via `ApplyContext.fail`) is recorded as `.failed`
 /// and the range continues — a failed feature does not stop the timeline.
@@ -24,6 +27,7 @@ pub fn applyRange(
     to: u32,
     doc: *Domain.Doc,
     gpa: std.mem.Allocator,
+    env: ?*anyopaque,
     applied: *u32,
 ) anyerror!void {
     applied.* = from;
@@ -35,7 +39,7 @@ pub fn applyRange(
             applied.* = i + 1;
             continue;
         }
-        var ctx: ft.ApplyContext = .{ .alloc = gpa, .feature_id = feature.id };
+        var ctx: ft.ApplyContext = .{ .alloc = gpa, .feature_id = feature.id, .env = env };
         Domain.apply(feature.op, doc, &ctx) catch |err| switch (err) {
             error.FeatureFailed => {
                 feature.status = .{ .failed = ctx.message orelse "feature failed" };
@@ -89,6 +93,9 @@ pub fn Job(comptime Domain: type) type {
         state: State = .pending,
         err: ?anyerror = null,
         cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// Environment captured at begin time; reaches `Domain.apply` as
+        /// `ApplyContext.env`.
+        env: ?*anyopaque = null,
 
         /// Apply features `[start_pos..target)` to `base`. Thread-safe against
         /// `cancel`; touches nothing but this job.
@@ -100,7 +107,7 @@ pub fn Job(comptime Domain: type) type {
                     return;
                 }
                 var applied: u32 = self.applied;
-                ft.rebuild.applyRange(Domain, self.features, self.applied, self.applied + 1, &self.base, self.gpa, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.features, self.applied, self.applied + 1, &self.base, self.gpa, self.env, &applied) catch |err| {
                     self.state = .failed;
                     self.err = err;
                     return;
@@ -165,7 +172,7 @@ test "applyRange records soft failures and continues" {
 
     var doc: Domain.Doc = .{};
     var applied: u32 = 0;
-    try applyRange(Domain, &features, 0, 4, &doc, std.testing.allocator, &applied);
+    try applyRange(Domain, &features, 0, 4, &doc, std.testing.allocator, null, &applied);
 
     try std.testing.expectEqual(@as(i64, 12), doc.value);
     try std.testing.expectEqual(@as(u32, 4), applied);

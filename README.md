@@ -33,6 +33,7 @@ Requires Zig `0.17.0-dev.2151+2ec5523d5` (pinned via `mise`).
 | Undo/redo, independent of the marker | built-in undo/redo journal |
 | Save / open a document | `persistence.save` / `load` |
 | Recompute off the UI thread | `beginRebuild()` / `job.run()` / `integrate()` |
+| Assemblies with component timelines | one `Timeline` per subresource + `setEnv` / `refresh` (see below) |
 
 ## Quick start
 
@@ -144,6 +145,55 @@ suppression, and the marker round-trip; statuses, checkpoints, and the undo
 journal intentionally do not — they recompute, like a Fusion document
 reopening.
 
+## Hierarchical timelines
+
+Fusion's assembly/component model maps directly onto the library: parent
+features *reference* sub-timelines rather than embedding them. Each
+subresource (a region of the globe) gets its own ordinary `Timeline` over
+its own Domain; the parent timeline holds **occurrence features** whose ops
+name the subresource by id.
+
+```zig
+var region_tl = try ft.Timeline(Region).init(gpa, region_seed, .{});
+var globe_tl = try ft.Timeline(Globe).init(gpa, globe_seed, .{});
+
+const env = Env{ .region = &region_tl };      // app-owned registry
+globe_tl.setEnv(&env);                        // reaches apply as ctx.env
+
+// Globe Domain:
+//   .region_occurrence => |o| read env.region.state(), merge into the doc
+const occurrence = try globe_tl.commit(.{ .region_occurrence = .{ .region = 0 } });
+```
+
+The rules of the model:
+
+- **Computed-state merge** (recommended over replaying sub-ops in parent
+  context): the parent's `apply` reads the sub-timeline's `state()` through
+  `ctx.env` and copies what it needs into the parent document. Sub rebuilds
+  stay region-sized; the globe document holds summaries, not raw region ops.
+- **Invalidation is explicit.** The library cannot see external inputs, so
+  when a sub-timeline changes, the app calls `parent.refresh(occurrence_id)`
+  to re-run that feature and everything after it. Refresh journals nothing —
+  the parent's structure didn't change.
+- **Cross-timeline skew is intended.** Scrubbing the *region* marker changes
+  what the occurrence reads (after refresh); rolling the *globe* back past
+  an occurrence leaves the region's own history untouched — exactly how
+  Fusion assemblies treat component occurrences.
+- **Environments must be acyclic.** A parent `apply` may call
+  `sub.state()`, which may lazily rebuild the sub-timeline; sub-timelines
+  must therefore never reference back, directly or transitively.
+- **Cross-level dependencies** are declared with
+  `DepCollector.depIn(timeline_feature, id)`; parent-level reorder
+  validation anchors them at the feature that introduces the sub-timeline.
+- **Ids remain per-timeline.** A reference from a parent is always
+  `(parent feature id naming the sub-timeline, feature id within it)`.
+
+For a multiuser editor this shape doubles as the future sync/merge unit:
+each sub-timeline (with its stable ids and flat journal) is an independent
+shard. `src/nested_demo.zig` (part of `zig build run`) walks the whole
+pattern: region edits, a stale globe, `refresh`, region-marker scrubbing,
+and globe rollback leaving the region untouched.
+
 ## Testing
 
 - Unit tests cover each behavior (co-located `test` blocks).
@@ -165,13 +215,14 @@ src/rebuild.zig    pure replay core + background Job
 src/checkpoint.zig checkpoint cache (internal)
 src/journal.zig    undo/redo journal (internal)
 src/persistence.zig save/load container format
+src/nested_demo.zig two-level globe/region demo (hierarchical timelines)
 src/main.zig       terrain-editor demo
 tests/oracle.zig   differential tests vs a naive reference model
 ```
 
 ## Status & non-goals
 
-v0.1.0. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
+v0.2.0. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
 feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are
