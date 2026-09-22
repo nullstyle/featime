@@ -1,2 +1,5 @@
 [tools]
-zig = "master"
+zig = "0.17.0-dev.2151+2ec5523d5"
+
+[env]
+ZIG_GLOBAL_CACHE_DIR = "{{config_root}}/.zig-global-cache"

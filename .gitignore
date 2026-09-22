@@ -1,3 +1,4 @@
 .zcode/
 zig-out/
 .zig-cache/
+.zig-global-cache/
