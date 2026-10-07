@@ -62,8 +62,13 @@ const std = @import("std");
 pub const timeline = @import("timeline.zig");
 pub const rebuild = @import("rebuild.zig");
 pub const persistence = @import("persistence.zig");
+pub const annotations = @import("annotations.zig");
 
 pub const Timeline = timeline.Timeline;
+pub const Mark = annotations.Mark;
+pub const Meta = annotations.Meta;
+pub const Chapter = annotations.Chapter;
+pub const ChapterId = annotations.ChapterId;
 
 /// Stable identifier for a feature on a timeline.
 ///
@@ -108,6 +113,10 @@ pub fn FeatureView(comptime Op: type) type {
         op: *const Op,
         suppressed: bool,
         status: Status,
+        /// User-assigned display name, if any (annotation layer).
+        name: ?[]const u8 = null,
+        /// Authorship/timestamp recorded at commit, if any (annotation layer).
+        meta: ?Meta = null,
     };
 }
 
@@ -182,10 +191,16 @@ pub const DepCollector = struct {
     }
 };
 
+/// Optional wall-clock source for provenance timestamps. The library itself
+/// is time-source-free; when set, plain `commit` auto-stamps features.
+pub const Clock = *const fn () u64;
+
 /// Tuning knobs for a timeline. The defaults favor correctness and cheap
 /// scrubbing on small documents; applications with huge documents (the
 /// globe-scale case) lower `max_checkpoints` and raise `checkpoint_interval`.
 pub const Config = struct {
+    /// Wall clock used to stamp provenance on plain commits (see `Clock`).
+    now: ?Clock = null,
     /// Write an extra checkpoint every N applied features during a rebuild.
     /// 0 disables interval checkpoints.
     checkpoint_interval: u32 = 256,
@@ -223,4 +238,5 @@ test {
     _ = timeline;
     _ = rebuild;
     _ = persistence;
+    _ = annotations;
 }

@@ -9,6 +9,7 @@ const std = @import("std");
 const ft = @import("root.zig");
 const checkpoint = @import("checkpoint.zig");
 const journaling = @import("journal.zig");
+const annotations = @import("annotations.zig");
 
 /// Mixes into feature-id salts so separately created timelines (including in
 /// different processes / peers) are unlikely to assign colliding ids.
@@ -74,6 +75,20 @@ pub fn Timeline(comptime Domain: type) type {
         /// Undo/redo journal (internal).
         journal: journaling.Journal(Op),
 
+        /// Annotation layer: names, chapters, provenance (tags and groups
+        /// arrive in later milestones). Never affects document computation.
+        ann: annotations.Annotations,
+
+        /// Bumped by annotation changes only — deliberately separate from
+        /// `gen`, which background jobs capture; annotation edits must not
+        /// invalidate running jobs.
+        ann_gen: u64 = 0,
+
+        /// Stable identity of this timeline, persisted so remote references
+        /// can be namespaced `(timeline_id, feature_id)` by a future sync
+        /// layer.
+        timeline_id: u64,
+
         // ------------------------------------------------------------------
         // Lifecycle
         // ------------------------------------------------------------------
@@ -91,6 +106,8 @@ pub fn Timeline(comptime Domain: type) type {
                 .next_id = prng.random().int(ft.FeatureId) | 1,
                 .cps = checkpoint.Checkpoints(Domain).init(gpa, config.max_checkpoints),
                 .journal = journaling.Journal(Op).init(gpa, config.max_journal),
+                .ann = annotations.Annotations.init(gpa),
+                .timeline_id = (prng.random().int(u64) ^ idEntropy(&config)) | 1,
             };
         }
 
@@ -104,8 +121,35 @@ pub fn Timeline(comptime Domain: type) type {
             self.list.deinit(self.gpa);
             self.cps.deinit();
             self.journal.deinit();
+            self.ann.deinit();
             Domain.deinitDoc(&self.seed_doc, self.gpa);
             Domain.deinitDoc(&self.live_doc, self.gpa);
+        }
+
+        /// This timeline's stable identity (see `timeline_id`).
+        pub fn timelineId(self: *const Self) u64 {
+            return self.timeline_id;
+        }
+
+        fn annTouch(self: *Self) void {
+            self.ann_gen += 1;
+        }
+
+        /// Version of the annotation layer; changes independently of `gen`
+        /// so UIs can detect metadata-only edits without conflating them
+        /// with document mutations.
+        pub fn annotationsVersion(self: *const Self) u64 {
+            return self.ann_gen;
+        }
+
+        /// Record through the journal. Note on undo semantics: every
+        /// annotation mutation is journaled above the commit of the feature
+        /// it decorates, so strict LIFO unwinds annotations before their
+        /// feature's commit and rewinds them on redo — no resurrection stash
+        /// is needed. Structural entries that delete features (remove)
+        /// snapshot what they need at record time.
+        fn record(self: *Self, entry: journaling.Journal(Op).Entry) void {
+            self.journal.record(entry);
         }
 
         // ------------------------------------------------------------------
@@ -165,13 +209,26 @@ pub fn Timeline(comptime Domain: type) type {
         /// immediately; otherwise (or if a hard error occurs) the work is
         /// deferred to the next `state()`.
         pub fn commit(self: *Self, op: Op) error{OutOfMemory}!ft.FeatureId {
+            const meta: ?ft.Meta = if (self.config.now) |now| .{ .ts = now() } else null;
+            return self.commitInner(op, meta);
+        }
+
+        /// Commit with explicit provenance. When `Config.now` is set, plain
+        /// `commit` auto-stamps; this overrides/supplements it.
+        pub fn commitWithMeta(self: *Self, op: Op, meta: ft.Meta) error{OutOfMemory}!ft.FeatureId {
+            return self.commitInner(op, meta);
+        }
+
+        fn commitInner(self: *Self, op: Op, meta: ?ft.Meta) error{OutOfMemory}!ft.FeatureId {
             self.touch();
             const id = self.next_id;
             self.next_id +%= 1;
             const at = self.marker_pos;
 
             try self.list.insert(self.gpa, at, .{ .id = id, .op = op });
-            self.journal.record(.{ .commit = .{ .id = id, .op = op, .at = at } });
+            self.record(.{ .commit = .{ .id = id, .op = op, .at = at, .meta = meta } });
+            if (meta) |m| self.ann.setProvenance(id, m) catch {};
+            if (meta != null) self.annTouch();
             self.afterInsert(at);
             return id;
         }
@@ -207,7 +264,7 @@ pub fn Timeline(comptime Domain: type) type {
             self.touch();
             const idx = self.indexOf(id) orelse return;
             const old_op = self.list.items[idx].op;
-            self.journal.record(.{ .edit = .{ .id = id, .old_op = old_op, .new_op = new_op } });
+            self.record(.{ .edit = .{ .id = id, .old_op = old_op, .new_op = new_op } });
             self.list.items[idx].op = new_op;
             self.invalidate(idx);
         }
@@ -218,13 +275,31 @@ pub fn Timeline(comptime Domain: type) type {
             self.touch();
             const idx = self.indexOf(id) orelse return;
             const f = self.list.items[idx];
-            self.journal.record(.{ .remove = .{
+
+            // Snapshot annotations for exact undo, then re-anchor chapters
+            // that point at this feature to its successor-in-place.
+            const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
+                self.list.items[idx + 1].id
+            else
+                null;
+            const name_snap: ?[]const u8 = if (self.ann.nameOf(id)) |n|
+                self.gpa.dupe(u8, n) catch null
+            else
+                null;
+            const fixes = self.ann.reanchorAfterRemove(id, replacement) catch @as([]annotations.ChapterFix, &.{});
+
+            self.record(.{ .remove = .{
                 .id = id,
                 .op = f.op,
                 .at = idx,
                 .suppressed = f.suppressed,
                 .marker_pre = self.marker_pos,
+                .name = name_snap,
+                .meta = self.ann.provenance(id),
+                .chapter_fixes = fixes,
             } });
+            self.ann.removeFeature(id);
+            self.annTouch();
             self.resetStatuses(idx);
             _ = self.list.orderedRemove(idx);
             if (idx < self.marker_pos) self.marker_pos -= 1;
@@ -239,9 +314,107 @@ pub fn Timeline(comptime Domain: type) type {
             const idx = self.indexOf(id) orelse return;
             const prev = self.list.items[idx].suppressed;
             if (prev == suppressed) return;
-            self.journal.record(.{ .suppress = .{ .id = id, .prev = prev } });
+            self.record(.{ .suppress = .{ .id = id, .prev = prev } });
             self.list.items[idx].suppressed = suppressed;
             self.invalidate(idx);
+        }
+
+        // ------------------------------------------------------------------
+        // Annotations: names, chapters, provenance
+        // ------------------------------------------------------------------
+
+        /// Assign (or replace) a feature's display name. No-op if the
+        /// feature is absent.
+        pub fn setFeatureName(self: *Self, id: ft.FeatureId, new_name: []const u8) error{OutOfMemory}!void {
+            if (self.indexOf(id) == null) return;
+            const old = self.ann.nameOf(id);
+            const old_snap: ?[]const u8 = if (old) |o| try self.gpa.dupe(u8, o) else null;
+            errdefer if (old_snap) |o| self.gpa.free(o);
+            const new_snap = try self.gpa.dupe(u8, new_name);
+            errdefer self.gpa.free(new_snap);
+            try self.ann.setName(id, new_name);
+            self.record(.{ .name_set = .{ .id = id, .old = old_snap, .new = new_snap } });
+            self.annTouch();
+        }
+
+        /// Remove a feature's display name. No-op if the feature or its
+        /// name is absent.
+        pub fn clearFeatureName(self: *Self, id: ft.FeatureId) error{OutOfMemory}!void {
+            const old = self.ann.nameOf(id) orelse return;
+            const old_snap = try self.gpa.dupe(u8, old);
+            errdefer self.gpa.free(old_snap);
+            try self.ann.setName(id, null);
+            self.record(.{ .name_set = .{ .id = id, .old = old_snap, .new = null } });
+            self.annTouch();
+        }
+
+        pub fn featureName(self: *const Self, id: ft.FeatureId) ?[]const u8 {
+            return self.ann.nameOf(id);
+        }
+
+        /// Provenance recorded at commit time, if any.
+        pub fn provenance(self: *const Self, id: ft.FeatureId) ?ft.Meta {
+            return self.ann.provenance(id);
+        }
+
+        /// Add a named chapter (a slider bookmark) at `mark`. Chapter ids
+        /// share the feature id space and are never reused.
+        pub fn addChapter(self: *Self, name: []const u8, mark: ft.Mark) error{OutOfMemory}!ft.ChapterId {
+            const cid: ft.ChapterId = self.next_id;
+            self.next_id +%= 1;
+            const entry_name = try self.gpa.dupe(u8, name);
+            errdefer self.gpa.free(entry_name);
+            try self.ann.addChapter(cid, name, mark);
+            self.record(.{ .chapter_add = .{ .chapter = .{ .id = cid, .name = entry_name, .mark = mark } } });
+            self.annTouch();
+            return cid;
+        }
+
+        /// Remove a chapter. No-op if absent.
+        pub fn removeChapter(self: *Self, id: ft.ChapterId) void {
+            const c = self.ann.chapterById(id) orelse return;
+            // Copy out everything the entry needs before removal invalidates
+            // the pointer into the chapters array.
+            const cid = c.id;
+            const mark = c.mark;
+            const entry_name = self.gpa.dupe(u8, c.name) catch return;
+            self.ann.removeChapter(id);
+            self.record(.{ .chapter_remove = .{ .chapter = .{
+                .id = cid,
+                .name = entry_name,
+                .mark = mark,
+            } } });
+            self.annTouch();
+        }
+
+        pub fn renameChapter(self: *Self, id: ft.ChapterId, new_name: []const u8) error{OutOfMemory}!void {
+            const c = self.ann.chapterById(id) orelse return;
+            const old_snap = try self.gpa.dupe(u8, c.name);
+            errdefer self.gpa.free(old_snap);
+            const new_snap = try self.gpa.dupe(u8, new_name);
+            errdefer self.gpa.free(new_snap);
+            try self.ann.renameChapter(id, new_name);
+            self.record(.{ .chapter_rename = .{ .id = id, .old = old_snap, .new = new_snap } });
+            self.annTouch();
+        }
+
+        /// All chapters, in creation order. The slice is valid until the next
+        /// annotation mutation.
+        pub fn chapters(self: *const Self) []const ft.Chapter {
+            return self.ann.chapterList();
+        }
+
+        /// Resolve a mark to a marker position (jump target).
+        pub fn markPosition(self: *const Self, mark: ft.Mark) u32 {
+            const after = mark.after orelse return self.len();
+            const idx = self.indexOf(after) orelse return self.len();
+            return idx + 1;
+        }
+
+        /// Resolve a chapter to a marker position. Null if absent.
+        pub fn chapterPosition(self: *const Self, id: ft.ChapterId) ?u32 {
+            const c = self.ann.chapterById(id) orelse return null;
+            return self.markPosition(c.mark);
         }
 
         /// Reorder a feature to `new_pos` (clamped to the list; interpreted
@@ -263,7 +436,7 @@ pub fn Timeline(comptime Domain: type) type {
                 if (self.depsViolated(from, to)) return error.DependencyViolation;
             }
 
-            self.journal.record(.{ .move = .{
+            self.record(.{ .move = .{
                 .id = id,
                 .from = from,
                 .to = to,
@@ -385,10 +558,16 @@ pub fn Timeline(comptime Domain: type) type {
             switch (entry) {
                 .commit => |e| {
                     const idx = self.indexOf(e.id) orelse return;
+                    // LIFO has already unwound any annotations journaled
+                    // above this commit; clear defensively in case future
+                    // code paths leave one behind.
+                    if (self.ann.takeName(e.id)) |n| self.gpa.free(n);
+                    _ = self.ann.removeProvenance(e.id);
                     self.resetStatuses(idx);
                     _ = self.list.orderedRemove(idx);
                     self.marker_pos = e.at;
                     self.invalidate(idx);
+                    self.annTouch();
                 },
                 .edit => |e| {
                     const idx = self.indexOf(e.id) orelse return;
@@ -403,6 +582,11 @@ pub fn Timeline(comptime Domain: type) type {
                     }) catch return;
                     self.afterInsert(e.at);
                     self.marker_pos = @min(e.marker_pre, @as(u32, @intCast(self.list.items.len)));
+                    // Restore the snapshot annotations exactly.
+                    if (e.name) |n| self.ann.setName(e.id, n) catch {};
+                    if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
+                    self.ann.applyFixes(e.chapter_fixes);
+                    self.annTouch();
                 },
                 .suppress => |e| {
                     const idx = self.indexOf(e.id) orelse return;
@@ -415,6 +599,22 @@ pub fn Timeline(comptime Domain: type) type {
                     // adjustment started from the post-undo marker).
                     self.marker_pos = e.marker_pre;
                 },
+                .name_set => |e| {
+                    self.ann.setName(e.id, e.old) catch {};
+                    self.annTouch();
+                },
+                .chapter_add => |e| {
+                    self.ann.removeChapter(e.chapter.id);
+                    self.annTouch();
+                },
+                .chapter_remove => |e| {
+                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch {};
+                    self.annTouch();
+                },
+                .chapter_rename => |e| {
+                    self.ann.renameChapter(e.id, e.old) catch {};
+                    self.annTouch();
+                },
             }
         }
 
@@ -423,6 +623,8 @@ pub fn Timeline(comptime Domain: type) type {
                 .commit => |e| {
                     self.list.insert(self.gpa, e.at, .{ .id = e.id, .op = e.op }) catch return;
                     self.afterInsert(e.at);
+                    if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
+                    if (e.meta != null) self.annTouch();
                 },
                 .edit => |e| {
                     const idx = self.indexOf(e.id) orelse return;
@@ -431,10 +633,18 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .remove => |e| {
                     const idx = self.indexOf(e.id) orelse return;
+                    const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
+                        self.list.items[idx + 1].id
+                    else
+                        null;
+                    const fixes = self.ann.reanchorAfterRemove(e.id, replacement) catch @as([]annotations.ChapterFix, &.{});
+                    self.gpa.free(fixes); // the entry keeps the originals
+                    self.ann.removeFeature(e.id);
                     self.resetStatuses(idx);
                     _ = self.list.orderedRemove(idx);
                     self.marker_pos = if (e.at < e.marker_pre) e.marker_pre - 1 else e.marker_pre;
                     self.invalidate(idx);
+                    self.annTouch();
                 },
                 .suppress => |e| {
                     const idx = self.indexOf(e.id) orelse return;
@@ -442,6 +652,22 @@ pub fn Timeline(comptime Domain: type) type {
                     self.invalidate(idx);
                 },
                 .move => |e| self.rawMove(e.id, e.to),
+                .name_set => |e| {
+                    self.ann.setName(e.id, e.new) catch {};
+                    self.annTouch();
+                },
+                .chapter_add => |e| {
+                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch {};
+                    self.annTouch();
+                },
+                .chapter_remove => |e| {
+                    self.ann.removeChapter(e.chapter.id);
+                    self.annTouch();
+                },
+                .chapter_rename => |e| {
+                    self.ann.renameChapter(e.id, e.new) catch {};
+                    self.annTouch();
+                },
             }
         }
 
@@ -463,6 +689,8 @@ pub fn Timeline(comptime Domain: type) type {
             items: []const Feature,
             i: u32 = 0,
 
+            ann: *const annotations.Annotations,
+
             pub fn next(self: *Iterator) ?FeatureView {
                 if (self.i >= self.items.len) return null;
                 const f = &self.items[self.i];
@@ -472,6 +700,8 @@ pub fn Timeline(comptime Domain: type) type {
                     .op = &f.op,
                     .suppressed = f.suppressed,
                     .status = f.status,
+                    .name = self.ann.nameOf(f.id),
+                    .meta = self.ann.provenance(f.id),
                 };
             }
         };
@@ -479,13 +709,20 @@ pub fn Timeline(comptime Domain: type) type {
         /// Iterate features oldest-first. Statuses reflect the last completed
         /// rebuild (see `Status` for the validity rules).
         pub fn features(self: *const Self) Iterator {
-            return .{ .items = self.list.items };
+            return .{ .items = self.list.items, .ann = &self.ann };
         }
 
         pub fn featureById(self: *const Self, id: ft.FeatureId) ?FeatureView {
             const idx = self.indexOf(id) orelse return null;
             const f = &self.list.items[idx];
-            return .{ .id = f.id, .op = &f.op, .suppressed = f.suppressed, .status = f.status };
+            return .{
+                .id = f.id,
+                .op = &f.op,
+                .suppressed = f.suppressed,
+                .status = f.status,
+                .name = self.ann.nameOf(id),
+                .meta = self.ann.provenance(id),
+            };
         }
 
         // ------------------------------------------------------------------
@@ -1451,4 +1688,171 @@ test "depIn anchors ordering at the sub-timeline feature" {
     try tl.move(aud, 1);
     try std.testing.expectEqual(@as(u32, 1), tl.indexOf(aud).?);
     try std.testing.expectEqual(@as(i64, 16), tl.state().value);
+}
+
+// ---------------------------------------------------------------------------
+// Annotation tests (Wave 1)
+// ---------------------------------------------------------------------------
+
+test "feature names: set, view, undo/redo, survive removal round trip" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+    try tl.setFeatureName(a, "hill");
+    try tl.setFeatureName(b, "valley");
+    try std.testing.expectEqualStrings("hill", tl.featureName(a).?);
+    try std.testing.expectEqualStrings("valley", tl.featureById(b).?.name.?);
+
+    // Rename is undoable and redoable.
+    try tl.setFeatureName(a, "big hill");
+    try std.testing.expectEqualStrings("big hill", tl.featureName(a).?);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqualStrings("hill", tl.featureName(a).?);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqualStrings("big hill", tl.featureName(a).?);
+
+    // Undo unwinds annotation edits along with everything else (strict
+    // LIFO); redo rewinds them through their own journal entries.
+    _ = tl.undo(); // name a: big hill -> hill
+    _ = tl.undo(); // name b: valley -> none
+    _ = tl.undo(); // name a: hill -> none
+    _ = tl.undo(); // commit b: feature gone
+    try std.testing.expectEqual(@as(u32, 1), tl.len());
+    try std.testing.expect(tl.featureName(b) == null);
+    _ = tl.redo(); // commit b back
+    _ = tl.redo(); // name a: hill
+    _ = tl.redo(); // name b: valley
+    try std.testing.expectEqualStrings("valley", tl.featureName(b).?);
+    // Once a new edit clears the redo region, the names die for good.
+    // (The fourth undo also removes feature `a` — its commit was popped.)
+    _ = tl.undo();
+    _ = tl.undo();
+    _ = tl.undo();
+    _ = tl.undo();
+    const c3 = try tl.commit(.{ .add = 3 });
+    try std.testing.expect(tl.featureName(b) == null);
+    try std.testing.expect(tl.featureName(a) == null);
+    try std.testing.expect(tl.featureById(a) == null);
+
+    // Removal snapshots the name; undo restores it exactly.
+    try tl.setFeatureName(c3, "keeper");
+    tl.remove(c3);
+    try std.testing.expect(tl.featureName(c3) == null);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqualStrings("keeper", tl.featureName(c3).?);
+}
+
+test "chapters: anchor, jump, rename, and persistence of position" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+
+    const mid = try tl.addChapter("after b", .{ .after = b });
+    const tip = try tl.addChapter("latest", .{ .after = null });
+    try std.testing.expectEqual(@as(u32, 2), tl.chapterPosition(mid).?);
+    try std.testing.expectEqual(@as(u32, 3), tl.chapterPosition(tip).?);
+
+    // Jump via the chapter.
+    tl.setMarker(tl.chapterPosition(mid).?);
+    try std.testing.expectEqual(@as(i64, 3), tl.state().value);
+
+    // Renaming is undoable; removal is undoable.
+    try tl.renameChapter(mid, "post-b");
+    try std.testing.expectEqualStrings("post-b", tl.chapters()[0].name);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqualStrings("after b", tl.chapters()[0].name);
+    tl.removeChapter(tip);
+    try std.testing.expectEqual(@as(usize, 1), tl.chapters().len);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(usize, 2), tl.chapters().len);
+
+    // The chapter follows its anchor feature across moves.
+    try tl.move(b, 0);
+    try std.testing.expectEqual(@as(u32, 1), tl.chapterPosition(mid).?);
+
+    // End-pinned follows the tip.
+    _ = try tl.commit(.{ .add = 4 });
+    try std.testing.expectEqual(@as(u32, 4), tl.chapterPosition(tip).?);
+}
+
+test "chapters: anchor removal re-anchors, undo restores exactly" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+    const c = try tl.commit(.{ .add = 3 });
+    const ch = try tl.addChapter("at b", .{ .after = b });
+    try std.testing.expectEqual(@as(u32, 2), tl.chapterPosition(ch).?);
+
+    // Removing the anchor re-anchors to the successor-in-place (c).
+    tl.remove(b);
+    try std.testing.expectEqual(@as(u32, 2), tl.chapterPosition(ch).?);
+    try std.testing.expectEqual(c, tl.chapters()[0].mark.after.?);
+
+    // Undo restores the original anchor.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(b, tl.chapters()[0].mark.after.?);
+    try std.testing.expectEqual(@as(u32, 2), tl.chapterPosition(ch).?);
+
+    // Removing the current anchor (b, restored by the undo above) re-anchors
+    // to its successor (c); removing the last feature pins to the end.
+    tl.remove(b);
+    try std.testing.expectEqual(c, tl.chapters()[0].mark.after.?);
+    tl.remove(c);
+    try std.testing.expect(tl.chapters()[0].mark.after == null);
+}
+
+var g_clock: u64 = 0;
+
+test "provenance: explicit meta and clock auto-stamping" {
+    const gpa = std.testing.allocator;
+    g_clock = 1000;
+    const clock: ft.Clock = struct {
+        fn now() u64 {
+            g_clock += 1;
+            return g_clock;
+        }
+    }.now;
+
+    var tl = try TestTimeline.init(gpa, .{}, .{ .now = clock });
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    const b = try tl.commitWithMeta(.{ .add = 2 }, .{ .author = 7, .ts = 5 });
+
+    try std.testing.expectEqual(ft.Meta{ .ts = 1001 }, tl.provenance(a).?);
+    try std.testing.expectEqual(ft.Meta{ .author = 7, .ts = 5 }, tl.provenance(b).?);
+    try std.testing.expectEqual(@as(?ft.Meta, .{ .ts = 1001 }), tl.featureById(a).?.meta);
+
+    // Provenance rides undo/redo of the commit.
+    try std.testing.expect(tl.undo());
+    try std.testing.expect(tl.provenance(b) == null);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(ft.Meta{ .author = 7, .ts = 5 }, tl.provenance(b).?);
+}
+
+test "annotation edits do not invalidate document state or jobs" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    _ = tl.state();
+    const gen_before = tl.gen;
+    const v_before = tl.annotationsVersion();
+
+    try tl.setFeatureName(a, "x");
+    _ = try tl.addChapter("ch", .{ .after = a });
+    try std.testing.expect(!tl.dirty());
+    try std.testing.expectEqual(gen_before, tl.gen);
+    try std.testing.expect(tl.annotationsVersion() != v_before);
 }
