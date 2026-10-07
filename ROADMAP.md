@@ -96,7 +96,7 @@ verified against the naive model.
 
 ---
 
-## Wave 2 — Journal transactions (→ 0.4.0)
+## Wave 2 — Journal transactions (→ 0.4.0) — DELIVERED
 
 - `journal` grouping: begin/commit/rollback; undo and redo pop whole
   transactions; public ops implicitly transactional; re-express Wave 1's

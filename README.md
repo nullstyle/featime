@@ -141,6 +141,30 @@ persistent random identity written into the FTZ2 container (FTZ1 files load
 with no annotations) — groundwork for `(timeline_id, feature_id)` global
 references in the future sync layer.
 
+## Transactions
+
+Every journaled edit is an undo unit by itself; group edits into one unit
+with an explicit transaction:
+
+```zig
+tl.beginTransaction();
+defer tl.endTransaction();
+
+_ = try tl.commit(.{ .raise = .{ .cell = 42, .amount = 9 } });
+tl.edit(hill, .{ .raise = .{ .cell = 42, .amount = 12 } });
+try tl.setFeatureName(hill, "steeper");
+tl.endTransaction(); // deferred end is fine
+
+tl.undo(); // the whole batch rewinds in one step
+```
+
+Nested begins flatten into the outermost unit; an empty transaction records
+nothing; an unbalanced `endTransaction` is a no-op. The library's own group
+operations (batch suppression, `moveGroup`, `removeGroupContents`) are built
+as transactions over simple entries — there are no special compound journal
+kinds. Journal eviction below `max_journal` removes whole units only, so
+undo boundaries survive memory pressure.
+
 ## Contracts
 
 - **Ops are plain data.** Op payloads must not own heap memory or hold

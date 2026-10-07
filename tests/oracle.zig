@@ -63,8 +63,6 @@ const NaiveEntry = union(enum) {
     group_add: struct { pos: usize, name: []u8, first: ?u32, last: ?u32 },
     group_remove: struct { pos: usize, name: []u8, first: ?u32, last: ?u32 },
     group_rename: struct { pos: usize, old: []u8, new: []u8 },
-    naive_group_suppress: struct { changes: []NaiveSuppressChange },
-    naive_group_move: struct { nids: []u64, from: u32, to: u32, marker_pre: u32 },
     suppress: struct { idx: u32, prev: bool },
     move: struct { idx: u32, to: u32, marker_pre: u32 },
     name_set: struct { idx: u32, old: ?[]u8, new: ?[]u8 },
@@ -79,8 +77,6 @@ const NaiveChapter = struct {
     after: ?u32,
 };
 
-const NaiveSuppressChange = struct { nid: u64, prev: bool };
-
 const NaiveGroup = struct {
     name: []u8,
     /// Anchor indices; null = dead anchor (empty folder).
@@ -92,12 +88,20 @@ const NaiveGroup = struct {
 /// timeline's structural semantics (insert-at-marker, marker/mutation index
 /// adjustments) and recomputes by replay from the seed.
 const Naive = struct {
+    const NaiveRecord = struct {
+        e: NaiveEntry,
+        txn_start: bool = false,
+    };
+
     gpa: std.mem.Allocator,
     features: std.ArrayList(NaiveFeature) = .empty,
     marker: u32 = 0,
-    log: std.ArrayList(NaiveEntry) = .empty,
+    log: std.ArrayList(NaiveRecord) = .empty,
     log_head: usize = 0,
     journal_max: u32,
+    txn_depth: u32 = 0,
+    txn_pending: bool = false,
+    unit_done: bool = false,
     /// Per-index display names (index-mirrored; strings owned).
     names: std.ArrayList(?[]u8) = .empty,
     chapters: std.ArrayList(NaiveChapter) = .empty,
@@ -111,7 +115,7 @@ const Naive = struct {
     fn deinit(self: *Naive) void {
         for (self.features.items) |*f| self.freeStatus(f);
         self.features.deinit(self.gpa);
-        for (self.log.items) |*e| self.deinitEntry(e);
+        for (self.log.items) |*r| self.deinitEntry(&r.e);
         self.log.deinit(self.gpa);
         for (self.names.items) |n| {
             if (n) |owned| self.gpa.free(owned);
@@ -218,31 +222,52 @@ const Naive = struct {
                 self.gpa.free(g.old);
                 self.gpa.free(g.new);
             },
-            .naive_group_suppress => |g| self.gpa.free(g.changes),
-            .naive_group_move => |g| self.gpa.free(g.nids),
             else => {},
         }
     }
 
+    fn beginTxn(self: *Naive) void {
+        if (self.txn_depth == 0) self.txn_pending = true;
+        self.txn_depth += 1;
+    }
+
+    fn endTxn(self: *Naive) void {
+        if (self.txn_depth == 0) return;
+        self.txn_depth -= 1;
+        if (self.txn_depth == 0) self.txn_pending = false;
+    }
+
     fn record(self: *Naive, e: NaiveEntry) void {
+        const starts_unit = if (self.txn_depth > 0) self.txn_pending else true;
         if (self.journal_max == 0) {
             var dead = e;
             self.deinitEntry(&dead);
             return;
         }
-        for (self.log.items[self.log_head..]) |*t| self.deinitEntry(t);
+        self.txn_pending = false;
+        for (self.log.items[self.log_head..]) |*t| self.deinitEntry(&t.e);
         self.log.shrinkRetainingCapacity(self.log_head);
-        self.log.append(self.gpa, e) catch {
+        self.log.append(self.gpa, .{ .e = e, .txn_start = starts_unit }) catch {
             var dead = e;
             self.deinitEntry(&dead);
             return;
         };
         self.log_head += 1;
-        if (self.log.items.len > self.journal_max) {
-            var dead = self.log.orderedRemove(0);
-            self.deinitEntry(&dead);
-            self.log_head -= 1;
+        self.evictWholeUnits();
+    }
+
+    fn evictWholeUnits(self: *Naive) void {
+        var cut: usize = 0;
+        while (self.log.items.len - cut > self.journal_max) {
+            var next = cut + 1;
+            while (next < self.log.items.len and !self.log.items[next].txn_start) next += 1;
+            if (next >= self.log.items.len) break;
+            for (self.log.items[cut..next]) |*r| self.deinitEntry(&r.e);
+            cut = next;
         }
+        if (cut == 0) return;
+        self.log.replaceRange(self.gpa, 0, cut, &.{}) catch return;
+        self.log_head -|= cut;
     }
 
     fn moveFeature(self: *Naive, idx: u32, to: u32) void {
@@ -492,23 +517,17 @@ const Naive = struct {
         return .{ .lo = f, .hi = l };
     }
 
-    fn setGroupSuppressedAt(self: *Naive, pos: usize, target: bool) !void {
+    fn setGroupSuppressedAt(self: *Naive, pos: usize, target: bool) void {
         const span = self.groupSpanLive(pos) orelse return;
-        var changes: std.ArrayList(NaiveSuppressChange) = .empty;
-        defer changes.deinit(self.gpa);
+        self.beginTxn();
+        defer self.endTxn();
         var i = span.lo;
         while (i <= span.hi) : (i += 1) {
-            if (self.features.items[i].suppressed != target) {
-                try changes.append(self.gpa, .{ .nid = self.nids.items[i], .prev = self.features.items[i].suppressed });
+            const f = self.features.items[i];
+            if (f.suppressed != target) {
+                self.record(.{ .suppress = .{ .idx = i, .prev = f.suppressed } });
+                self.features.items[i].suppressed = target;
             }
-        }
-        if (changes.items.len == 0) return;
-        const owned = try changes.toOwnedSlice(self.gpa);
-        errdefer self.gpa.free(owned);
-        self.record(.{ .naive_group_suppress = .{ .changes = owned } });
-        for (owned) |ch| {
-            const idx = self.idxOfNid(ch.nid) orelse continue;
-            self.features.items[idx].suppressed = target;
         }
     }
 
@@ -517,23 +536,16 @@ const Naive = struct {
         const n: u32 = span.hi - span.lo + 1;
         const to = @min(new_pos, @as(u32, @intCast(self.features.items.len)) - n);
         if (to == span.lo) return;
-        var buf: [64]u64 = undefined;
-        if (n > buf.len) return;
-        for (span.lo..span.hi + 1) |i| buf[i - span.lo] = self.nids.items[i];
-        const owned = self.gpa.dupe(u64, buf[0..n]) catch return;
-        self.record(.{ .naive_group_move = .{
-            .nids = owned,
-            .from = span.lo,
-            .to = to,
-            .marker_pre = self.marker,
-        } });
-        self.applyNaiveGroupMove(buf[0..n], to);
-    }
-
-    fn applyNaiveGroupMove(self: *Naive, nids: []const u64, to: u32) void {
-        for (nids, 0..) |nid, k| {
-            const idx = self.idxOfNid(nid) orelse continue;
-            self.moveFeature(idx, to + @as(u32, @intCast(k)));
+        if (n > 4096) return;
+        self.beginTxn();
+        defer self.endTxn();
+        var k: u32 = 0;
+        while (k < n) : (k += 1) {
+            const member = self.nids.items[span.lo];
+            const marker_pre = self.marker;
+            self.record(.{ .move = .{ .idx = span.lo, .to = to + k, .marker_pre = marker_pre } });
+            self.moveFeature(span.lo, to + k);
+            _ = member;
         }
     }
 
@@ -547,8 +559,25 @@ const Naive = struct {
 
     fn undo(self: *Naive) bool {
         if (self.log_head == 0) return false;
+        const first = self.nextUndoEntry() orelse return false;
+        if (!self.undoEntry(first)) return false;
+        while (!self.unit_done) {
+            const e = self.nextUndoEntry() orelse break;
+            if (!self.undoEntry(e)) break;
+            if (self.unit_done) break;
+        }
+        return true;
+    }
+
+    fn nextUndoEntry(self: *Naive) ?NaiveEntry {
+        if (self.log_head == 0) return null;
         self.log_head -= 1;
-        const e = self.log.items[self.log_head];
+        const rec = self.log.items[self.log_head];
+        self.unit_done = rec.txn_start;
+        return rec.e;
+    }
+
+    fn undoEntry(self: *Naive, e: NaiveEntry) bool {
         switch (e) {
             .commit => |c| {
                 for (self.features.items[c.idx..]) |*f| self.freeStatus(f);
@@ -627,22 +656,6 @@ const Naive = struct {
                 self.gpa.free(target.name);
                 target.name = duped;
             },
-            .naive_group_suppress => |g| {
-                for (g.changes) |ch| {
-                    const idx = self.idxOfNid(ch.nid) orelse continue;
-                    self.features.items[idx].suppressed = ch.prev;
-                }
-            },
-            .naive_group_move => |g| {
-                var k: usize = g.nids.len;
-                while (k > 0) {
-                    k -= 1;
-                    if (self.idxOfNid(g.nids[k])) |idx| {
-                        self.moveFeature(idx, g.from + @as(u32, @intCast(k)));
-                    }
-                }
-                self.marker = g.marker_pre;
-            },
             .chapter_add => |c| {
                 const dead = self.chapters.orderedRemove(c.pos);
                 self.gpa.free(dead.name);
@@ -665,8 +678,27 @@ const Naive = struct {
 
     fn redo(self: *Naive) bool {
         if (self.log_head >= self.log.items.len) return false;
-        const e = self.log.items[self.log_head];
+        const first = self.nextRedoEntry() orelse return false;
+        if (!self.redoEntry(first)) return false;
+        while (!self.unit_done) {
+            const e = self.nextRedoEntry() orelse break;
+            if (!self.redoEntry(e)) break;
+            if (self.unit_done) break;
+        }
+        return true;
+    }
+
+    fn nextRedoEntry(self: *Naive) ?NaiveEntry {
+        if (self.log_head >= self.log.items.len) return null;
+        const rec = self.log.items[self.log_head];
         self.log_head += 1;
+        const done = self.log_head >= self.log.items.len or
+            self.log.items[self.log_head].txn_start;
+        self.unit_done = done;
+        return rec.e;
+    }
+
+    fn redoEntry(self: *Naive, e: NaiveEntry) bool {
         switch (e) {
             .commit => |c| {
                 self.features.insert(self.gpa, c.idx, .{ .id = 0, .op = c.op }) catch return false;
@@ -719,13 +751,6 @@ const Naive = struct {
                 self.gpa.free(target.name);
                 target.name = duped;
             },
-            .naive_group_suppress => |g| {
-                for (g.changes) |ch| {
-                    const idx = self.idxOfNid(ch.nid) orelse continue;
-                    self.features.items[idx].suppressed = !ch.prev;
-                }
-            },
-            .naive_group_move => |g| self.applyNaiveGroupMove(g.nids, g.to),
             .chapter_add => |c| {
                 self.chapters.insert(self.gpa, c.pos, .{
                     .name = self.gpa.dupe(u8, c.name) catch return false,
@@ -888,6 +913,7 @@ fn runSequence(seed: u64, steps: u16) !void {
     var step: u16 = 0;
     var last_action: u7 = 0;
     errdefer std.debug.print("FAIL seed={d} step={d} action={d}\n", .{ seed, step, last_action });
+    _ = &last_action;
 
     var tl = try Timeline.init(gpa, .{}, randomConfig(random));
     defer tl.deinit();
@@ -895,82 +921,104 @@ fn runSequence(seed: u64, steps: u16) !void {
     defer naive.deinit();
 
     while (step < steps) : (step += 1) {
-        const len: u32 = @intCast(naive.features.items.len);
-        // Roll a structural action; fall back to commit when the timeline is
-        // too short for index-based ones.
-        const action = if (len == 0) 0 else random.uintLessThan(u7, 100);
-        last_action = action;
-        switch (action) {
-            0...29 => {
-                const op = randomOp(random);
-                _ = try tl.commit(op);
-                try naive.commit(op);
-            },
-            30...33 => {
-                const idx = random.uintAtMost(u32, len - 1);
-                const pool = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon" };
-                const name = pool[random.uintAtMost(u3, 4)];
-                try tl.setFeatureName(idAt(&tl, idx), name);
-                try naive.setName(idx, name);
-            },
-            34...35 => {
-                const idx = random.uintAtMost(u32, len - 1);
-                if (naive.names.items[idx] != null) {
-                    tl.clearFeatureName(idAt(&tl, idx)) catch unreachable;
-                    try naive.setName(idx, null);
-                }
-            },
-            36...37 => {
-                const idx = random.uintAtMost(u32, len - 1);
-                const pool = [_][]const u8{ "tA", "tB", "tC", "tD" };
-                const tag = pool[random.uintAtMost(u2, 3)];
-                try tl.addTag(idAt(&tl, idx), tag);
-                try naive.addTag(idx, tag);
-            },
-            38...39 => {
-                const idx = random.uintAtMost(u32, len - 1);
-                if (naive.tag_lists.items[idx].items.len > 0) {
-                    const pick = random.uintAtMost(usize, naive.tag_lists.items[idx].items.len - 1);
-                    const tag = naive.tag_lists.items[idx].items[pick];
-                    tl.removeTag(idAt(&tl, idx), tag);
-                    naive.removeTag(idx, tag);
-                }
-            },
-            40...49 => {
-                const pos = random.uintAtMost(u32, len);
-                tl.setMarker(pos);
-                naive.setMarker(pos);
-            },
-            55...64 => {
-                const idx = random.uintAtMost(u32, len - 1);
-                tl.setSuppressed(idAt(&tl, idx), !naive.features.items[idx].suppressed);
-                naive.toggleSuppress(idx);
-            },
-            65...74 => {
-                const idx = random.uintAtMost(u32, len - 1);
-                const op = randomOp(random);
-                tl.edit(idAt(&tl, idx), op);
-                naive.edit(idx, op);
-            },
-            75...79 => {
-                const idx = random.uintAtMost(u32, len - 1);
-                tl.remove(idAt(&tl, idx));
-                naive.remove(idx);
-            },
-            80...86 => {
-                try std.testing.expectEqual(naive.undo(), tl.undo());
-            },
-            87...92 => {
-                try std.testing.expectEqual(naive.redo(), tl.redo());
-            },
-            else => {
-                const idx = random.uintAtMost(u32, len - 1);
-                const to = random.uintAtMost(u32, len - 1);
-                tl.move(idAt(&tl, idx), to) catch unreachable;
-                naive.move(idx, to);
-            },
-        }
+        try stepAction(&tl, &naive, random, &last_action);
         try compare(&tl, &naive, gpa);
+    }
+}
+
+fn stepAction(
+    tl: *Timeline,
+    naive: *Naive,
+    random: std.Random,
+    last_action: *u7,
+) !void {
+    const len: u32 = @intCast(naive.features.items.len);
+    // Roll a structural action; fall back to commit when the timeline is
+    // too short for index-based ones.
+    const action = if (len == 0) 0 else random.uintLessThan(u7, 100);
+    last_action.* = action;
+    switch (action) {
+        0...29 => {
+            const op = randomOp(random);
+            _ = try tl.commit(op);
+            try naive.commit(op);
+        },
+        30...33 => {
+            const idx = random.uintAtMost(u32, len - 1);
+            const pool = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon" };
+            const name = pool[random.uintAtMost(u3, 4)];
+            try tl.setFeatureName(idAt(tl, idx), name);
+            try naive.setName(idx, name);
+        },
+        34...35 => {
+            const idx = random.uintAtMost(u32, len - 1);
+            if (naive.names.items[idx] != null) {
+                tl.clearFeatureName(idAt(tl, idx)) catch unreachable;
+                try naive.setName(idx, null);
+            }
+        },
+        36...37 => {
+            const idx = random.uintAtMost(u32, len - 1);
+            const pool = [_][]const u8{ "tA", "tB", "tC", "tD" };
+            const tag = pool[random.uintAtMost(u2, 3)];
+            try tl.addTag(idAt(tl, idx), tag);
+            try naive.addTag(idx, tag);
+        },
+        38...39 => {
+            const idx = random.uintAtMost(u32, len - 1);
+            if (naive.tag_lists.items[idx].items.len > 0) {
+                const pick = random.uintAtMost(usize, naive.tag_lists.items[idx].items.len - 1);
+                const tag = naive.tag_lists.items[idx].items[pick];
+                tl.removeTag(idAt(tl, idx), tag);
+                naive.removeTag(idx, tag);
+            }
+        },
+        40...49 => {
+            const pos = random.uintAtMost(u32, len);
+            tl.setMarker(pos);
+            naive.setMarker(pos);
+        },
+        55...64 => {
+            const idx = random.uintAtMost(u32, len - 1);
+            tl.setSuppressed(idAt(tl, idx), !naive.features.items[idx].suppressed);
+            naive.toggleSuppress(idx);
+        },
+        65...74 => {
+            const idx = random.uintAtMost(u32, len - 1);
+            const op = randomOp(random);
+            tl.edit(idAt(tl, idx), op);
+            naive.edit(idx, op);
+        },
+        75...79 => {
+            const idx = random.uintAtMost(u32, len - 1);
+            tl.remove(idAt(tl, idx));
+            naive.remove(idx);
+        },
+        80...83 => {
+            try std.testing.expectEqual(naive.undo(), tl.undo());
+        },
+        84 => {
+            // Explicit transaction: 2-4 random journaled edits grouped
+            // into one undo unit on both sides.
+            tl.beginTransaction();
+            naive.beginTxn();
+            const sub_count: u32 = 2 + @as(u32, random.uintAtMost(u2, 2));
+            var sub: u32 = 0;
+            while (sub < sub_count) : (sub += 1) {
+                try stepAction(tl, naive, random, last_action);
+            }
+            tl.endTransaction();
+            naive.endTxn();
+        },
+        85...88 => {
+            try std.testing.expectEqual(naive.redo(), tl.redo());
+        },
+        else => {
+            const idx = random.uintAtMost(u32, len - 1);
+            const to = random.uintAtMost(u32, len - 1);
+            tl.move(idAt(tl, idx), to) catch unreachable;
+            naive.move(idx, to);
+        },
     }
 }
 

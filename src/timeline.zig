@@ -556,28 +556,16 @@ pub fn Timeline(comptime Domain: type) type {
             return null;
         }
 
-        /// Suppress or unsuppress every member of a group — one undo step.
-        pub fn setGroupSuppressed(self: *Self, id: ft.annotations.GroupId, suppressed: bool) error{OutOfMemory}!void {
+        /// Suppress or unsuppress every member of a group — one undo step
+        /// (a transaction over per-member suppress entries).
+        pub fn setGroupSuppressed(self: *Self, id: ft.annotations.GroupId, suppressed: bool) void {
             const g = self.ann.groupById(id) orelse return;
             const span = self.groupSpan(g) orelse return;
-            var changes: std.ArrayList(journaling.Journal(Op).SuppressChange) = .empty;
-            defer changes.deinit(self.gpa);
+            self.beginTransaction();
+            defer self.endTransaction();
             var i: u32 = span.lo;
             while (i <= span.hi) : (i += 1) {
-                const f = &self.list.items[i];
-                if (f.suppressed != suppressed) {
-                    try changes.append(self.gpa, .{ .id = f.id, .prev = f.suppressed });
-                }
-            }
-            if (changes.items.len == 0) return;
-            const owned = try changes.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(owned);
-            self.record(.{ .group_suppress = .{ .changes = owned } });
-            self.touch();
-            for (owned) |ch| {
-                const idx = self.indexOf(ch.id) orelse continue;
-                self.list.items[idx].suppressed = suppressed;
-                self.invalidate(idx);
+                self.setSuppressed(self.list.items[i].id, suppressed);
             }
         }
 
@@ -597,28 +585,25 @@ pub fn Timeline(comptime Domain: type) type {
             if (comptime hasDeps(Domain)) {
                 if (self.groupMoveViolatesDeps(span, to)) return error.DependencyViolation;
             }
+            if (n > 4096) return error.OutOfMemory; // huge groups: raise later
 
-            var ids_buf: [64]ft.FeatureId = undefined;
-            if (n > ids_buf.len) return error.OutOfMemory; // large groups: raise later
-            for (self.list.items[span.lo .. span.hi + 1], 0..) |*f, i| ids_buf[i] = f.id;
-            const ids = try self.gpa.dupe(ft.FeatureId, ids_buf[0..n]);
-            errdefer self.gpa.free(ids);
-
-            self.record(.{ .group_move = .{
-                .ids = ids,
-                .from = span.lo,
-                .to = to,
-                .marker_pre = self.marker_pos,
-            } });
-            self.applyGroupMove(ids_buf[0..n], to);
-        }
-
-        fn applyGroupMove(self: *Self, ids: []const ft.FeatureId, to: u32) void {
-            // Sequential rawMoves: member k always sits at the old block
-            // start when its turn comes, whichever direction the block
-            // travels (see the M4 notes in ROADMAP-era commits).
-            for (ids, 0..) |id, k| {
-                self.rawMove(id, to + @as(u32, @intCast(k)));
+            // Transaction of per-member move entries. Sequential rawMoves:
+            // member k always sits at the old block start when its turn
+            // comes, whichever direction the block travels.
+            self.beginTransaction();
+            defer self.endTransaction();
+            var k: u32 = 0;
+            while (k < n) : (k += 1) {
+                const member = self.list.items[span.lo].id;
+                const from: u32 = span.lo;
+                const marker_pre = self.marker_pos;
+                self.record(.{ .move = .{
+                    .id = member,
+                    .from = from,
+                    .to = to + k,
+                    .marker_pre = marker_pre,
+                } });
+                self.rawMove(member, to + k);
             }
         }
 
@@ -658,82 +643,27 @@ pub fn Timeline(comptime Domain: type) type {
             return if (i > span.hi and i < to + n) i - n else i;
         }
 
-        /// Delete a group and its members in one undo step. No-op if the
-        /// group is absent; an empty group just disappears.
-        pub fn removeGroupContents(self: *Self, id: ft.annotations.GroupId) error{OutOfMemory}!void {
+        /// Delete a group and its members in one undo step (a transaction
+        /// of per-member removes plus the group removal). No-op if the group
+        /// is absent; an empty group just disappears. Member annotations
+        /// ride the per-member remove snapshots.
+        pub fn removeGroupContents(self: *Self, id: ft.annotations.GroupId) void {
             self.touch();
-            const marker_pre = self.marker_pos;
             const g = self.ann.groupById(id) orelse return;
             const gid = g.id;
-            const first = g.first;
-            const last = g.last;
-            const entry_name = try self.gpa.dupe(u8, g.name);
-            errdefer self.gpa.free(entry_name);
-
             const span = self.groupSpan(g);
             const count: usize = if (span) |sp| sp.hi - sp.lo + 1 else 0;
-            var members = try self.gpa.alloc(journaling.Journal(Op).RemovedMember, count);
-            errdefer self.gpa.free(members);
-            var filled: usize = 0;
-            errdefer {
-                for (members[0..filled]) |*m| self.deinitRemovedMember(m);
-            }
 
-            // Snapshot members low-to-high, mirroring the single-remove
-            // fixups after each conceptual removal.
+            self.beginTransaction();
+            defer self.endTransaction();
             var k: u32 = 0;
             while (k < count) : (k += 1) {
+                // The span head keeps re-anchoring to the successor, so the
+                // first member is always at the span start.
                 const sp = self.groupSpan(self.ann.groupById(gid).?) orelse break;
-                const idx = sp.lo; // always remove the current first member
-                const f = self.list.items[idx];
-                const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
-                    self.list.items[idx + 1].id
-                else
-                    null;
-                const name_snap: ?[]const u8 = if (self.ann.nameOf(f.id)) |nm|
-                    self.gpa.dupe(u8, nm) catch null
-                else
-                    null;
-                const meta_snap = self.ann.provenance(f.id);
-                const tags_snap = self.ann.takeTags(f.id) catch @as([][]const u8, &.{});
-                const ch_fixes = self.ann.reanchorAfterRemove(f.id, replacement) catch @as([]annotations.ChapterFix, &.{});
-                const g_fixes = self.reanchorGroupBoundaries(f.id, idx) catch @as([]annotations.GroupFix, &.{});
-                self.ann.removeFeature(f.id);
-                self.resetStatuses(idx);
-                _ = self.list.orderedRemove(idx);
-                if (idx < self.marker_pos) self.marker_pos -= 1;
-                self.invalidate(idx);
-                members[filled] = .{
-                    // Original index: the span start stays fixed while its
-                    // head is re-anchored, so record position k within it.
-                    .at = sp.lo + k,
-                    .id = f.id,
-                    .op = f.op,
-                    .suppressed = f.suppressed,
-                    .name = name_snap,
-                    .tags = tags_snap,
-                    .meta = meta_snap,
-                    .chapter_fixes = ch_fixes,
-                    .group_fixes = g_fixes,
-                };
-                filled += 1;
+                self.remove(self.list.items[sp.lo].id);
             }
-
-            self.ann.removeGroup(gid);
-            self.record(.{ .group_delete = .{
-                .group = .{ .id = gid, .name = entry_name, .first = first, .last = last },
-                .members = members,
-                .marker_pre = marker_pre,
-            } });
-            self.annTouch();
-        }
-
-        fn deinitRemovedMember(self: *Self, m: *journaling.Journal(Op).RemovedMember) void {
-            if (m.name) |n| self.gpa.free(n);
-            for (m.tags) |t| self.gpa.free(t);
-            self.gpa.free(m.tags);
-            self.gpa.free(m.chapter_fixes);
-            self.gpa.free(m.group_fixes);
+            self.removeGroup(gid);
         }
 
         /// Reorder a feature to `new_pos` (clamped to the list; interpreted
@@ -853,24 +783,49 @@ pub fn Timeline(comptime Domain: type) type {
             return self.journal.canRedo();
         }
 
-        /// Undo the most recent timeline edit. The marker restores to where
-        /// it was when that edit was made (marker moves themselves are not
-        /// journaled — scrubbing is free and never erodes undo depth).
-        /// Returns false when there is nothing to undo.
+        /// Undo the most recent transaction — a single edit, or every edit
+        /// grouped between an explicit `beginTransaction`/`endTransaction`
+        /// pair. The marker restores to where it was when the unit's first
+        /// edit was made (marker moves themselves are not journaled —
+        /// scrubbing is free and never erodes undo depth). Returns false
+        /// when there is nothing to undo.
         pub fn undo(self: *Self) bool {
-            const entry = self.journal.nextUndo() orelse return false;
+            const first = self.journal.nextUndo() orelse return false;
             self.touch();
-            self.reverse(entry);
+            self.reverse(first.entry);
+            while (!first.unit_done) {
+                const step = self.journal.nextUndo() orelse break;
+                self.reverse(step.entry);
+                if (step.unit_done) break;
+            }
             return true;
         }
 
-        /// Re-apply the most recently undone edit. Returns false when there
-        /// is nothing to redo.
+        /// Re-apply the most recently undone transaction. Returns false
+        /// when there is nothing to redo.
         pub fn redo(self: *Self) bool {
-            const entry = self.journal.nextRedo() orelse return false;
+            const first = self.journal.nextRedo() orelse return false;
             self.touch();
-            self.forward(entry);
+            self.forward(first.entry);
+            while (!first.unit_done) {
+                const step = self.journal.nextRedo() orelse break;
+                self.forward(step.entry);
+                if (step.unit_done) break;
+            }
             return true;
+        }
+
+        /// Open an explicit transaction: every edit recorded before the
+        /// matching `endTransaction` becomes one undo/redo unit. Nested
+        /// begins flatten into the outermost unit. An empty transaction
+        /// records nothing; an unbalanced end is a no-op. Always pair with
+        /// `endTransaction` (`defer` pairs well).
+        pub fn beginTransaction(self: *Self) void {
+            self.journal.beginTxn();
+        }
+
+        pub fn endTransaction(self: *Self) void {
+            self.journal.endTxn();
         }
 
         fn reverse(self: *Self, entry: journaling.Journal(Op).Entry) void {
@@ -959,64 +914,6 @@ pub fn Timeline(comptime Domain: type) type {
                     self.ann.renameGroup(e.id, e.old) catch {};
                     self.annTouch();
                 },
-                .group_suppress => |e| {
-                    for (e.changes) |ch| {
-                        const mi = self.indexOf(ch.id) orelse continue;
-                        if (self.list.items[mi].suppressed != ch.prev) {
-                            self.list.items[mi].suppressed = ch.prev;
-                            self.invalidate(mi);
-                        }
-                    }
-                },
-                .group_move => |e| {
-                    // Move the block back: reverse member order so each
-                    // member departs from the (fixed) block start.
-                    var k: usize = e.ids.len;
-                    while (k > 0) {
-                        k -= 1;
-                        self.rawMove(e.ids[k], e.from + @as(u32, @intCast(k)));
-                    }
-                    self.marker_pos = e.marker_pre;
-                },
-                .group_delete => |e| {
-                    // Re-insert members at their original positions
-                    // (ascending), then restore annotations and fixups in
-                    // reverse removal order (descending), then the group.
-                    for (e.members) |m| {
-                        self.list.insert(self.gpa, m.at, .{
-                            .id = m.id,
-                            .op = m.op,
-                            .suppressed = m.suppressed,
-                        }) catch return;
-                    }
-                    var k: usize = e.members.len;
-                    while (k > 0) {
-                        k -= 1;
-                        const m = e.members[k];
-                        if (m.name) |nm| self.ann.setName(m.id, nm) catch {};
-                        if (m.meta) |meta| self.ann.setProvenance(m.id, meta) catch {};
-                        if (m.tags.len > 0) {
-                            var restore: std.ArrayList([]const u8) = .empty;
-                            for (m.tags) |t| {
-                                if (self.gpa.dupe(u8, t) catch null) |d| {
-                                    restore.append(self.gpa, d) catch self.gpa.free(d);
-                                }
-                            }
-                            const owned = restore.toOwnedSlice(self.gpa) catch @as([][]const u8, &.{});
-                            if (self.ann.giveTags(m.id, owned)) |_| {
-                                self.gpa.free(owned);
-                            } else |_| {
-                                self.ann.freeTags(owned);
-                            }
-                        }
-                        self.ann.applyFixes(m.chapter_fixes);
-                        self.ann.applyGroupFixes(m.group_fixes);
-                        self.afterInsert(m.at);
-                    }
-                    self.marker_pos = e.marker_pre;
-                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch {};
-                    self.annTouch();
-                },
                 .chapter_add => |e| {
                     self.ann.removeChapter(e.chapter.id);
                     self.annTouch();
@@ -1090,40 +987,6 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .group_rename => |e| {
                     self.ann.renameGroup(e.id, e.old) catch {};
-                    self.annTouch();
-                },
-                .group_suppress => |e| {
-                    for (e.changes) |ch| {
-                        const mi = self.indexOf(ch.id) orelse continue;
-                        const target = !ch.prev;
-                        if (self.list.items[mi].suppressed != target) {
-                            self.list.items[mi].suppressed = target;
-                            self.invalidate(mi);
-                        }
-                    }
-                },
-                .group_move => |e| self.applyGroupMove(e.ids, e.to),
-                .group_delete => |e| {
-                    var k: usize = e.members.len;
-                    while (k > 0) {
-                        k -= 1;
-                        const m = e.members[k];
-                        const idx = self.indexOf(m.id) orelse continue;
-                        const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
-                            self.list.items[idx + 1].id
-                        else
-                            null;
-                        const cf = self.ann.reanchorAfterRemove(m.id, replacement) catch @as([]annotations.ChapterFix, &.{});
-                        self.gpa.free(cf);
-                        const gf = self.reanchorGroupBoundaries(m.id, idx) catch @as([]annotations.GroupFix, &.{});
-                        self.gpa.free(gf);
-                        self.ann.removeFeature(m.id);
-                        self.resetStatuses(idx);
-                        _ = self.list.orderedRemove(idx);
-                        if (idx < self.marker_pos) self.marker_pos -= 1;
-                        self.invalidate(idx);
-                    }
-                    self.ann.removeGroup(e.group.id);
                     self.annTouch();
                 },
                 .chapter_add => |e| {
@@ -2468,7 +2331,7 @@ test "groups: batch suppression is one undo step" {
     const c = try tl.commit(.{ .add = 3 });
     _ = try tl.addGroup("g", a, c);
 
-    try tl.setGroupSuppressed(tl.groups()[0].id, true);
+    tl.setGroupSuppressed(tl.groups()[0].id, true);
     try std.testing.expectEqual(@as(i64, 0), tl.state().value); // all suppressed
 
     // One undo restores every member's flag.
@@ -2527,7 +2390,7 @@ test "removeGroupContents deletes members and group in one undo step" {
     try tl.setFeatureName(b, "keeper");
     try tl.addTag(b, "terrain");
 
-    try tl.removeGroupContents(g);
+    tl.removeGroupContents(g);
     try std.testing.expectEqual(@as(u32, 2), tl.len());
     try std.testing.expectEqual(@as(usize, 0), tl.groups().len);
     try std.testing.expectEqual(@as(i64, 7), tl.state().value);
@@ -2539,4 +2402,104 @@ test "removeGroupContents deletes members and group in one undo step" {
     try std.testing.expectEqual(@as(i64, 10), tl.state().value);
     try std.testing.expectEqualStrings("keeper", tl.featureName(b).?);
     try std.testing.expectEqual(@as(usize, 1), tl.tags(b).len);
+}
+
+// ---------------------------------------------------------------------------
+// Transaction tests (Wave 2)
+// ---------------------------------------------------------------------------
+
+test "transactions: a batch of edits undoes and redoes as one unit" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+
+    tl.beginTransaction();
+    const a = try tl.commit(.{ .add = 2 });
+    tl.edit(a, .{ .add = 20 });
+    try tl.setFeatureName(a, "adjusted");
+    try tl.addTag(a, "batch");
+    tl.endTransaction();
+
+    try std.testing.expectEqual(@as(i64, 21), tl.state().value);
+    try std.testing.expectEqualStrings("adjusted", tl.featureName(a).?);
+
+    // One undo rewinds the whole batch.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+    try std.testing.expect(tl.featureName(a) == null);
+    try std.testing.expectEqual(@as(usize, 0), tl.tags(a).len);
+
+    // One redo replays it.
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 21), tl.state().value);
+    try std.testing.expectEqualStrings("adjusted", tl.featureName(a).?);
+    try std.testing.expectEqual(@as(usize, 1), tl.tags(a).len);
+}
+
+test "transactions: nested begins flatten into the outermost unit" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    tl.beginTransaction();
+    _ = try tl.commit(.{ .add = 1 });
+    tl.beginTransaction();
+    _ = try tl.commit(.{ .add = 2 });
+    tl.endTransaction();
+    _ = try tl.commit(.{ .add = 3 });
+    tl.endTransaction();
+
+    try std.testing.expectEqual(@as(i64, 6), tl.state().value);
+    try std.testing.expect(tl.undo()); // all three commits at once
+    try std.testing.expectEqual(@as(u32, 0), tl.len());
+    try std.testing.expect(!tl.canUndo());
+}
+
+test "transactions: empty and unbalanced pairs are harmless" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    tl.endTransaction(); // unbalanced: no-op
+    tl.beginTransaction();
+    tl.endTransaction(); // empty: records nothing
+    _ = try tl.commit(.{ .add = 5 });
+
+    try std.testing.expect(tl.undo()); // exactly one undoable unit
+    try std.testing.expect(!tl.canUndo());
+}
+
+test "transactions: eviction removes whole units, never a partial one" {
+    const gpa = std.testing.allocator;
+    var tl = try TestTimeline.init(gpa, .{}, .{ .max_journal = 7 });
+    defer tl.deinit();
+
+    // Three lone units, then one 10-record transaction: the cap is 7
+    // records, so eviction must kick in and may only cut whole units.
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) _ = try tl.commit(.{ .add = 1 });
+    tl.beginTransaction();
+    var k: u32 = 0;
+    while (k < 5) : (k += 1) {
+        _ = try tl.commit(.{ .add = 10 });
+        tl.setSuppressed(tl.list.items[0].id, @mod(k, 2) == 0);
+    }
+    tl.endTransaction();
+
+    // Undo only ever lands on unit boundaries: each undo leaves a state
+    // that redo replays back to the same tip.
+    const tip = tl.state().value;
+    var undos: u32 = 0;
+    var redone: u32 = 0;
+    while (tl.undo()) {
+        undos += 1;
+    }
+    while (tl.redo()) {
+        redone += 1;
+    }
+    try std.testing.expectEqual(tip, tl.state().value);
+    try std.testing.expectEqual(undos, redone); // symmetric units
+    try std.testing.expect(undos >= 1);
 }

@@ -114,14 +114,14 @@ fn demo(out: *Io.Writer, arena: std.mem.Allocator) !void {
         break :blk n;
     }});
 
-    try tl.setGroupSuppressed(g, true);
+    tl.setGroupSuppressed(g, true);
     try out.print("group suppressed:   total = {d} (one undo step)\n", .{tl.state().total});
     _ = tl.undo();
     try out.print("one undo restores:  total = {d}\n", .{tl.state().total});
 
     // Deleting a group's contents — members, annotations and all — is also
     // a single undo step.
-    try tl.removeGroupContents(g);
+    tl.removeGroupContents(g);
     try out.print("\ngroup deleted:      {d} features left, total = {d}\n", .{ tl.len(), tl.state().total });
     _ = tl.undo();
     try out.print("one undo restores:  {d} features, total = {d}, bump still named '{s}'\n", .{ tl.len(), tl.state().total, tl.featureName(bump).? });
