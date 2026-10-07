@@ -141,6 +141,42 @@ persistent random identity written into the FTZ2 container (FTZ1 files load
 with no annotations) — groundwork for `(timeline_id, feature_id)` global
 references in the future sync layer.
 
+## Parameters
+
+Fusion's parameter table, minus the expression language: named numeric
+values owned by the timeline, read by features, so one parameter edit
+re-drives everything referencing it.
+
+```zig
+const scale = try tl.addParam("scale", 2.0);
+_ = try tl.commit(.{ .scale_by_param = scale }); // op payload is a plain id
+
+// Domain side:
+//   .scale_by_param => |pid| {
+//       const v = ctx.param(pid) orelse return ctx.fail("missing parameter", .{});
+//       doc.value = @intFromFloat(@round(@as(f64, @floatFromInt(doc.value)) * v));
+//   },
+//   pub fn references(op: Op, out: *ParamRefCollector) void {
+//       switch (op) { .scale_by_param => |pid| out.param(pid), else => {} }
+//   },
+
+tl.setParam(scale, 3.0); // referencing features recompute lazily
+```
+
+Ops reference parameters by `ParamId` (plain u64 — op payloads stay plain
+data); `Domain.references` declares what an op reads, and `setParam`/
+`removeParam` invalidate from the earliest referencing feature. That
+invalidation is suffix replay — a deliberate over-approximation of the
+scattered dirty set (replaying unreferenced features in between is correct
+by determinism, just extra work); scattered dirty-set tracking is a
+documented future optimization. Without the `references` hook the timeline
+cannot see the dependency — parameter edits don't dirty anything and the
+app must `refresh` affected features itself. Derived values (Fusion's
+expressions) are deliberately out of scope: compute them in your Domain.
+Background jobs snapshot parameter values at begin time. The container is
+now FTZ3 (parameters section); FTZ1 and FTZ2 files load with what they
+have.
+
 ## Transactions
 
 Every journaled edit is an undo unit by itself; group edits into one unit

@@ -28,6 +28,7 @@ pub fn applyRange(
     doc: *Domain.Doc,
     gpa: std.mem.Allocator,
     env: ?*anyopaque,
+    param_values: []const ft.Param,
     applied: *u32,
 ) anyerror!void {
     applied.* = from;
@@ -39,7 +40,12 @@ pub fn applyRange(
             applied.* = i + 1;
             continue;
         }
-        var ctx: ft.ApplyContext = .{ .alloc = gpa, .feature_id = feature.id, .env = env };
+        var ctx: ft.ApplyContext = .{
+            .alloc = gpa,
+            .feature_id = feature.id,
+            .env = env,
+            .param_values = param_values,
+        };
         Domain.apply(feature.op, doc, &ctx) catch |err| switch (err) {
             error.FeatureFailed => {
                 feature.status = .{ .failed = ctx.message orelse "feature failed" };
@@ -96,6 +102,9 @@ pub fn Job(comptime Domain: type) type {
         /// Environment captured at begin time; reaches `Domain.apply` as
         /// `ApplyContext.env`.
         env: ?*anyopaque = null,
+        /// Parameter snapshot captured at begin time (owned; names are
+        /// borrowed and never read by jobs).
+        param_values: []ft.Param = &.{},
 
         /// Apply features `[start_pos..target)` to `base`. Thread-safe against
         /// `cancel`; touches nothing but this job.
@@ -107,7 +116,7 @@ pub fn Job(comptime Domain: type) type {
                     return;
                 }
                 var applied: u32 = self.applied;
-                ft.rebuild.applyRange(Domain, self.features, self.applied, self.applied + 1, &self.base, self.gpa, self.env, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.features, self.applied, self.applied + 1, &self.base, self.gpa, self.env, self.param_values, &applied) catch |err| {
                     self.state = .failed;
                     self.err = err;
                     return;
@@ -127,6 +136,7 @@ pub fn Job(comptime Domain: type) type {
         /// is already consumed; calling this is still safe.
         pub fn deinit(self: *Self) void {
             if (self.state == .consumed) return;
+            self.gpa.free(self.param_values);
             for (self.features[@min(self.start_pos, self.features.len)..]) |*f| {
                 switch (f.status) {
                     .failed => |msg| self.gpa.free(msg),
@@ -172,7 +182,7 @@ test "applyRange records soft failures and continues" {
 
     var doc: Domain.Doc = .{};
     var applied: u32 = 0;
-    try applyRange(Domain, &features, 0, 4, &doc, std.testing.allocator, null, &applied);
+    try applyRange(Domain, &features, 0, 4, &doc, std.testing.allocator, null, &.{}, &applied);
 
     try std.testing.expectEqual(@as(i64, 12), doc.value);
     try std.testing.expectEqual(@as(u32, 4), applied);

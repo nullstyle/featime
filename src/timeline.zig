@@ -10,6 +10,7 @@ const ft = @import("root.zig");
 const checkpoint = @import("checkpoint.zig");
 const journaling = @import("journal.zig");
 const annotations = @import("annotations.zig");
+const params = @import("params.zig");
 
 /// Mixes into feature-id salts so separately created timelines (including in
 /// different processes / peers) are unlikely to assign colliding ids.
@@ -79,6 +80,12 @@ pub fn Timeline(comptime Domain: type) type {
         /// arrive in later milestones). Never affects document computation.
         ann: annotations.Annotations,
 
+        /// The parameter table: named numeric values read by features via
+        /// `ApplyContext.param`. Unlike annotations, parameters ARE
+        /// computational inputs — editing one invalidates the features
+        /// that read it.
+        ptab: params.ParamTable,
+
         /// Bumped by annotation changes only — deliberately separate from
         /// `gen`, which background jobs capture; annotation edits must not
         /// invalidate running jobs.
@@ -107,6 +114,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .cps = checkpoint.Checkpoints(Domain).init(gpa, config.max_checkpoints),
                 .journal = journaling.Journal(Op).init(gpa, config.max_journal),
                 .ann = annotations.Annotations.init(gpa),
+                .ptab = params.ParamTable.init(gpa),
                 .timeline_id = (prng.random().int(u64) ^ idEntropy(&config)) | 1,
             };
         }
@@ -122,6 +130,7 @@ pub fn Timeline(comptime Domain: type) type {
             self.cps.deinit();
             self.journal.deinit();
             self.ann.deinit();
+            self.ptab.deinit();
             Domain.deinitDoc(&self.seed_doc, self.gpa);
             Domain.deinitDoc(&self.live_doc, self.gpa);
         }
@@ -246,7 +255,7 @@ pub fn Timeline(comptime Domain: type) type {
 
             if (self.broken == null and !self.live_stale and self.built_pos == at) {
                 var applied: u32 = at;
-                ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.gpa, self.env, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.gpa, self.env, self.ptab.items(), &applied) catch |err| {
                     // Hard failure: features before `at` are still good on the
                     // live doc, but this op may have partially mutated it.
                     // Flag broken so nothing touches it before a full rebuild.
@@ -772,6 +781,99 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         // ------------------------------------------------------------------
+        // Parameters
+        // ------------------------------------------------------------------
+
+        /// Add a named numeric parameter and return its stable id. Names are
+        /// unique; fails on a duplicate.
+        pub fn addParam(self: *Self, name: []const u8, value: f64) error{ OutOfMemory, DuplicateParam }!ft.ParamId {
+            const pid: ft.ParamId = self.next_id;
+            self.next_id +%= 1;
+            const entry_name = try self.gpa.dupe(u8, name);
+            errdefer self.gpa.free(entry_name);
+            try self.ptab.add(pid, name, value);
+            self.record(.{ .param_add = .{ .id = pid, .name = entry_name, .value = value } });
+            return pid;
+        }
+
+        /// Set a parameter's value. Features referencing it (via the
+        /// optional `Domain.references` hook) recompute lazily; without the
+        /// hook the timeline cannot see the dependency and the app must
+        /// `refresh` affected features itself. No-op for unknown ids.
+        pub fn setParam(self: *Self, id: ft.ParamId, value: f64) void {
+            const old = self.ptab.valueOf(id) orelse return;
+            if (old == value) return;
+            _ = self.ptab.set(id, value);
+            self.record(.{ .param_set = .{ .id = id, .old = old, .new = value } });
+            self.touch();
+            self.invalidateReferencing(id);
+        }
+
+        /// Remove a parameter. Referencing features see `ctx.param` return
+        /// null on the next rebuild and typically soft-fail. No-op for
+        /// unknown ids.
+        pub fn removeParam(self: *Self, id: ft.ParamId) void {
+            const p = self.ptab.byId(id) orelse return;
+            const entry_name = self.gpa.dupe(u8, p.name) catch return;
+            _ = self.ptab.remove(id);
+            self.record(.{ .param_remove = .{ .id = id, .name = entry_name, .value = p.value } });
+            self.touch();
+            self.invalidateReferencing(id);
+        }
+
+        /// Rename a parameter (display only — ops reference ids, not names).
+        pub fn renameParam(self: *Self, id: ft.ParamId, new_name: []const u8) error{OutOfMemory}!void {
+            const old = self.ptab.byId(id) orelse return;
+            const old_snap = try self.gpa.dupe(u8, old.name);
+            errdefer self.gpa.free(old_snap);
+            const new_snap = try self.gpa.dupe(u8, new_name);
+            errdefer self.gpa.free(new_snap);
+            if (!try self.ptab.rename(id, new_name)) {
+                self.gpa.free(old_snap);
+                self.gpa.free(new_snap);
+                return;
+            }
+            self.record(.{ .param_rename = .{ .id = id, .old = old_snap, .new = new_snap } });
+        }
+
+        /// Parameters in creation order. Valid until the next mutation.
+        pub fn paramsList(self: *const Self) []const ft.Param {
+            return self.ptab.items();
+        }
+
+        pub fn paramValue(self: *const Self, id: ft.ParamId) ?f64 {
+            return self.ptab.valueOf(id);
+        }
+
+        pub fn paramIdByName(self: *const Self, name: []const u8) ?ft.ParamId {
+            return self.ptab.idByName(name);
+        }
+
+        /// Invalidate from the earliest feature that reads `id` (suffix
+        /// replay — a deliberate over-approximation of the scattered dirty
+        /// set; see ROADMAP). Requires the `references` hook; without it
+        /// this is a no-op.
+        fn invalidateReferencing(self: *Self, id: ft.ParamId) void {
+            if (comptime !@hasDecl(Domain, "references")) return;
+            var collector: ft.ParamRefCollector = .{ .gpa = self.gpa };
+            defer collector.ids.deinit(self.gpa);
+            var earliest: ?u32 = null;
+            for (self.list.items, 0..) |f, i| {
+                collector.ids.clearRetainingCapacity();
+                Domain.references(f.op, &collector);
+                if (collector.failed) break; // can't see: invalidate broadly
+                for (collector.ids.items) |pid| {
+                    if (pid == id) {
+                        earliest = @intCast(i);
+                        break;
+                    }
+                }
+                if (earliest != null) break;
+            }
+            if (earliest) |idx| self.invalidate(idx);
+        }
+
+        // ------------------------------------------------------------------
         // Undo / redo
         // ------------------------------------------------------------------
 
@@ -914,6 +1016,20 @@ pub fn Timeline(comptime Domain: type) type {
                     self.ann.renameGroup(e.id, e.old) catch {};
                     self.annTouch();
                 },
+                .param_add => |e| {
+                    _ = self.ptab.remove(e.id);
+                },
+                .param_remove => |e| {
+                    self.ptab.add(e.id, e.name, e.value) catch {};
+                    self.invalidateReferencing(e.id);
+                },
+                .param_set => |e| {
+                    _ = self.ptab.set(e.id, e.old);
+                    self.invalidateReferencing(e.id);
+                },
+                .param_rename => |e| {
+                    _ = self.ptab.rename(e.id, e.old) catch false;
+                },
                 .chapter_add => |e| {
                     self.ann.removeChapter(e.chapter.id);
                     self.annTouch();
@@ -988,6 +1104,21 @@ pub fn Timeline(comptime Domain: type) type {
                 .group_rename => |e| {
                     self.ann.renameGroup(e.id, e.old) catch {};
                     self.annTouch();
+                },
+                .param_add => |e| {
+                    self.ptab.add(e.id, e.name, e.value) catch {};
+                    self.invalidateReferencing(e.id);
+                },
+                .param_remove => |e| {
+                    _ = self.ptab.remove(e.id);
+                    self.invalidateReferencing(e.id);
+                },
+                .param_set => |e| {
+                    _ = self.ptab.set(e.id, e.new);
+                    self.invalidateReferencing(e.id);
+                },
+                .param_rename => |e| {
+                    _ = self.ptab.rename(e.id, e.new) catch false;
                 },
                 .chapter_add => |e| {
                     self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch {};
@@ -1115,6 +1246,10 @@ pub fn Timeline(comptime Domain: type) type {
             const features_copy = try self.gpa.dupe(ft.Feature(Op), self.list.items);
             errdefer self.gpa.free(features_copy);
             for (features_copy) |*f| f.status = .pending;
+            // Snapshot parameter values: the table is owner-thread state and
+            // may change while the job runs; only id/value are ever read.
+            const param_snap = try self.gpa.dupe(ft.Param, self.ptab.items());
+            errdefer self.gpa.free(param_snap);
 
             return .{
                 .gpa = self.gpa,
@@ -1125,6 +1260,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .base = base,
                 .features = features_copy,
                 .env = self.env,
+                .param_values = param_snap,
             };
         }
 
@@ -1215,7 +1351,7 @@ pub fn Timeline(comptime Domain: type) type {
             if (self.broken == null and !self.live_stale and self.built_pos < self.marker_pos) {
                 self.resetStatuses(self.built_pos);
                 var applied: u32 = self.built_pos;
-                ft.rebuild.applyRange(Domain, self.list.items, self.built_pos, self.marker_pos, &self.live_doc, self.gpa, self.env, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.list.items, self.built_pos, self.marker_pos, &self.live_doc, self.gpa, self.env, self.ptab.items(), &applied) catch |err| {
                     self.broken = err;
                     self.built_pos = applied;
                     return;
@@ -1248,7 +1384,7 @@ pub fn Timeline(comptime Domain: type) type {
                 else
                     self.marker_pos;
                 var applied: u32 = pos;
-                ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.gpa, self.env, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.gpa, self.env, self.ptab.items(), &applied) catch |err| {
                     Domain.deinitDoc(&scratch, self.gpa);
                     self.broken = err;
                     return; // live_doc still holds the last good state
@@ -2502,4 +2638,185 @@ test "transactions: eviction removes whole units, never a partial one" {
     try std.testing.expectEqual(tip, tl.state().value);
     try std.testing.expectEqual(undos, redone); // symmetric units
     try std.testing.expect(undos >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// Parameter tests (Wave 3)
+// ---------------------------------------------------------------------------
+
+const ParamDomain = struct {
+    pub const Doc = struct { value: i64 = 0 };
+    pub const Op = union(enum) {
+        add: i64,
+        scale_by_param: ft.ParamId,
+    };
+    pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
+        switch (op) {
+            .add => |n| doc.value += n,
+            .scale_by_param => |pid| {
+                const v = ctx.param(pid) orelse
+                    return ctx.fail("missing parameter", .{});
+                doc.value = @intFromFloat(@round(@as(f64, @floatFromInt(doc.value)) * v));
+            },
+        }
+        g_applies += 1;
+    }
+    pub fn references(op: Op, out: *ft.ParamRefCollector) void {
+        switch (op) {
+            .scale_by_param => |pid| out.param(pid),
+            .add => {},
+        }
+    }
+    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
+        _ = gpa;
+        return doc.*;
+    }
+    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
+        _ = doc;
+        _ = gpa;
+    }
+    pub fn encodeOp(op: Op, w: *std.Io.Writer) anyerror!void {
+        switch (op) {
+            .add => |n| {
+                try w.writeAll(&[1]u8{1});
+                try w.writeInt(i64, n, .little);
+            },
+            .scale_by_param => |pid| {
+                try w.writeAll(&[1]u8{2});
+                try w.writeInt(u64, pid, .little);
+            },
+        }
+    }
+    pub fn decodeOp(r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Op {
+        _ = gpa;
+        return switch ((try r.take(1))[0]) {
+            1 => .{ .add = try r.takeInt(i64, .little) },
+            2 => .{ .scale_by_param = try r.takeInt(u64, .little) },
+            else => error.Malformed,
+        };
+    }
+    pub fn encodeDoc(doc: *const Doc, w: *std.Io.Writer) anyerror!void {
+        try w.writeInt(i64, doc.value, .little);
+    }
+    pub fn decodeDoc(r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Doc {
+        _ = gpa;
+        return .{ .value = try r.takeInt(i64, .little) };
+    }
+};
+
+test "parameters: editing a value re-drives referencing features" {
+    const gpa = std.testing.allocator;
+    var tl = try Timeline(ParamDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    const scale = try tl.addParam("scale", 2.0);
+    _ = try tl.commit(.{ .add = 10 });
+    _ = try tl.commit(.{ .scale_by_param = scale }); // 20
+    _ = try tl.commit(.{ .add = 5 }); // 25
+    try std.testing.expectEqual(@as(i64, 25), tl.state().value);
+
+    tl.setParam(scale, 3.0); // 30 + 5 = 35
+    try std.testing.expect(tl.dirty());
+    try std.testing.expectEqual(@as(i64, 35), tl.state().value);
+
+    // Undo restores the old value and recomputes.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 25), tl.state().value);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 35), tl.state().value);
+}
+
+test "parameters: suffix replay invalidates from the earliest reference" {
+    const gpa = std.testing.allocator;
+    var tl = try Timeline(ParamDomain).init(gpa, .{}, .{
+        .checkpoint_interval = 2,
+        .max_checkpoints = 8,
+    });
+    defer tl.deinit();
+
+    const scale = try tl.addParam("scale", 1.0);
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        if (i == 4) {
+            _ = try tl.commit(.{ .scale_by_param = scale });
+        } else {
+            _ = try tl.commit(.{ .add = 1 });
+        }
+    }
+    // Fast-path commits lay no checkpoints; force one chunked rebuild
+    // (a no-op-value edit still invalidates) to plant them at 2, 4, 6.
+    tl.edit(tl.list.items[0].id, .{ .add = 1 });
+    _ = tl.state();
+    g_applies = 0;
+    tl.setParam(scale, 2.0);
+    _ = tl.state();
+    // Over-approximate suffix replay: from the checkpoint at 4 (feature 4
+    // is the earliest referencing feature), so features 4..7 replay.
+    try std.testing.expectEqual(@as(usize, 4), g_applies);
+}
+
+test "parameters: unreferenced edits do not dirty the document" {
+    const gpa = std.testing.allocator;
+    var tl = try Timeline(ParamDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    const unused = try tl.addParam("unused", 1.0);
+    _ = try tl.commit(.{ .add = 7 });
+    _ = tl.state();
+    tl.setParam(unused, 99.0);
+    try std.testing.expect(!tl.dirty());
+}
+
+test "parameters: removal soft-fails referencing features" {
+    const gpa = std.testing.allocator;
+    var tl = try Timeline(ParamDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    const scale = try tl.addParam("scale", 2.0);
+    _ = try tl.commit(.{ .add = 10 });
+    _ = try tl.commit(.{ .scale_by_param = scale });
+    try std.testing.expectEqual(@as(i64, 20), tl.state().value);
+
+    tl.removeParam(scale);
+    try std.testing.expectEqual(@as(i64, 10), tl.state().value);
+    var it = tl.features();
+    _ = it.next().?;
+    try std.testing.expectEqualStrings("missing parameter", it.next().?.status.failed);
+
+    // Undo brings the parameter back and the feature recomputes.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 20), tl.state().value);
+}
+
+test "parameters: rename is display-only; persistence round-trips" {
+    const gpa = std.testing.allocator;
+    var tl = try Timeline(ParamDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    const scale = try tl.addParam("scale", 2.5);
+    _ = try tl.commit(.{ .add = 4 });
+    _ = try tl.commit(.{ .scale_by_param = scale });
+    _ = tl.state();
+    try tl.renameParam(scale, "growth");
+    try std.testing.expectEqualStrings("growth", tl.paramsList()[0].name);
+    try std.testing.expect(!tl.dirty());
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try save_persistence_shim(&tl, gpa, &aw.writer);
+    var reader = std.Io.Reader.fixed(aw.written());
+    var loaded = try load_persistence_shim(gpa, &reader);
+    defer loaded.deinit();
+
+    const grown = loaded.paramIdByName("growth").?;
+    try std.testing.expectEqual(@as(f64, 2.5), loaded.paramValue(grown).?);
+    try std.testing.expectEqual(@as(i64, 10), loaded.state().value);
+}
+
+// Persistence is generic over the Domain; tiny shims keep the test local.
+fn save_persistence_shim(tl: *Timeline(ParamDomain), gpa: std.mem.Allocator, w: *std.Io.Writer) !void {
+    try @import("persistence.zig").save(ParamDomain, tl, gpa, w);
+}
+fn load_persistence_shim(gpa: std.mem.Allocator, r: *std.Io.Reader) !Timeline(ParamDomain) {
+    return @import("persistence.zig").load(ParamDomain, gpa, .{}, r);
 }

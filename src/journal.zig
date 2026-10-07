@@ -24,6 +24,7 @@ const std = @import("std");
 const ft = @import("root.zig");
 
 const annotations = @import("annotations.zig");
+const params = @import("params.zig");
 
 pub fn Journal(comptime Op: type) type {
     return struct {
@@ -62,6 +63,10 @@ pub fn Journal(comptime Op: type) type {
             group_add: struct { group: annotations.Group },
             group_remove: struct { group: annotations.Group },
             group_rename: struct { id: annotations.GroupId, old: []const u8, new: []const u8 },
+            param_add: struct { id: params.ParamId, name: []const u8, value: f64 },
+            param_remove: struct { id: params.ParamId, name: []const u8, value: f64 },
+            param_set: struct { id: params.ParamId, old: f64, new: f64 },
+            param_rename: struct { id: params.ParamId, old: []const u8, new: []const u8 },
         };
 
         pub const Record = struct {
@@ -120,6 +125,12 @@ pub fn Journal(comptime Op: type) type {
                 .group_rename => |g| {
                     self.gpa.free(g.old);
                     self.gpa.free(g.new);
+                },
+                .param_add => |p| self.gpa.free(p.name),
+                .param_remove => |p| self.gpa.free(p.name),
+                .param_rename => |p| {
+                    self.gpa.free(p.old);
+                    self.gpa.free(p.new);
                 },
                 else => {},
             }

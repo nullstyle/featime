@@ -32,7 +32,8 @@
 const std = @import("std");
 const ft = @import("root.zig");
 
-pub const magic = "FTZ2";
+pub const magic = "FTZ3";
+pub const magic_v2 = "FTZ2";
 pub const magic_v1 = "FTZ1";
 
 pub const LoadError = error{BadMagic};
@@ -80,6 +81,14 @@ pub fn save(
     }
 
     try writer.writeInt(u32, tl.marker_pos, .little);
+
+    // Parameters (FTZ3).
+    try writer.writeInt(u32, @intCast(tl.ptab.items().len), .little);
+    for (tl.ptab.items()) |p| {
+        try writer.writeInt(u64, p.id, .little);
+        try writer.writeInt(u64, @bitCast(p.value), .little);
+        try writeFramed(writer, p.name);
+    }
 
     // Annotation sections.
     var name_count: u32 = 0;
@@ -149,12 +158,13 @@ pub fn load(
 ) anyerror!ft.Timeline(Domain) {
     validateCodecs(Domain);
     const head = try reader.take(4);
-    const v2 = std.mem.eql(u8, head, magic);
-    if (!v2 and !std.mem.eql(u8, head, magic_v1))
+    const v3 = std.mem.eql(u8, head, magic);
+    const v2 = std.mem.eql(u8, head, magic_v2);
+    if (!v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
         return error.BadMagic;
 
     var timeline_id: u64 = 0;
-    if (v2) timeline_id = try reader.takeInt(u64, .little);
+    if (v3 or v2) timeline_id = try reader.takeInt(u64, .little);
 
     var doc_reader = try framedReader(gpa, reader);
     defer gpa.free(doc_reader.bytes);
@@ -177,9 +187,22 @@ pub fn load(
     }
     tl.marker_pos = @min(try reader.takeInt(u32, .little), tl.len());
     if (max_id >= tl.next_id) tl.next_id = max_id +% 1;
-    if (v2) tl.timeline_id = timeline_id;
+    if (v3) {
+        const param_count = try reader.takeInt(u32, .little);
+        var pm: u32 = 0;
+        while (pm < param_count) : (pm += 1) {
+            const pid = try reader.takeInt(u64, .little);
+            const value: f64 = @bitCast(try reader.takeInt(u64, .little));
+            const fr = try framedReader(gpa, reader);
+            defer gpa.free(fr.bytes);
+            tl.ptab.add(pid, fr.bytes, value) catch {};
+            if (pid >= tl.next_id) tl.next_id = pid +% 1;
+        }
+    }
 
-    if (v2) {
+    if (v3 or v2) tl.timeline_id = timeline_id;
+
+    if (v3 or v2) {
         const name_count = try reader.takeInt(u32, .little);
         var n: u32 = 0;
         while (n < name_count) : (n += 1) {
@@ -449,4 +472,34 @@ test "FTZ1 files load with no annotations and a fresh identity" {
     try std.testing.expectEqual(@as(i64, 12), loaded.state().value);
     try std.testing.expectEqual(@as(usize, 0), loaded.chapters().len);
     try std.testing.expect(loaded.featureName(1234) == null);
+}
+
+test "FTZ2 files load with annotations but no parameters" {
+    const gpa = std.testing.allocator;
+    // Hand-craft FTZ2: magic, timeline_id, framed seed, 0 features, marker,
+    // empty annotation sections (all zero counts) — no params section.
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll(magic_v2);
+    try w.writeInt(u64, 777, .little); // timeline_id
+    try w.writeInt(u32, 8, .little); // seed doc frame
+    try w.writeInt(i64, 3, .little);
+    try w.writeInt(u32, 0, .little); // feature count
+    try w.writeInt(u32, 0, .little); // marker
+    try w.writeInt(u32, 0, .little); // groups
+    try w.writeInt(u32, 0, .little); // names
+    try w.writeInt(u32, 0, .little); // chapters
+    try w.writeInt(u32, 0, .little); // tags
+    try w.writeInt(u32, 0, .little); // provenance
+
+    var reader = std.Io.Reader.fixed(aw.written());
+    var loaded = try load(PersistDomain, gpa, .{}, &reader);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 777), loaded.timelineId());
+    try std.testing.expectEqual(@as(i64, 3), loaded.state().value);
+    try std.testing.expectEqual(@as(usize, 0), loaded.paramsList().len);
+    const pid = try loaded.addParam("width", 2.0);
+    try std.testing.expectEqual(@as(f64, 2.0), loaded.paramValue(pid).?);
 }

@@ -63,9 +63,13 @@ pub const timeline = @import("timeline.zig");
 pub const rebuild = @import("rebuild.zig");
 pub const persistence = @import("persistence.zig");
 pub const annotations = @import("annotations.zig");
+pub const params = @import("params.zig");
 
 pub const Timeline = timeline.Timeline;
 pub const Mark = annotations.Mark;
+pub const Param = params.Param;
+pub const ParamId = params.ParamId;
+pub const ParamRefCollector = params.ParamRefCollector;
 pub const Meta = annotations.Meta;
 pub const Chapter = annotations.Chapter;
 pub const ChapterId = annotations.ChapterId;
@@ -140,7 +144,20 @@ pub const ApplyContext = struct {
     /// on hierarchical timelines.
     env: ?*anyopaque = null,
 
+    /// The timeline's parameter values (`addParam`/`setParam`), visible to
+    /// `apply` as `ctx.param(id)`. Background jobs snapshot the slice.
+    param_values: []const params.Param = &.{},
+
     message: ?[]const u8 = null,
+
+    /// Read a parameter value by id, or null when absent (features
+    /// typically soft-fail on a missing parameter).
+    pub fn param(self: *const ApplyContext, id: ParamId) ?f64 {
+        for (self.param_values) |p| {
+            if (p.id == id) return p.value;
+        }
+        return null;
+    }
 
     /// Record a soft failure for the feature being applied and return
     /// `error.FeatureFailed`. The message is owned by the timeline and
@@ -239,4 +256,5 @@ test {
     _ = rebuild;
     _ = persistence;
     _ = annotations;
+    _ = params;
 }

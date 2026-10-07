@@ -18,6 +18,7 @@ const Domain = struct {
         add: i32,
         mul: i32,
         fail: i32,
+        scale_by_param: ft.ParamId,
     };
     pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
         switch (op) {
@@ -32,8 +33,22 @@ const Domain = struct {
                 try doc.trace.append(ctx.alloc, '*');
             },
             .fail => |n| return ctx.fail("fail {d}", .{n}),
+            .scale_by_param => |pid| {
+                const v = ctx.param(pid) orelse
+                    return ctx.fail("missing parameter", .{});
+                const scaled = @round(@as(f64, @floatFromInt(doc.value)) * v);
+                doc.value = @intFromFloat(scaled);
+                try doc.trace.append(ctx.alloc, 's');
+            },
         }
     }
+    pub fn references(op: Op, out: *ft.ParamRefCollector) void {
+        switch (op) {
+            .scale_by_param => |pid| out.param(pid),
+            else => {},
+        }
+    }
+
     pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
         return .{ .value = doc.value, .trace = try doc.trace.clone(gpa) };
     }
@@ -60,6 +75,9 @@ const NaiveEntry = union(enum) {
     },
     tag_add: struct { idx: u32, tag: []u8 },
     tag_remove: struct { idx: u32, tag: []u8 },
+    naive_param_add: struct { id: u64, name: []const u8, value: f64 },
+    naive_param_remove: struct { id: u64, name: []const u8, value: f64 },
+    naive_param_set: struct { id: u64, old: f64, new: f64 },
     group_add: struct { pos: usize, name: []u8, first: ?u32, last: ?u32 },
     group_remove: struct { pos: usize, name: []u8, first: ?u32, last: ?u32 },
     group_rename: struct { pos: usize, old: []u8, new: []u8 },
@@ -109,6 +127,9 @@ const Naive = struct {
     tag_lists: std.ArrayList(std.ArrayList([]u8)) = .empty,
     /// Per-feature stable internal ids (for group move/delete mirrors).
     nids: std.ArrayList(u64) = .empty,
+    /// Parameter mirror (same ids as the real timeline; names borrowed
+    /// from static driver strings).
+    param_mirror: std.ArrayList(ft.Param) = .empty,
     next_nid: u64 = 1,
     groups: std.ArrayList(NaiveGroup) = .empty,
 
@@ -127,6 +148,7 @@ const Naive = struct {
         }
         self.tag_lists.deinit(self.gpa);
         self.nids.deinit(self.gpa);
+        self.param_mirror.deinit(self.gpa);
         for (self.groups.items) |*g| self.gpa.free(g.name);
         self.groups.deinit(self.gpa);
         for (self.chapters.items) |*c| self.gpa.free(c.name);
@@ -222,6 +244,7 @@ const Naive = struct {
                 self.gpa.free(g.old);
                 self.gpa.free(g.new);
             },
+            .naive_param_add, .naive_param_remove, .naive_param_set => {},
             else => {},
         }
     }
@@ -549,6 +572,33 @@ const Naive = struct {
         }
     }
 
+    fn addParamMirror(self: *Naive, id: u64, name: []const u8, value: f64) !void {
+        try self.param_mirror.append(self.gpa, .{ .id = id, .name = name, .value = value });
+        self.record(.{ .naive_param_add = .{ .id = id, .name = name, .value = value } });
+    }
+
+    fn removeParamMirror(self: *Naive, id: u64) void {
+        for (self.param_mirror.items, 0..) |p, i| {
+            if (p.id == id) {
+                const dead = self.param_mirror.orderedRemove(i);
+                self.record(.{ .naive_param_remove = .{ .id = dead.id, .name = dead.name, .value = dead.value } });
+                return;
+            }
+        }
+    }
+
+    fn setParamMirror(self: *Naive, id: u64, value: f64) void {
+        for (self.param_mirror.items) |*p| {
+            if (p.id == id) {
+                if (p.value == value) return;
+                const old = p.value;
+                p.value = value;
+                self.record(.{ .naive_param_set = .{ .id = id, .old = old, .new = value } });
+                return;
+            }
+        }
+    }
+
     fn canUndo(self: *const Naive) bool {
         return self.log_head > 0;
     }
@@ -639,6 +689,22 @@ const Naive = struct {
             .name_set => |n| self.setNameRaw(n.idx, n.old),
             .tag_add => |t| self.removeTagRaw(t.idx, t.tag),
             .tag_remove => |t| self.addTagRaw(t.idx, t.tag),
+            .naive_param_add => |p| {
+                for (self.param_mirror.items, 0..) |pm, i| {
+                    if (pm.id == p.id) {
+                        _ = self.param_mirror.orderedRemove(i);
+                        break;
+                    }
+                }
+            },
+            .naive_param_remove => |p| {
+                self.param_mirror.append(self.gpa, .{ .id = p.id, .name = p.name, .value = p.value }) catch return false;
+            },
+            .naive_param_set => |p| {
+                for (self.param_mirror.items) |*pm| {
+                    if (pm.id == p.id) pm.value = p.old;
+                }
+            },
             .group_add => |g| {
                 const dead = self.groups.orderedRemove(g.pos);
                 self.gpa.free(dead.name);
@@ -734,6 +800,22 @@ const Naive = struct {
             .name_set => |n| self.setNameRaw(n.idx, n.new),
             .tag_add => |t| self.addTagRaw(t.idx, t.tag),
             .tag_remove => |t| self.removeTagRaw(t.idx, t.tag),
+            .naive_param_add => |p| {
+                self.param_mirror.append(self.gpa, .{ .id = p.id, .name = p.name, .value = p.value }) catch return false;
+            },
+            .naive_param_remove => |p| {
+                for (self.param_mirror.items, 0..) |pm, i| {
+                    if (pm.id == p.id) {
+                        _ = self.param_mirror.orderedRemove(i);
+                        break;
+                    }
+                }
+            },
+            .naive_param_set => |p| {
+                for (self.param_mirror.items) |*pm| {
+                    if (pm.id == p.id) pm.value = p.new;
+                }
+            },
             .group_add => |g| {
                 self.groups.insert(self.gpa, g.pos, .{
                     .name = self.gpa.dupe(u8, g.name) catch return false,
@@ -777,7 +859,7 @@ const Naive = struct {
         for (self.features.items) |*f| self.freeStatus(f);
         var doc: Domain.Doc = .{};
         var applied: u32 = 0;
-        try ft.rebuild.applyRange(Domain, self.features.items, 0, self.marker, &doc, self.gpa, null, &applied);
+        try ft.rebuild.applyRange(Domain, self.features.items, 0, self.marker, &doc, self.gpa, null, self.param_mirror.items, &applied);
         return .{ .value = doc.value, .trace = try doc.trace.toOwnedSlice(self.gpa) };
     }
 };
@@ -883,6 +965,15 @@ fn compare(tl: *Timeline, naive: *Naive, gpa: std.mem.Allocator) !void {
         } else {
             try expectEqual(ft.Status.pending, got.status);
         }
+    }
+
+    // Parameters: same set, order, and values.
+    try expectEqual(tl.paramsList().len, naive.param_mirror.items.len);
+    for (tl.paramsList(), 0..) |gp, gi| {
+        const np = naive.param_mirror.items[gi];
+        try expectEqual(gp.id, np.id);
+        try expectEqual(gp.value, np.value);
+        try std.testing.expectEqualStrings(gp.name, np.name);
     }
 
     // Groups: same order and names.

@@ -108,7 +108,7 @@ oracle behavior; nested-transaction rules documented and tested.
 
 ---
 
-## Wave 3 — Parameters (→ 0.5.0)
+## Wave 3 — Parameters (→ 0.5.0) — DELIVERED
 
 The Fusion parameter table: named values that features reference, so one
 parameter edit re-drives every referencing feature.
