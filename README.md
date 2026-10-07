@@ -177,6 +177,33 @@ Background jobs snapshot parameter values at begin time. The container is
 now FTZ3 (parameters section); FTZ1 and FTZ2 files load with what they
 have.
 
+## Sync
+
+The multiuser stopping point: journal entries as a wire vocabulary. Merge,
+OT, and CRDT semantics belong to the application; the library ships the
+feed and the integration semantics.
+
+```zig
+// Producer side: every local edit, in record order.
+tl.setRecordObserver(.{ .ctx = &outbox, .func = Outbox.observe });
+
+// Consumer side: entries cross the wire via the Domain codecs...
+var entry = try ft.sync.decode(MyApp, gpa, &reader);
+tl.applyRemote(&entry);          // journaled locally; observer NOT fired
+ft.sync.deinit(MyApp.Op, gpa, &entry);
+```
+
+`applyRemote` preserves identity exactly — feature/chapter/group/param ids
+are random-anchored per timeline, replicas share a `timelineId`, and the
+local id counter skips past remote ids — while positions are hints: indices
+are clamped, unknown ids are dropped, duplicate commits are ignored
+(re-delivery is safe). Remote integrations are journaled like local edits
+so undo is uniform, but never re-broadcast: replicas feeding each other
+cannot loop. Two replicas exchanging every entry in a consistent order
+converge; concurrent positional edits are the app's layer
+(`sync.lastWriterWins(local_meta, remote_meta)` is the provided
+tie-breaker when provenance timestamps exist).
+
 ## Transactions
 
 Every journaled edit is an undo unit by itself; group edits into one unit
@@ -325,7 +352,7 @@ tests/oracle.zig   differential tests vs a naive reference model
 
 ## Status & non-goals
 
-v0.2.0 — see [ROADMAP.md](ROADMAP.md) for what's planned next. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
+v0.6.0 — all four roadmap waves delivered; see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
 feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are

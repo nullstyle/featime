@@ -131,7 +131,7 @@ read it (and their dependents); oracle gains parameter actions.
 
 ---
 
-## Wave 4 — Sync feed (→ 0.6.0)
+## Wave 4 — Sync feed (→ 0.6.0) — DELIVERED
 
 The multiuser gateway — the honest stopping point for the library; merge and
 conflict semantics belong to the application.

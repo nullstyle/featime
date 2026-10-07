@@ -64,6 +64,7 @@ pub const rebuild = @import("rebuild.zig");
 pub const persistence = @import("persistence.zig");
 pub const annotations = @import("annotations.zig");
 pub const params = @import("params.zig");
+pub const sync = @import("sync.zig");
 
 pub const Timeline = timeline.Timeline;
 pub const Mark = annotations.Mark;
@@ -257,4 +258,5 @@ test {
     _ = persistence;
     _ = annotations;
     _ = params;
+    _ = sync;
 }

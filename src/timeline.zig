@@ -11,6 +11,7 @@ const checkpoint = @import("checkpoint.zig");
 const journaling = @import("journal.zig");
 const annotations = @import("annotations.zig");
 const params = @import("params.zig");
+const syncing = @import("sync.zig");
 
 /// Mixes into feature-id salts so separately created timelines (including in
 /// different processes / peers) are unlikely to assign colliding ids.
@@ -26,6 +27,9 @@ pub fn Timeline(comptime Domain: type) type {
         pub const Doc = Domain.Doc;
         pub const Op = Domain.Op;
         pub const FeatureView = ft.FeatureView(Domain.Op);
+        /// Journal entry shape, re-exported for record observers and
+        /// `applyRemote`.
+        pub const Entry = journaling.Journal(Op).Entry;
 
         gpa: std.mem.Allocator,
         config: ft.Config,
@@ -96,6 +100,16 @@ pub fn Timeline(comptime Domain: type) type {
         /// layer.
         timeline_id: u64,
 
+        /// Fired for every *locally made* edit as it is journaled (the sync
+        /// feed's source). Suppressed while `applyRemote` integrates remote
+        /// entries, so replicas never echo. The entry is borrowed for the
+        /// duration of the callback.
+        observer: ?RecordObserver = null,
+
+        /// True while `applyRemote` runs: records made now are remote
+        /// integrations and must not fire the observer.
+        applying_remote: bool = false,
+
         // ------------------------------------------------------------------
         // Lifecycle
         // ------------------------------------------------------------------
@@ -151,14 +165,19 @@ pub fn Timeline(comptime Domain: type) type {
             return self.ann_gen;
         }
 
-        /// Record through the journal. Note on undo semantics: every
-        /// annotation mutation is journaled above the commit of the feature
-        /// it decorates, so strict LIFO unwinds annotations before their
-        /// feature's commit and rewinds them on redo — no resurrection stash
-        /// is needed. Structural entries that delete features (remove)
-        /// snapshot what they need at record time.
+        /// Record through the journal and fire the sync-feed observer (for
+        /// local edits only; `applyRemote` records directly and stays
+        /// silent). Note on undo semantics: every annotation mutation is
+        /// journaled above the commit of the feature it decorates, so strict
+        /// LIFO unwinds annotations before their feature's commit and
+        /// rewinds them on redo — no resurrection stash is needed.
+        /// Structural entries that delete features (remove) snapshot what
+        /// they need at record time.
         fn record(self: *Self, entry: journaling.Journal(Op).Entry) void {
             self.journal.record(entry);
+            if (!self.applying_remote) {
+                if (self.observer) |obs| obs.func(obs.ctx, &entry);
+            }
         }
 
         // ------------------------------------------------------------------
@@ -915,6 +934,255 @@ pub fn Timeline(comptime Domain: type) type {
                 if (step.unit_done) break;
             }
             return true;
+        }
+
+        pub const RecordObserver = struct {
+            ctx: ?*anyopaque = null,
+            func: *const fn (ctx: ?*anyopaque, entry: *const Entry) void,
+        };
+
+        /// Install the sync-feed observer: called for each locally journaled
+        /// edit, in record order (including each entry inside a
+        /// transaction). Remote integrations via `applyRemote` do not fire
+        /// it. The entry pointer is borrowed — copy what you need inside
+        /// the callback.
+        pub fn setRecordObserver(self: *Self, observer: RecordObserver) void {
+            self.observer = observer;
+        }
+
+        /// Integrate an edit that originated on another replica. Identity is
+        /// exact — feature/chapter/group/param ids are preserved (and the
+        /// local id counter skips past them) — while positions are hints:
+        /// indices are clamped and entries referencing unknown ids are
+        /// silently dropped. The effect is journaled locally (undo works
+        /// uniformly) but does not fire the record observer, so feeding
+        /// replicas' entries to each other cannot loop.
+        ///
+        /// Two replicas that exchange every entry in a consistent order
+        /// converge; concurrent positional edits are the application
+        /// layer's concern (`sync.lastWriterWins` is the provided
+        /// tie-breaker when provenance timestamps exist).
+        pub fn applyRemote(self: *Self, entry: *const Entry) void {
+            const prev = self.applying_remote;
+            self.applying_remote = true;
+            defer self.applying_remote = prev;
+            self.applyRemoteInner(entry);
+        }
+
+        fn applyRemoteInner(self: *Self, entry: *const Entry) void {
+            switch (entry.*) {
+                .commit => |e| {
+                    // Re-delivery is possible in any feed protocol: a
+                    // commit whose id already exists here was integrated.
+                    if (self.indexOf(e.id) != null) return;
+                    const at = @min(e.at, @as(u32, @intCast(self.list.items.len)));
+                    self.list.insert(self.gpa, at, .{ .id = e.id, .op = e.op }) catch return;
+                    if (e.id >= self.next_id) self.next_id = e.id +% 1;
+                    if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
+                    self.journal.record(.{ .commit = .{
+                        .id = e.id,
+                        .op = e.op,
+                        .at = at,
+                        .meta = e.meta,
+                    } });
+                    self.afterInsert(at);
+                },
+                .edit => |e| {
+                    const idx = self.indexOf(e.id) orelse return;
+                    const old_op = self.list.items[idx].op;
+                    self.journal.record(.{ .edit = .{
+                        .id = e.id,
+                        .old_op = old_op,
+                        .new_op = e.new_op,
+                    } });
+                    self.list.items[idx].op = e.new_op;
+                    self.invalidate(idx);
+                },
+                .remove => |e| {
+                    if (self.indexOf(e.id) == null) return;
+                    self.removeRemote(e.id);
+                },
+                .suppress => |e| {
+                    const idx = self.indexOf(e.id) orelse return;
+                    const prev_flag = self.list.items[idx].suppressed;
+                    if (prev_flag == e.prev) return;
+                    self.journal.record(.{ .suppress = .{ .id = e.id, .prev = prev_flag } });
+                    self.list.items[idx].suppressed = !e.prev;
+                    self.invalidate(idx);
+                },
+                .move => |e| {
+                    if (self.indexOf(e.id) == null) return;
+                    if (self.list.items.len == 0) return;
+                    const from = self.indexOf(e.id).?;
+                    const to = @min(e.to, @as(u32, @intCast(self.list.items.len - 1)));
+                    if (from == to) return;
+                    self.journal.record(.{ .move = .{
+                        .id = e.id,
+                        .from = from,
+                        .to = to,
+                        .marker_pre = self.marker_pos,
+                    } });
+                    self.rawMove(e.id, to);
+                },
+                .name_set => |e| {
+                    if (self.indexOf(e.id) == null) return;
+                    const old = self.ann.nameOf(e.id);
+                    const old_snap: ?[]const u8 = if (old) |o| self.gpa.dupe(u8, o) catch null else null;
+                    self.ann.setName(e.id, e.new) catch return;
+                    const new_snap: ?[]const u8 = if (e.new) |n| self.gpa.dupe(u8, n) catch null else null;
+                    self.journal.record(.{ .name_set = .{ .id = e.id, .old = old_snap, .new = new_snap } });
+                    self.annTouch();
+                },
+                .tag_add => |e| {
+                    if (self.indexOf(e.id) == null) return;
+                    const added = self.ann.addTag(e.id, e.tag) catch return;
+                    if (added) {
+                        const tag_snap = self.gpa.dupe(u8, e.tag) catch return;
+                        self.journal.record(.{ .tag_add = .{ .id = e.id, .tag = tag_snap } });
+                    }
+                    self.annTouch();
+                },
+                .tag_remove => |e| {
+                    if (!self.ann.hasTag(e.id, e.tag)) return;
+                    _ = self.ann.removeTag(e.id, e.tag);
+                    const tag_snap = self.gpa.dupe(u8, e.tag) catch return;
+                    self.journal.record(.{ .tag_remove = .{ .id = e.id, .tag = tag_snap } });
+                    self.annTouch();
+                },
+                .chapter_add => |e| {
+                    if (self.ann.chapterById(e.chapter.id) != null) return;
+                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch return;
+                    if (e.chapter.id >= self.next_id) self.next_id = e.chapter.id +% 1;
+                    self.journal.record(.{ .chapter_add = .{ .chapter = .{
+                        .id = e.chapter.id,
+                        .name = self.gpa.dupe(u8, e.chapter.name) catch return,
+                        .mark = e.chapter.mark,
+                    } } });
+                    self.annTouch();
+                },
+                .chapter_remove => |e| {
+                    if (self.ann.chapterById(e.chapter.id) == null) return;
+                    self.ann.removeChapter(e.chapter.id);
+                    self.journal.record(.{ .chapter_remove = .{ .chapter = .{
+                        .id = e.chapter.id,
+                        .name = self.gpa.dupe(u8, e.chapter.name) catch return,
+                        .mark = e.chapter.mark,
+                    } } });
+                    self.annTouch();
+                },
+                .chapter_rename => |e| {
+                    const c = self.ann.chapterById(e.id) orelse return;
+                    const old_snap = self.gpa.dupe(u8, c.name) catch return;
+                    self.ann.renameChapter(e.id, e.new) catch return;
+                    const new_snap = self.gpa.dupe(u8, e.new) catch return;
+                    self.journal.record(.{ .chapter_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
+                    self.annTouch();
+                },
+                .group_add => |e| {
+                    if (self.ann.groupById(e.group.id) != null) return;
+                    if (self.indexOf(e.group.first) == null and self.indexOf(e.group.last) == null and e.group.first != e.group.last) {
+                        // Span anchors unknown here: keep the folder empty
+                        // (dead anchors) rather than dropping the group.
+                    }
+                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch return;
+                    if (e.group.id >= self.next_id) self.next_id = e.group.id +% 1;
+                    self.journal.record(.{ .group_add = .{ .group = .{
+                        .id = e.group.id,
+                        .name = self.gpa.dupe(u8, e.group.name) catch return,
+                        .first = e.group.first,
+                        .last = e.group.last,
+                    } } });
+                    self.annTouch();
+                },
+                .group_remove => |e| {
+                    if (self.ann.groupById(e.group.id) == null) return;
+                    self.ann.removeGroup(e.group.id);
+                    self.journal.record(.{ .group_remove = .{ .group = .{
+                        .id = e.group.id,
+                        .name = self.gpa.dupe(u8, e.group.name) catch return,
+                        .first = e.group.first,
+                        .last = e.group.last,
+                    } } });
+                    self.annTouch();
+                },
+                .group_rename => |e| {
+                    const g = self.ann.groupById(e.id) orelse return;
+                    const old_snap = self.gpa.dupe(u8, g.name) catch return;
+                    self.ann.renameGroup(e.id, e.new) catch return;
+                    const new_snap = self.gpa.dupe(u8, e.new) catch return;
+                    self.journal.record(.{ .group_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
+                    self.annTouch();
+                },
+                .param_add => |e| {
+                    if (self.ptab.byId(e.id) != null) return;
+                    self.ptab.add(e.id, e.name, e.value) catch return;
+                    if (e.id >= self.next_id) self.next_id = e.id +% 1;
+                    self.journal.record(.{ .param_add = .{
+                        .id = e.id,
+                        .name = self.gpa.dupe(u8, e.name) catch return,
+                        .value = e.value,
+                    } });
+                },
+                .param_remove => |e| {
+                    if (self.ptab.byId(e.id) == null) return;
+                    _ = self.ptab.remove(e.id);
+                    self.journal.record(.{ .param_remove = .{
+                        .id = e.id,
+                        .name = self.gpa.dupe(u8, e.name) catch return,
+                        .value = e.value,
+                    } });
+                    self.invalidateReferencing(e.id);
+                },
+                .param_set => |e| {
+                    const old = self.ptab.valueOf(e.id) orelse return;
+                    if (old == e.new) return;
+                    _ = self.ptab.set(e.id, e.new);
+                    self.journal.record(.{ .param_set = .{ .id = e.id, .old = old, .new = e.new } });
+                    self.invalidateReferencing(e.id);
+                },
+                .param_rename => |e| {
+                    const current = self.ptab.byId(e.id) orelse return;
+                    const old_snap = self.gpa.dupe(u8, current.name) catch return;
+                    _ = self.ptab.rename(e.id, e.new) catch false;
+                    const new_snap = self.gpa.dupe(u8, e.new) catch return;
+                    self.journal.record(.{ .param_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
+                },
+            }
+        }
+
+        /// Remote removal: same snapshot flow as a local remove, journaled
+        /// silently.
+        fn removeRemote(self: *Self, id: ft.FeatureId) void {
+            const idx = self.indexOf(id) orelse return;
+            const f = self.list.items[idx];
+            const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
+                self.list.items[idx + 1].id
+            else
+                null;
+            const name_snap: ?[]const u8 = if (self.ann.nameOf(id)) |n|
+                self.gpa.dupe(u8, n) catch null
+            else
+                null;
+            const fixes = self.ann.reanchorAfterRemove(id, replacement) catch @as([]annotations.ChapterFix, &.{});
+            const tags_snap = self.ann.takeTags(id) catch @as([][]const u8, &.{});
+            const group_fixes = self.reanchorGroupBoundaries(id, idx) catch @as([]annotations.GroupFix, &.{});
+            self.journal.record(.{ .remove = .{
+                .id = id,
+                .op = f.op,
+                .at = idx,
+                .suppressed = f.suppressed,
+                .marker_pre = self.marker_pos,
+                .name = name_snap,
+                .meta = self.ann.provenance(id),
+                .chapter_fixes = fixes,
+                .tags = tags_snap,
+                .group_fixes = group_fixes,
+            } });
+            self.ann.removeFeature(id);
+            self.resetStatuses(idx);
+            _ = self.list.orderedRemove(idx);
+            if (idx < self.marker_pos) self.marker_pos -= 1;
+            self.invalidate(idx);
         }
 
         /// Open an explicit transaction: every edit recorded before the
@@ -2819,4 +3087,187 @@ fn save_persistence_shim(tl: *Timeline(ParamDomain), gpa: std.mem.Allocator, w: 
 }
 fn load_persistence_shim(gpa: std.mem.Allocator, r: *std.Io.Reader) !Timeline(ParamDomain) {
     return @import("persistence.zig").load(ParamDomain, gpa, .{}, r);
+}
+
+// ---------------------------------------------------------------------------
+// Sync feed tests (Wave 4)
+// ---------------------------------------------------------------------------
+
+const SyncTl = Timeline(ParamDomain);
+
+const Outbox = struct {
+    gpa: std.mem.Allocator,
+    blobs: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *Outbox) void {
+        for (self.blobs.items) |b| self.gpa.free(b);
+        self.blobs.deinit(self.gpa);
+    }
+
+    fn observe(ctx: ?*anyopaque, entry: *const SyncTl.Entry) void {
+        const self: *Outbox = @ptrCast(@alignCast(ctx.?));
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        syncing.encode(ParamDomain, entry, self.gpa, &aw.writer) catch {
+            aw.deinit();
+            return;
+        };
+        const owned = aw.toOwnedSlice() catch return;
+        self.blobs.append(self.gpa, owned) catch self.gpa.free(owned);
+    }
+
+    /// Feed every recorded entry to `tl` through the wire codec, then
+    /// drain (a real feed delivers each entry once; the library tolerates
+    /// re-delivery regardless).
+    fn feed(self: *Outbox, tl: *SyncTl) !void {
+        for (self.blobs.items) |blob| {
+            var reader = std.Io.Reader.fixed(blob);
+            var entry = try syncing.decode(ParamDomain, self.gpa, &reader);
+            tl.applyRemote(&entry);
+            syncing.deinit(ParamDomain.Op, self.gpa, &entry);
+        }
+        for (self.blobs.items) |b| self.gpa.free(b);
+        self.blobs.clearRetainingCapacity();
+    }
+};
+
+fn expectConverged(a: *SyncTl, b: *SyncTl) !void {
+    try std.testing.expectEqual(a.len(), b.len());
+    try std.testing.expectEqual(a.state().value, b.state().value);
+    var ia = a.features();
+    var ib = b.features();
+    while (ia.next()) |fa| {
+        const fb = ib.next().?;
+        try std.testing.expectEqual(fa.id, fb.id);
+        try std.testing.expect(std.meta.eql(fa.op.*, fb.op.*));
+        try std.testing.expectEqual(fa.suppressed, fb.suppressed);
+        const na = a.featureName(fa.id);
+        const nb = b.featureName(fb.id);
+        if (na) |x| try std.testing.expectEqualStrings(x, nb.?) else try std.testing.expect(nb == null);
+    }
+}
+
+test "sync: wire codec round-trips a remove entry with annotations" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 3 });
+    try tl.setFeatureName(a, "gone");
+    try tl.addTag(a, "core");
+    _ = try tl.addChapter("mark", .{ .after = a });
+
+    // Capture the remove entry via the observer.
+    var out = Outbox{ .gpa = gpa };
+    defer out.deinit();
+    tl.setRecordObserver(.{ .ctx = &out, .func = Outbox.observe });
+    tl.remove(a);
+    try std.testing.expectEqual(@as(usize, 1), out.blobs.items.len);
+
+    // Decode it back and check the payload survived the wire.
+    var reader = std.Io.Reader.fixed(out.blobs.items[0]);
+    var entry = try syncing.decode(ParamDomain, gpa, &reader);
+    defer syncing.deinit(ParamDomain.Op, gpa, &entry);
+    try std.testing.expectEqual(a, entry.remove.id);
+    try std.testing.expectEqualStrings("gone", entry.remove.name.?);
+    try std.testing.expectEqual(@as(usize, 1), entry.remove.tags.len);
+    try std.testing.expectEqualStrings("core", entry.remove.tags[0]);
+    try std.testing.expectEqual(@as(usize, 1), entry.remove.chapter_fixes.len);
+}
+
+test "sync: replicas converge when fed each other's entries" {
+    const gpa = std.testing.allocator;
+    var tl1 = try SyncTl.init(gpa, .{}, .{});
+    defer tl1.deinit();
+    var out1 = Outbox{ .gpa = gpa };
+    defer out1.deinit();
+    tl1.setRecordObserver(.{ .ctx = &out1, .func = Outbox.observe });
+
+    // Replica two: same identity via a persistence round trip.
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try @import("persistence.zig").save(ParamDomain, &tl1, gpa, &aw.writer);
+    var reader = std.Io.Reader.fixed(aw.written());
+    var tl2 = try @import("persistence.zig").load(ParamDomain, gpa, .{}, &reader);
+    defer tl2.deinit();
+    try std.testing.expectEqual(tl1.timelineId(), tl2.timelineId());
+    var out2 = Outbox{ .gpa = gpa };
+    defer out2.deinit();
+    tl2.setRecordObserver(.{ .ctx = &out2, .func = Outbox.observe });
+
+    // Session one on replica 1.
+    const a = try tl1.commit(.{ .add = 10 });
+    const b = try tl1.commit(.{ .scale_by_param = 0 }); // placeholder id, edited below
+    _ = b;
+    _ = try tl1.addParam("scale", 2.0);
+    _ = try tl1.commit(.{ .add = 5 });
+    try tl1.setFeatureName(a, "base");
+    tl1.setSuppressed(a, true);
+    tl1.setSuppressed(a, false);
+
+    try out1.feed(&tl2);
+    try expectConverged(&tl1, &tl2);
+    // Echo suppression: integrating remote entries fired no observer.
+    try std.testing.expectEqual(@as(usize, 0), out2.blobs.items.len);
+
+    // Session two on replica 2 — including a param-driven edit.
+    const scale = tl2.paramIdByName("scale").?;
+    tl2.setParam(scale, 3.0);
+    _ = try tl2.commit(.{ .scale_by_param = scale });
+    try tl2.addTag(a, "remote");
+    const c = try tl2.commit(.{ .add = 1 });
+    tl2.remove(c);
+
+    try out2.feed(&tl1);
+    try expectConverged(&tl1, &tl2);
+    // And a third round the other way to prove no loop formed.
+    const d = try tl1.commit(.{ .add = 100 });
+    tl1.edit(d, .{ .add = 200 });
+    try out1.feed(&tl2);
+    try expectConverged(&tl1, &tl2);
+
+    // Locally committed ids never collide with remote ones.
+    const fresh = try tl2.commit(.{ .add = 7 });
+    var seen: usize = 0;
+    var it = tl1.features();
+    while (it.next()) |f| {
+        if (f.id == fresh) seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), seen); // not yet fed
+    try out2.feed(&tl1);
+    it = tl1.features();
+    while (it.next()) |f| {
+        if (f.id == fresh) seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen);
+}
+
+test "sync: remote entries referencing unknown ids are dropped" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    _ = try tl.commit(.{ .add = 1 });
+
+    const bogus: ft.FeatureId = 0xDEADBEEF;
+    tl.applyRemote(&.{ .edit = .{ .id = bogus, .old_op = .{ .add = 0 }, .new_op = .{ .add = 9 } } });
+    try std.testing.expectEqual(@as(u32, 1), tl.len());
+    tl.applyRemote(&.{ .suppress = .{ .id = bogus, .prev = false } });
+    var it2 = tl.features();
+    try std.testing.expectEqual(false, it2.next().?.suppressed);
+}
+
+test "sync: remote edits undo locally as normal units" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    _ = try tl.commit(.{ .add = 1 });
+
+    tl.applyRemote(&.{ .commit = .{ .id = 4242, .op = .{ .add = 10 }, .at = 1, .meta = null } });
+    try std.testing.expectEqual(@as(i64, 11), tl.state().value);
+    try std.testing.expect(tl.undo()); // remote commit undoes like a local one
+    try std.testing.expectEqual(@as(i64, 1), tl.state().value);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 11), tl.state().value);
+    // The id counter skips past the remote id.
+    const fresh = try tl.commit(.{ .add = 1 });
+    try std.testing.expect(fresh > 4242);
 }

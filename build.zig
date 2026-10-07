@@ -162,6 +162,7 @@ pub fn build(b: *std.Build) void {
         "persistence_roundtrip",
         "background_rebuild",
         "annotations",
+        "sync",
     };
     for (example_names) |name| {
         const example_exe = b.addExecutable(.{
