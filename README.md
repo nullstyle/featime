@@ -16,7 +16,7 @@ zig build test   # unit + differential tests
 zig build run    # terrain-editor demo exercising every capability
 ```
 
-Requires Zig `0.17.0-dev.2151+2ec5523d5` (pinned via `mise`).
+Requires Zig `0.17.0` (pinned via `mise`).
 
 ## Fusion capability → library facility
 
