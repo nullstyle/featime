@@ -240,7 +240,7 @@ tests/oracle.zig   differential tests vs a naive reference model
 
 ## Status & non-goals
 
-v0.2.0. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
+v0.2.0 — see [ROADMAP.md](ROADMAP.md) for what's planned next. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
 feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are
