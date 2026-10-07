@@ -110,11 +110,36 @@ zig build edit_undo             # parametric edit, suppress, remove, undo/redo
 zig build caching               # apply-counted tour of the checkpoint cache
 zig build persistence_roundtrip # save/load with app-written codecs
 zig build background_rebuild    # worker-thread jobs, cancellation, staleness
+zig build annotations           # names, tags, chapters, groups, provenance
 zig build examples              # all of the above
 ```
 
 `zig build run` remains the full terrain-editor demo (including the
 hierarchical globe/region walkthrough from the previous section).
+
+## Annotations: names, tags, chapters, groups, provenance
+
+User-authored metadata that never affects document computation (no
+`dirty()`, no rebuild-generation impact) but participates fully in undo and
+persistence, anchored to feature ids so it survives structural edits:
+
+- **Names** — `setFeatureName(id, "ridge spine")`, surfaced on `FeatureView`.
+- **Tags** — set-semantics labels with `featuresTagged("quest-27")` filters.
+- **Chapters** — slider bookmarks: `Mark{ .after = X }` is the gap after
+  feature X (null pins to the tip); `markPosition` resolves a jump target.
+  Removing the anchor re-anchors to the successor, exactly reversed by undo.
+- **Groups** — contiguous `{first, last}` spans with computed membership:
+  inserts inside join, member moves out leave (Fusion folders). Batch
+  operations are single undo steps: `setGroupSuppressed`, `moveGroup`
+  (dependency-validated), `removeGroupContents`.
+- **Provenance** — `commitWithMeta(op, .{ .author, .ts })`; plain `commit`
+  auto-stamps when `Config.now` supplies a clock.
+
+Annotation changes are reported by `annotationsVersion()`, separate from the
+rebuild generation so background jobs stay valid. `timelineId()` exposes the
+persistent random identity written into the FTZ2 container (FTZ1 files load
+with no annotations) — groundwork for `(timeline_id, feature_id)` global
+references in the future sync layer.
 
 ## Contracts
 

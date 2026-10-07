@@ -16,7 +16,7 @@ roadmap that is expensive to revisit.
 
 ---
 
-## Wave 1 — Annotations & metadata (→ 0.3.0)
+## Wave 1 — Annotations & metadata (→ 0.3.0) — DELIVERED
 
 One subsystem: user-authored metadata about the timeline that never affects
 document computation (no `apply` involvement, no `dirty()` impact, no Domain

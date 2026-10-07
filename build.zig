@@ -161,6 +161,7 @@ pub fn build(b: *std.Build) void {
         "caching",
         "persistence_roundtrip",
         "background_rebuild",
+        "annotations",
     };
     for (example_names) |name| {
         const example_exe = b.addExecutable(.{
