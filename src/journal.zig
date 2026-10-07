@@ -43,12 +43,33 @@ pub fn Journal(comptime Op: type) type {
                 meta: ?annotations.Meta = null,
                 chapter_fixes: []annotations.ChapterFix = &.{}, // owned slice
                 tags: [][]const u8 = &.{}, // owned strings + owned slice
+                group_fixes: []annotations.GroupFix = &.{}, // owned slice
             },
             suppress: struct { id: ft.FeatureId, prev: bool },
             move: struct { id: ft.FeatureId, from: u32, to: u32, marker_pre: u32 },
             name_set: struct { id: ft.FeatureId, old: ?[]const u8, new: ?[]const u8 },
             tag_add: struct { id: ft.FeatureId, tag: []const u8 },
             tag_remove: struct { id: ft.FeatureId, tag: []const u8 },
+            group_add: struct { group: annotations.Group },
+            group_remove: struct { group: annotations.Group },
+            group_rename: struct { id: annotations.GroupId, old: []const u8, new: []const u8 },
+            /// Compound: batch suppression of a group's members in one
+            /// undo step. `prev` is each member's pre-change value; redo
+            /// sets every changed member to `!prev`.
+            group_suppress: struct { changes: []SuppressChange },
+            /// Compound: relocate a group's members keeping order (M4).
+            group_move: struct {
+                ids: []ft.FeatureId, // member order before the move
+                from: u32, // block start before the move
+                to: u32, // block start after the move
+                marker_pre: u32,
+            },
+            /// Compound: delete a group and its members in one undo step.
+            group_delete: struct {
+                group: annotations.Group, // snapshot (owns name)
+                members: []RemovedMember, // original list order
+                marker_pre: u32,
+            },
             chapter_add: struct { chapter: annotations.Chapter },
             chapter_remove: struct { chapter: annotations.Chapter },
             chapter_rename: struct { id: annotations.ChapterId, old: []const u8, new: []const u8 },
@@ -58,6 +79,20 @@ pub fn Journal(comptime Op: type) type {
         max: u32,
         entries: std.ArrayList(Entry) = .empty,
         head: usize = 0,
+
+        pub const SuppressChange = struct { id: ft.FeatureId, prev: bool };
+        pub const RemovedMember = struct {
+            at: u32,
+            id: ft.FeatureId,
+            op: Op,
+            suppressed: bool,
+            // Annotation snapshots for exact undo (all owned by the entry).
+            name: ?[]const u8 = null,
+            tags: [][]const u8 = &.{},
+            meta: ?annotations.Meta = null,
+            chapter_fixes: []annotations.ChapterFix = &.{},
+            group_fixes: []annotations.GroupFix = &.{},
+        };
 
         pub fn init(gpa: std.mem.Allocator, max: u32) Self {
             return .{ .gpa = gpa, .max = max };
@@ -75,6 +110,7 @@ pub fn Journal(comptime Op: type) type {
                     self.gpa.free(r.chapter_fixes);
                     for (r.tags) |t| self.gpa.free(t);
                     self.gpa.free(r.tags);
+                    self.gpa.free(r.group_fixes);
                 },
                 .name_set => |n| {
                     if (n.old) |o| self.gpa.free(o);
@@ -82,6 +118,25 @@ pub fn Journal(comptime Op: type) type {
                 },
                 .tag_add => |t| self.gpa.free(t.tag),
                 .tag_remove => |t| self.gpa.free(t.tag),
+                .group_add => |g| self.gpa.free(g.group.name),
+                .group_remove => |g| self.gpa.free(g.group.name),
+                .group_rename => |g| {
+                    self.gpa.free(g.old);
+                    self.gpa.free(g.new);
+                },
+                .group_suppress => |g| self.gpa.free(g.changes),
+                .group_move => |g| self.gpa.free(g.ids),
+                .group_delete => |g| {
+                    self.gpa.free(g.group.name);
+                    for (g.members) |m| {
+                        if (m.name) |n| self.gpa.free(n);
+                        for (m.tags) |t| self.gpa.free(t);
+                        self.gpa.free(m.tags);
+                        self.gpa.free(m.chapter_fixes);
+                        self.gpa.free(m.group_fixes);
+                    }
+                    self.gpa.free(g.members);
+                },
                 .chapter_add => |c| self.gpa.free(c.chapter.name),
                 .chapter_remove => |c| self.gpa.free(c.chapter.name),
                 .chapter_rename => |c| {

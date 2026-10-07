@@ -60,6 +60,11 @@ const NaiveEntry = union(enum) {
     },
     tag_add: struct { idx: u32, tag: []u8 },
     tag_remove: struct { idx: u32, tag: []u8 },
+    group_add: struct { pos: usize, name: []u8, first: ?u32, last: ?u32 },
+    group_remove: struct { pos: usize, name: []u8, first: ?u32, last: ?u32 },
+    group_rename: struct { pos: usize, old: []u8, new: []u8 },
+    naive_group_suppress: struct { changes: []NaiveSuppressChange },
+    naive_group_move: struct { nids: []u64, from: u32, to: u32, marker_pre: u32 },
     suppress: struct { idx: u32, prev: bool },
     move: struct { idx: u32, to: u32, marker_pre: u32 },
     name_set: struct { idx: u32, old: ?[]u8, new: ?[]u8 },
@@ -72,6 +77,15 @@ const NaiveChapter = struct {
     name: []u8,
     /// Index of the anchor feature; null = end-pinned.
     after: ?u32,
+};
+
+const NaiveSuppressChange = struct { nid: u64, prev: bool };
+
+const NaiveGroup = struct {
+    name: []u8,
+    /// Anchor indices; null = dead anchor (empty folder).
+    first: ?u32,
+    last: ?u32,
 };
 
 /// The reference model: no caching, no incremental anything. Mirrors the
@@ -89,6 +103,10 @@ const Naive = struct {
     chapters: std.ArrayList(NaiveChapter) = .empty,
     /// Per-index tags (index-mirrored; strings owned).
     tag_lists: std.ArrayList(std.ArrayList([]u8)) = .empty,
+    /// Per-feature stable internal ids (for group move/delete mirrors).
+    nids: std.ArrayList(u64) = .empty,
+    next_nid: u64 = 1,
+    groups: std.ArrayList(NaiveGroup) = .empty,
 
     fn deinit(self: *Naive) void {
         for (self.features.items) |*f| self.freeStatus(f);
@@ -104,6 +122,9 @@ const Naive = struct {
             list.deinit(self.gpa);
         }
         self.tag_lists.deinit(self.gpa);
+        self.nids.deinit(self.gpa);
+        for (self.groups.items) |*g| self.gpa.free(g.name);
+        self.groups.deinit(self.gpa);
         for (self.chapters.items) |*c| self.gpa.free(c.name);
         self.chapters.deinit(self.gpa);
     }
@@ -120,6 +141,9 @@ const Naive = struct {
         try self.features.insert(self.gpa, self.marker, .{ .id = 0, .op = op });
         try self.names.insert(self.gpa, self.marker, null);
         try self.tag_lists.insert(self.gpa, self.marker, .empty);
+        try self.nids.insert(self.gpa, self.marker, self.next_nid);
+        self.next_nid += 1;
+        self.shiftGroupAnchors(.insert, self.marker);
         for (self.features.items[self.marker + 1 ..]) |*f| self.freeStatus(f);
         self.record(.{ .commit = .{ .idx = self.marker, .op = op } });
         self.marker += 1;
@@ -188,6 +212,14 @@ const Naive = struct {
             },
             .tag_add => |t| self.gpa.free(t.tag),
             .tag_remove => |t| self.gpa.free(t.tag),
+            .group_add => |g| self.gpa.free(g.name),
+            .group_remove => |g| self.gpa.free(g.name),
+            .group_rename => |g| {
+                self.gpa.free(g.old);
+                self.gpa.free(g.new);
+            },
+            .naive_group_suppress => |g| self.gpa.free(g.changes),
+            .naive_group_move => |g| self.gpa.free(g.nids),
             else => {},
         }
     }
@@ -224,13 +256,51 @@ const Naive = struct {
         self.names.insert(self.gpa, to_c, n) catch unreachable;
         const tags_moved = self.tag_lists.orderedRemove(idx);
         self.tag_lists.insert(self.gpa, to_c, tags_moved) catch unreachable;
+        const nid_moved = self.nids.orderedRemove(idx);
+        self.nids.insert(self.gpa, to_c, nid_moved) catch unreachable;
         self.shiftChapterAnchors(.remove, idx);
         self.shiftChapterAnchors(.insert, to_c);
+        self.shiftGroupAnchors(.remove, idx);
+        self.shiftGroupAnchors(.insert, to_c);
         if (idx < self.marker and to_c >= self.marker) {
             self.marker -= 1;
         } else if (idx >= self.marker and to_c < self.marker) {
             self.marker += 1;
         }
+    }
+
+    fn shiftGroupAnchors(self: *Naive, kind: ShiftKind, at: u32) void {
+        for (self.groups.items) |*g| {
+            const f = g.first orelse continue;
+            const l = g.last orelse continue;
+            switch (kind) {
+                .insert => {
+                    if (at <= f) g.first = f + 1;
+                    if (at <= l) g.last = l + 1;
+                },
+                .remove => {
+                    if (f == at) {
+                        g.first = if (f + 1 <= l) f else null; // successor stays at f
+                    } else if (f > at) {
+                        g.first = f - 1;
+                    }
+                    if (l == at) {
+                        g.last = if (l >= f + 1) l - 1 else null;
+                    } else if (l > at) {
+                        g.last = l - 1;
+                    }
+                },
+            }
+        }
+    }
+
+    fn groupOrdinalAt(self: *const Naive, i: u32) ?usize {
+        for (self.groups.items, 0..) |g, gi| {
+            const f = g.first orelse continue;
+            const l = g.last orelse continue;
+            if (f <= l and i >= f and i <= l) return gi;
+        }
+        return null;
     }
 
     const ShiftKind = enum { insert, remove };
@@ -366,6 +436,107 @@ const Naive = struct {
         }
     }
 
+    fn nidAt(self: *const Naive, idx: u32) u64 {
+        return self.nids.items[idx];
+    }
+
+    fn idxOfNid(self: *const Naive, nid: u64) ?u32 {
+        for (self.nids.items, 0..) |n, i| {
+            if (n == nid) return @intCast(i);
+        }
+        return null;
+    }
+
+    fn addGroup(self: *Naive, name: []const u8, first: ?u32, last: ?u32) !void {
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        const entry_name = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(entry_name);
+        try self.groups.append(self.gpa, .{ .name = owned, .first = first, .last = last });
+        self.record(.{ .group_add = .{
+            .pos = self.groups.items.len - 1,
+            .name = entry_name,
+            .first = first,
+            .last = last,
+        } });
+    }
+
+    fn removeGroupAt(self: *Naive, pos: usize) void {
+        const dead = self.groups.orderedRemove(pos);
+        self.record(.{ .group_remove = .{
+            .pos = pos,
+            .name = dead.name,
+            .first = dead.first,
+            .last = dead.last,
+        } });
+    }
+
+    fn renameGroupAt(self: *Naive, pos: usize, new: []const u8) !void {
+        const g = &self.groups.items[pos];
+        const stored = try self.gpa.dupe(u8, new);
+        errdefer self.gpa.free(stored);
+        const old_copy = try self.gpa.dupe(u8, g.name);
+        errdefer self.gpa.free(old_copy);
+        const new_copy = try self.gpa.dupe(u8, new);
+        errdefer self.gpa.free(new_copy);
+        self.gpa.free(g.name);
+        g.name = stored;
+        self.record(.{ .group_rename = .{ .pos = pos, .old = old_copy, .new = new_copy } });
+    }
+
+    fn groupSpanLive(self: *const Naive, pos: usize) ?struct { lo: u32, hi: u32 } {
+        const g = self.groups.items[pos];
+        const f = g.first orelse return null;
+        const l = g.last orelse return null;
+        if (f > l) return null;
+        return .{ .lo = f, .hi = l };
+    }
+
+    fn setGroupSuppressedAt(self: *Naive, pos: usize, target: bool) !void {
+        const span = self.groupSpanLive(pos) orelse return;
+        var changes: std.ArrayList(NaiveSuppressChange) = .empty;
+        defer changes.deinit(self.gpa);
+        var i = span.lo;
+        while (i <= span.hi) : (i += 1) {
+            if (self.features.items[i].suppressed != target) {
+                try changes.append(self.gpa, .{ .nid = self.nids.items[i], .prev = self.features.items[i].suppressed });
+            }
+        }
+        if (changes.items.len == 0) return;
+        const owned = try changes.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(owned);
+        self.record(.{ .naive_group_suppress = .{ .changes = owned } });
+        for (owned) |ch| {
+            const idx = self.idxOfNid(ch.nid) orelse continue;
+            self.features.items[idx].suppressed = target;
+        }
+    }
+
+    fn moveGroupAt(self: *Naive, pos: usize, new_pos: u32) void {
+        const span = self.groupSpanLive(pos) orelse return;
+        const n: u32 = span.hi - span.lo + 1;
+        const to = @min(new_pos, @as(u32, @intCast(self.features.items.len)) - n);
+        if (to == span.lo) return;
+        var buf: [64]u64 = undefined;
+        if (n > buf.len) return;
+        for (span.lo..span.hi + 1) |i| buf[i - span.lo] = self.nids.items[i];
+        const owned = self.gpa.dupe(u64, buf[0..n]) catch return;
+        self.record(.{ .naive_group_move = .{
+            .nids = owned,
+            .from = span.lo,
+            .to = to,
+            .marker_pre = self.marker,
+        } });
+        self.applyNaiveGroupMove(buf[0..n], to);
+    }
+
+    fn applyNaiveGroupMove(self: *Naive, nids: []const u64, to: u32) void {
+        for (nids, 0..) |nid, k| {
+            const idx = self.idxOfNid(nid) orelse continue;
+            self.moveFeature(idx, to + @as(u32, @intCast(k)));
+        }
+    }
+
     fn canUndo(self: *const Naive) bool {
         return self.log_head > 0;
     }
@@ -385,9 +556,11 @@ const Naive = struct {
                 _ = self.names.orderedRemove(c.idx);
                 self.freeTagListAt(c.idx);
                 _ = self.tag_lists.orderedRemove(c.idx);
+                _ = self.nids.orderedRemove(c.idx);
                 _ = self.features.orderedRemove(c.idx);
                 self.marker = c.idx;
                 self.shiftChapterAnchors(.remove, c.idx);
+                self.shiftGroupAnchors(.remove, c.idx);
             },
             .edit => |ed| {
                 self.features.items[ed.idx].op = ed.old;
@@ -401,6 +574,9 @@ const Naive = struct {
                 }) catch return false;
                 const restored: ?[]u8 = if (r.name) |n| (self.gpa.dupe(u8, n) catch return false) else null;
                 self.names.insert(self.gpa, r.idx, restored) catch return false;
+                self.nids.insert(self.gpa, r.idx, self.next_nid) catch return false;
+                self.next_nid += 1;
+                self.shiftGroupAnchors(.insert, r.idx);
                 var restored_tags: std.ArrayList([]u8) = .empty;
                 for (r.tags) |t| {
                     const dt = self.gpa.dupe(u8, t) catch {
@@ -434,6 +610,39 @@ const Naive = struct {
             .name_set => |n| self.setNameRaw(n.idx, n.old),
             .tag_add => |t| self.removeTagRaw(t.idx, t.tag),
             .tag_remove => |t| self.addTagRaw(t.idx, t.tag),
+            .group_add => |g| {
+                const dead = self.groups.orderedRemove(g.pos);
+                self.gpa.free(dead.name);
+            },
+            .group_remove => |g| {
+                self.groups.insert(self.gpa, g.pos, .{
+                    .name = self.gpa.dupe(u8, g.name) catch return false,
+                    .first = g.first,
+                    .last = g.last,
+                }) catch return false;
+            },
+            .group_rename => |g| {
+                const target = &self.groups.items[g.pos];
+                const duped = self.gpa.dupe(u8, g.old) catch return false;
+                self.gpa.free(target.name);
+                target.name = duped;
+            },
+            .naive_group_suppress => |g| {
+                for (g.changes) |ch| {
+                    const idx = self.idxOfNid(ch.nid) orelse continue;
+                    self.features.items[idx].suppressed = ch.prev;
+                }
+            },
+            .naive_group_move => |g| {
+                var k: usize = g.nids.len;
+                while (k > 0) {
+                    k -= 1;
+                    if (self.idxOfNid(g.nids[k])) |idx| {
+                        self.moveFeature(idx, g.from + @as(u32, @intCast(k)));
+                    }
+                }
+                self.marker = g.marker_pre;
+            },
             .chapter_add => |c| {
                 const dead = self.chapters.orderedRemove(c.pos);
                 self.gpa.free(dead.name);
@@ -463,6 +672,9 @@ const Naive = struct {
                 self.features.insert(self.gpa, c.idx, .{ .id = 0, .op = c.op }) catch return false;
                 self.names.insert(self.gpa, c.idx, null) catch return false;
                 self.tag_lists.insert(self.gpa, c.idx, .empty) catch return false;
+                self.nids.insert(self.gpa, c.idx, self.next_nid) catch return false;
+                self.next_nid += 1;
+                self.shiftGroupAnchors(.insert, c.idx);
                 for (self.features.items[c.idx + 1 ..]) |*f| self.freeStatus(f);
                 self.marker = c.idx + 1;
             },
@@ -476,9 +688,11 @@ const Naive = struct {
                 _ = self.names.orderedRemove(r.idx);
                 self.freeTagListAt(r.idx);
                 _ = self.tag_lists.orderedRemove(r.idx);
+                _ = self.nids.orderedRemove(r.idx);
                 _ = self.features.orderedRemove(r.idx);
                 self.marker = if (r.idx < r.marker_pre) r.marker_pre - 1 else r.marker_pre;
                 self.shiftChapterAnchors(.remove, r.idx);
+                self.shiftGroupAnchors(.remove, r.idx);
             },
             .suppress => |s| {
                 self.features.items[s.idx].suppressed = !s.prev;
@@ -488,6 +702,30 @@ const Naive = struct {
             .name_set => |n| self.setNameRaw(n.idx, n.new),
             .tag_add => |t| self.addTagRaw(t.idx, t.tag),
             .tag_remove => |t| self.removeTagRaw(t.idx, t.tag),
+            .group_add => |g| {
+                self.groups.insert(self.gpa, g.pos, .{
+                    .name = self.gpa.dupe(u8, g.name) catch return false,
+                    .first = g.first,
+                    .last = g.last,
+                }) catch return false;
+            },
+            .group_remove => |g| {
+                const dead = self.groups.orderedRemove(g.pos);
+                self.gpa.free(dead.name);
+            },
+            .group_rename => |g| {
+                const target = &self.groups.items[g.pos];
+                const duped = self.gpa.dupe(u8, g.new) catch return false;
+                self.gpa.free(target.name);
+                target.name = duped;
+            },
+            .naive_group_suppress => |g| {
+                for (g.changes) |ch| {
+                    const idx = self.idxOfNid(ch.nid) orelse continue;
+                    self.features.items[idx].suppressed = !ch.prev;
+                }
+            },
+            .naive_group_move => |g| self.applyNaiveGroupMove(g.nids, g.to),
             .chapter_add => |c| {
                 self.chapters.insert(self.gpa, c.pos, .{
                     .name = self.gpa.dupe(u8, c.name) catch return false,
@@ -589,6 +827,17 @@ fn compare(tl: *Timeline, naive: *Naive, gpa: std.mem.Allocator) !void {
         } else {
             try expect(got.name == null);
         }
+        // Group membership by ordinal (creation order both sides).
+        if (naive.groupOrdinalAt(i)) |want_ordinal| {
+            const gid = tl.groupOf(got.id) orelse return error.MissingGroupMembership;
+            var got_ordinal: ?usize = null;
+            for (tl.groups(), 0..) |g2, gi2| {
+                if (g2.id == gid) got_ordinal = gi2;
+            }
+            try expectEqual(want_ordinal, got_ordinal.?);
+        } else {
+            try expect(tl.groupOf(got.id) == null);
+        }
         const want_tags = naive.tag_lists.items[i].items;
         const got_tags = tl.tags(got.id);
         if (want_tags.len != got_tags.len) {
@@ -609,6 +858,12 @@ fn compare(tl: *Timeline, naive: *Naive, gpa: std.mem.Allocator) !void {
         } else {
             try expectEqual(ft.Status.pending, got.status);
         }
+    }
+
+    // Groups: same order and names.
+    try expectEqual(naive.groups.items.len, tl.groups().len);
+    for (naive.groups.items, 0..) |want_g, gi| {
+        try std.testing.expectEqualStrings(want_g.name, tl.groups()[gi].name);
     }
 
     // Chapters: same order, names, and resolved positions.

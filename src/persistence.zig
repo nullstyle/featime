@@ -99,6 +99,14 @@ pub fn save(
         try writeFramed(writer, c.name);
     }
 
+    try writer.writeInt(u32, @intCast(tl.ann.groups.items.len), .little);
+    for (tl.ann.groups.items) |g| {
+        try writer.writeInt(u64, g.id, .little);
+        try writer.writeInt(u64, g.first, .little);
+        try writer.writeInt(u64, g.last, .little);
+        try writeFramed(writer, g.name);
+    }
+
     var tag_count: u32 = 0;
     var tag_it = tl.ann.tags.iterator();
     while (tag_it.next()) |e| {
@@ -192,6 +200,18 @@ pub fn load(
             defer gpa.free(fr.bytes);
             try tl.ann.addChapter(cid, fr.bytes, .{ .after = if (after_raw == 0) null else after_raw });
             if (cid >= tl.next_id) tl.next_id = cid +% 1;
+        }
+
+        const group_count = try reader.takeInt(u32, .little);
+        var gr: u32 = 0;
+        while (gr < group_count) : (gr += 1) {
+            const gid = try reader.takeInt(u64, .little);
+            const first = try reader.takeInt(u64, .little);
+            const last = try reader.takeInt(u64, .little);
+            const fr = try framedReader(gpa, reader);
+            defer gpa.free(fr.bytes);
+            try tl.ann.addGroup(gid, fr.bytes, first, last);
+            if (gid >= tl.next_id) tl.next_id = gid +% 1;
         }
 
         const tag_count = try reader.takeInt(u32, .little);

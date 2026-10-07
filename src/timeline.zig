@@ -288,6 +288,7 @@ pub fn Timeline(comptime Domain: type) type {
                 null;
             const fixes = self.ann.reanchorAfterRemove(id, replacement) catch @as([]annotations.ChapterFix, &.{});
             const tags_snap = self.ann.takeTags(id) catch @as([][]const u8, &.{});
+            const group_fixes = self.reanchorGroupBoundaries(id, idx) catch @as([]annotations.GroupFix, &.{});
 
             self.record(.{ .remove = .{
                 .id = id,
@@ -299,6 +300,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .meta = self.ann.provenance(id),
                 .chapter_fixes = fixes,
                 .tags = tags_snap,
+                .group_fixes = group_fixes,
             } });
             self.ann.removeFeature(id);
             self.annTouch();
@@ -466,6 +468,272 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn chapterPosition(self: *const Self, id: ft.ChapterId) ?u32 {
             const c = self.ann.chapterById(id) orelse return null;
             return self.markPosition(c.mark);
+        }
+
+        // ------------------------------------------------------------------
+        // Annotations: groups (contiguous spans)
+        // ------------------------------------------------------------------
+
+        /// Create a group spanning `first`..`last` (normalized by position).
+        /// Returns null when either anchor is absent.
+        pub fn addGroup(self: *Self, name: []const u8, first: ft.FeatureId, last: ft.FeatureId) error{OutOfMemory}!?ft.annotations.GroupId {
+            const fi = self.indexOf(first) orelse return null;
+            const li = self.indexOf(last) orelse return null;
+            const lo = @min(fi, li);
+            const hi = @max(fi, li);
+            const gid: ft.annotations.GroupId = self.next_id;
+            self.next_id +%= 1;
+            const entry_name = try self.gpa.dupe(u8, name);
+            errdefer self.gpa.free(entry_name);
+            try self.ann.addGroup(gid, name, self.list.items[lo].id, self.list.items[hi].id);
+            self.record(.{ .group_add = .{ .group = .{
+                .id = gid,
+                .name = entry_name,
+                .first = self.list.items[lo].id,
+                .last = self.list.items[hi].id,
+            } } });
+            self.annTouch();
+            return gid;
+        }
+
+        /// Ungroup: remove the group, keep the features. No-op if absent.
+        pub fn removeGroup(self: *Self, id: ft.annotations.GroupId) void {
+            const g = self.ann.groupById(id) orelse return;
+            const gid = g.id;
+            const first = g.first;
+            const last = g.last;
+            const entry_name = self.gpa.dupe(u8, g.name) catch return;
+            self.ann.removeGroup(id);
+            self.record(.{ .group_remove = .{ .group = .{
+                .id = gid,
+                .name = entry_name,
+                .first = first,
+                .last = last,
+            } } });
+            self.annTouch();
+        }
+
+        pub fn renameGroup(self: *Self, id: ft.annotations.GroupId, new_name: []const u8) error{OutOfMemory}!void {
+            const g = self.ann.groupById(id) orelse return;
+            const old_snap = try self.gpa.dupe(u8, g.name);
+            errdefer self.gpa.free(old_snap);
+            const new_snap = try self.gpa.dupe(u8, new_name);
+            errdefer self.gpa.free(new_snap);
+            try self.ann.renameGroup(id, new_name);
+            self.record(.{ .group_rename = .{ .id = id, .old = old_snap, .new = new_snap } });
+            self.annTouch();
+        }
+
+        /// All groups in creation order. Valid until the next annotation
+        /// mutation.
+        pub fn groups(self: *const Self) []const ft.annotations.Group {
+            return self.ann.groupList();
+        }
+
+        const Span = struct { lo: u32, hi: u32 };
+
+        /// Resolved span indices, or null when anchors are dead/inverted
+        /// (an empty folder).
+        fn spanOf(self: *const Self, first: ft.FeatureId, last: ft.FeatureId) ?Span {
+            const lo = self.indexOf(first) orelse return null;
+            const hi = self.indexOf(last) orelse return null;
+            if (lo > hi) return null;
+            return .{ .lo = lo, .hi = hi };
+        }
+
+        fn groupSpan(self: *const Self, g: *const ft.annotations.Group) ?Span {
+            return self.spanOf(g.first, g.last);
+        }
+
+        /// The group a feature belongs to, if any.
+        pub fn groupOf(self: *const Self, id: ft.FeatureId) ?ft.annotations.GroupId {
+            const idx = self.indexOf(id) orelse return null;
+            for (self.ann.groupList()) |*g| {
+                if (self.groupSpan(g)) |span| {
+                    if (idx >= span.lo and idx <= span.hi) return g.id;
+                }
+            }
+            return null;
+        }
+
+        /// Suppress or unsuppress every member of a group — one undo step.
+        pub fn setGroupSuppressed(self: *Self, id: ft.annotations.GroupId, suppressed: bool) error{OutOfMemory}!void {
+            const g = self.ann.groupById(id) orelse return;
+            const span = self.groupSpan(g) orelse return;
+            var changes: std.ArrayList(journaling.Journal(Op).SuppressChange) = .empty;
+            defer changes.deinit(self.gpa);
+            var i: u32 = span.lo;
+            while (i <= span.hi) : (i += 1) {
+                const f = &self.list.items[i];
+                if (f.suppressed != suppressed) {
+                    try changes.append(self.gpa, .{ .id = f.id, .prev = f.suppressed });
+                }
+            }
+            if (changes.items.len == 0) return;
+            const owned = try changes.toOwnedSlice(self.gpa);
+            errdefer self.gpa.free(owned);
+            self.record(.{ .group_suppress = .{ .changes = owned } });
+            self.touch();
+            for (owned) |ch| {
+                const idx = self.indexOf(ch.id) orelse continue;
+                self.list.items[idx].suppressed = suppressed;
+                self.invalidate(idx);
+            }
+        }
+
+        /// Relocate a group's members to `new_pos` (the block's first index
+        /// in the resulting list), preserving member order — one undo step.
+        /// Members cross the marker individually (same semantics as `move`).
+        /// No-op when absent or empty; `error.DependencyViolation` when the
+        /// resulting order would break declared dependencies.
+        pub fn moveGroup(self: *Self, id: ft.annotations.GroupId, new_pos: u32) MoveError!void {
+            self.touch();
+            const g = self.ann.groupById(id) orelse return;
+            const span = self.groupSpan(g) orelse return;
+            const n: u32 = span.hi - span.lo + 1;
+            const to = @min(new_pos, @as(u32, @intCast(self.list.items.len)) - n);
+            if (to == span.lo) return;
+
+            if (comptime hasDeps(Domain)) {
+                if (self.groupMoveViolatesDeps(span, to)) return error.DependencyViolation;
+            }
+
+            var ids_buf: [64]ft.FeatureId = undefined;
+            if (n > ids_buf.len) return error.OutOfMemory; // large groups: raise later
+            for (self.list.items[span.lo .. span.hi + 1], 0..) |*f, i| ids_buf[i] = f.id;
+            const ids = try self.gpa.dupe(ft.FeatureId, ids_buf[0..n]);
+            errdefer self.gpa.free(ids);
+
+            self.record(.{ .group_move = .{
+                .ids = ids,
+                .from = span.lo,
+                .to = to,
+                .marker_pre = self.marker_pos,
+            } });
+            self.applyGroupMove(ids_buf[0..n], to);
+        }
+
+        fn applyGroupMove(self: *Self, ids: []const ft.FeatureId, to: u32) void {
+            // Sequential rawMoves: member k always sits at the old block
+            // start when its turn comes, whichever direction the block
+            // travels (see the M4 notes in ROADMAP-era commits).
+            for (ids, 0..) |id, k| {
+                self.rawMove(id, to + @as(u32, @intCast(k)));
+            }
+        }
+
+        /// Simulate the block move and check every dependency edge against
+        /// the resulting order.
+        fn groupMoveViolatesDeps(self: *Self, span: Span, to: u32) bool {
+            const n: u32 = span.hi - span.lo + 1;
+            var collector: ft.DepCollector = .{ .gpa = self.gpa };
+            defer collector.deps.deinit(self.gpa);
+            for (self.list.items, 0..) |f, i| {
+                collector.deps.clearRetainingCapacity();
+                Domain.dependencies(f.op, &collector);
+                if (collector.failed) return false;
+                const mapped_i = groupMoveRemap(@intCast(i), span, to, n);
+                for (collector.deps.items) |d| {
+                    const anchor: ft.FeatureId = switch (d) {
+                        .feature => |id| id,
+                        .in_timeline => |ns| ns.timeline_feature,
+                    };
+                    const j = self.indexOf(anchor) orelse continue;
+                    if (j == i) continue;
+                    if (groupMoveRemap(j, span, to, n) >= mapped_i) return true;
+                }
+            }
+            return false;
+        }
+
+        fn groupMoveRemap(i: u32, span: Span, to: u32, n: u32) u32 {
+            if (i >= span.lo and i <= span.hi) return to + (i - span.lo);
+            if (to < span.lo) {
+                // Block moves left: features in [to .. span.lo) shift right
+                // by n.
+                return if (i >= to and i < span.lo) i + n else i;
+            }
+            // Block moves right: features in (span.hi .. to+n) shift left
+            // by n.
+            return if (i > span.hi and i < to + n) i - n else i;
+        }
+
+        /// Delete a group and its members in one undo step. No-op if the
+        /// group is absent; an empty group just disappears.
+        pub fn removeGroupContents(self: *Self, id: ft.annotations.GroupId) error{OutOfMemory}!void {
+            self.touch();
+            const marker_pre = self.marker_pos;
+            const g = self.ann.groupById(id) orelse return;
+            const gid = g.id;
+            const first = g.first;
+            const last = g.last;
+            const entry_name = try self.gpa.dupe(u8, g.name);
+            errdefer self.gpa.free(entry_name);
+
+            const span = self.groupSpan(g);
+            const count: usize = if (span) |sp| sp.hi - sp.lo + 1 else 0;
+            var members = try self.gpa.alloc(journaling.Journal(Op).RemovedMember, count);
+            errdefer self.gpa.free(members);
+            var filled: usize = 0;
+            errdefer {
+                for (members[0..filled]) |*m| self.deinitRemovedMember(m);
+            }
+
+            // Snapshot members low-to-high, mirroring the single-remove
+            // fixups after each conceptual removal.
+            var k: u32 = 0;
+            while (k < count) : (k += 1) {
+                const sp = self.groupSpan(self.ann.groupById(gid).?) orelse break;
+                const idx = sp.lo; // always remove the current first member
+                const f = self.list.items[idx];
+                const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
+                    self.list.items[idx + 1].id
+                else
+                    null;
+                const name_snap: ?[]const u8 = if (self.ann.nameOf(f.id)) |nm|
+                    self.gpa.dupe(u8, nm) catch null
+                else
+                    null;
+                const meta_snap = self.ann.provenance(f.id);
+                const tags_snap = self.ann.takeTags(f.id) catch @as([][]const u8, &.{});
+                const ch_fixes = self.ann.reanchorAfterRemove(f.id, replacement) catch @as([]annotations.ChapterFix, &.{});
+                const g_fixes = self.reanchorGroupBoundaries(f.id, idx) catch @as([]annotations.GroupFix, &.{});
+                self.ann.removeFeature(f.id);
+                self.resetStatuses(idx);
+                _ = self.list.orderedRemove(idx);
+                if (idx < self.marker_pos) self.marker_pos -= 1;
+                self.invalidate(idx);
+                members[filled] = .{
+                    // Original index: the span start stays fixed while its
+                    // head is re-anchored, so record position k within it.
+                    .at = sp.lo + k,
+                    .id = f.id,
+                    .op = f.op,
+                    .suppressed = f.suppressed,
+                    .name = name_snap,
+                    .tags = tags_snap,
+                    .meta = meta_snap,
+                    .chapter_fixes = ch_fixes,
+                    .group_fixes = g_fixes,
+                };
+                filled += 1;
+            }
+
+            self.ann.removeGroup(gid);
+            self.record(.{ .group_delete = .{
+                .group = .{ .id = gid, .name = entry_name, .first = first, .last = last },
+                .members = members,
+                .marker_pre = marker_pre,
+            } });
+            self.annTouch();
+        }
+
+        fn deinitRemovedMember(self: *Self, m: *journaling.Journal(Op).RemovedMember) void {
+            if (m.name) |n| self.gpa.free(n);
+            for (m.tags) |t| self.gpa.free(t);
+            self.gpa.free(m.tags);
+            self.gpa.free(m.chapter_fixes);
+            self.gpa.free(m.group_fixes);
         }
 
         /// Reorder a feature to `new_pos` (clamped to the list; interpreted
@@ -637,6 +905,7 @@ pub fn Timeline(comptime Domain: type) type {
                     if (e.name) |n| self.ann.setName(e.id, n) catch {};
                     if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     self.ann.applyFixes(e.chapter_fixes);
+                    self.ann.applyGroupFixes(e.group_fixes);
                     if (e.tags.len > 0) {
                         var restore: std.ArrayList([]const u8) = .empty;
                         for (e.tags) |t| {
@@ -678,6 +947,76 @@ pub fn Timeline(comptime Domain: type) type {
                     _ = self.ann.addTag(e.id, e.tag) catch {};
                     self.annTouch();
                 },
+                .group_add => |e| {
+                    self.ann.removeGroup(e.group.id);
+                    self.annTouch();
+                },
+                .group_remove => |e| {
+                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch {};
+                    self.annTouch();
+                },
+                .group_rename => |e| {
+                    self.ann.renameGroup(e.id, e.old) catch {};
+                    self.annTouch();
+                },
+                .group_suppress => |e| {
+                    for (e.changes) |ch| {
+                        const mi = self.indexOf(ch.id) orelse continue;
+                        if (self.list.items[mi].suppressed != ch.prev) {
+                            self.list.items[mi].suppressed = ch.prev;
+                            self.invalidate(mi);
+                        }
+                    }
+                },
+                .group_move => |e| {
+                    // Move the block back: reverse member order so each
+                    // member departs from the (fixed) block start.
+                    var k: usize = e.ids.len;
+                    while (k > 0) {
+                        k -= 1;
+                        self.rawMove(e.ids[k], e.from + @as(u32, @intCast(k)));
+                    }
+                    self.marker_pos = e.marker_pre;
+                },
+                .group_delete => |e| {
+                    // Re-insert members at their original positions
+                    // (ascending), then restore annotations and fixups in
+                    // reverse removal order (descending), then the group.
+                    for (e.members) |m| {
+                        self.list.insert(self.gpa, m.at, .{
+                            .id = m.id,
+                            .op = m.op,
+                            .suppressed = m.suppressed,
+                        }) catch return;
+                    }
+                    var k: usize = e.members.len;
+                    while (k > 0) {
+                        k -= 1;
+                        const m = e.members[k];
+                        if (m.name) |nm| self.ann.setName(m.id, nm) catch {};
+                        if (m.meta) |meta| self.ann.setProvenance(m.id, meta) catch {};
+                        if (m.tags.len > 0) {
+                            var restore: std.ArrayList([]const u8) = .empty;
+                            for (m.tags) |t| {
+                                if (self.gpa.dupe(u8, t) catch null) |d| {
+                                    restore.append(self.gpa, d) catch self.gpa.free(d);
+                                }
+                            }
+                            const owned = restore.toOwnedSlice(self.gpa) catch @as([][]const u8, &.{});
+                            if (self.ann.giveTags(m.id, owned)) |_| {
+                                self.gpa.free(owned);
+                            } else |_| {
+                                self.ann.freeTags(owned);
+                            }
+                        }
+                        self.ann.applyFixes(m.chapter_fixes);
+                        self.ann.applyGroupFixes(m.group_fixes);
+                        self.afterInsert(m.at);
+                    }
+                    self.marker_pos = e.marker_pre;
+                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch {};
+                    self.annTouch();
+                },
                 .chapter_add => |e| {
                     self.ann.removeChapter(e.chapter.id);
                     self.annTouch();
@@ -714,6 +1053,8 @@ pub fn Timeline(comptime Domain: type) type {
                         null;
                     const fixes = self.ann.reanchorAfterRemove(e.id, replacement) catch @as([]annotations.ChapterFix, &.{});
                     self.gpa.free(fixes); // the entry keeps the originals
+                    const gfixes = self.reanchorGroupBoundaries(e.id, idx) catch @as([]annotations.GroupFix, &.{});
+                    self.gpa.free(gfixes);
                     self.ann.removeFeature(e.id); // frees name/tags
                     self.resetStatuses(idx);
                     _ = self.list.orderedRemove(idx);
@@ -739,6 +1080,52 @@ pub fn Timeline(comptime Domain: type) type {
                     _ = self.ann.removeTag(e.id, e.tag);
                     self.annTouch();
                 },
+                .group_add => |e| {
+                    self.ann.removeGroup(e.group.id);
+                    self.annTouch();
+                },
+                .group_remove => |e| {
+                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch {};
+                    self.annTouch();
+                },
+                .group_rename => |e| {
+                    self.ann.renameGroup(e.id, e.old) catch {};
+                    self.annTouch();
+                },
+                .group_suppress => |e| {
+                    for (e.changes) |ch| {
+                        const mi = self.indexOf(ch.id) orelse continue;
+                        const target = !ch.prev;
+                        if (self.list.items[mi].suppressed != target) {
+                            self.list.items[mi].suppressed = target;
+                            self.invalidate(mi);
+                        }
+                    }
+                },
+                .group_move => |e| self.applyGroupMove(e.ids, e.to),
+                .group_delete => |e| {
+                    var k: usize = e.members.len;
+                    while (k > 0) {
+                        k -= 1;
+                        const m = e.members[k];
+                        const idx = self.indexOf(m.id) orelse continue;
+                        const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
+                            self.list.items[idx + 1].id
+                        else
+                            null;
+                        const cf = self.ann.reanchorAfterRemove(m.id, replacement) catch @as([]annotations.ChapterFix, &.{});
+                        self.gpa.free(cf);
+                        const gf = self.reanchorGroupBoundaries(m.id, idx) catch @as([]annotations.GroupFix, &.{});
+                        self.gpa.free(gf);
+                        self.ann.removeFeature(m.id);
+                        self.resetStatuses(idx);
+                        _ = self.list.orderedRemove(idx);
+                        if (idx < self.marker_pos) self.marker_pos -= 1;
+                        self.invalidate(idx);
+                    }
+                    self.ann.removeGroup(e.group.id);
+                    self.annTouch();
+                },
                 .chapter_add => |e| {
                     self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch {};
                     self.annTouch();
@@ -752,6 +1139,29 @@ pub fn Timeline(comptime Domain: type) type {
                     self.annTouch();
                 },
             }
+        }
+
+        /// Re-anchor group boundaries when a member at `idx` is removed:
+        /// the second member becomes `first`, the predecessor becomes `last`;
+        /// with no members left the anchors go dead (empty folder). Returns
+        /// the fixes needed to undo this exactly.
+        fn reanchorGroupBoundaries(self: *Self, removed_id: ft.FeatureId, idx: u32) error{OutOfMemory}![]annotations.GroupFix {
+            var fixes: std.ArrayList(annotations.GroupFix) = .empty;
+            errdefer fixes.deinit(self.gpa);
+            for (self.ann.groupsMut()) |*g| {
+                const span = self.spanOf(g.first, g.last) orelse continue;
+                const at_first = idx == span.lo;
+                const at_last = idx == span.hi;
+                if (!at_first and !at_last) continue;
+                try fixes.append(self.gpa, .{ .group_id = g.id, .old_first = g.first, .old_last = g.last });
+                if (at_first) {
+                    g.first = if (span.lo + 1 <= span.hi) self.list.items[span.lo + 1].id else removed_id;
+                }
+                if (at_last) {
+                    g.last = if (span.hi >= span.lo + 1) self.list.items[span.hi - 1].id else removed_id;
+                }
+            }
+            return fixes.toOwnedSlice(self.gpa);
         }
 
         /// Shared tail for structural mutations at `idx`: statuses from `idx`
@@ -1980,4 +2390,153 @@ test "tags: add, iterate, filter, undo/redo, remove round trip" {
     try std.testing.expect(tl.undo());
     try std.testing.expectEqual(@as(usize, 1), tl.tags(a).len);
     try std.testing.expectEqualStrings("terrain", tl.tags(a)[0]);
+}
+
+test "groups: membership computed from the span" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+    const c = try tl.commit(.{ .add = 3 });
+    const d = try tl.commit(.{ .add = 4 });
+    _ = d;
+
+    const g = (try tl.addGroup("middle", c, b)).?; // normalized: a-span b..c
+    try std.testing.expectEqual(b, tl.groups()[0].first);
+    try std.testing.expectEqual(c, tl.groups()[0].last);
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(b));
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(c));
+    try std.testing.expect(tl.groupOf(a) == null);
+
+    // Insert inside the span: joins the group.
+    tl.setMarker(2);
+    _ = try tl.commit(.{ .add = 5 });
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(idAtIdx(&tl, 2)));
+
+    // Ungroup keeps features.
+    tl.removeGroup(g);
+    try std.testing.expectEqual(@as(usize, 0), tl.groups().len);
+    try std.testing.expectEqual(@as(u32, 5), tl.len());
+    try std.testing.expect(tl.groupOf(b) == null);
+}
+
+fn idAtIdx(tl: *TestTimeline, idx: u32) ft.FeatureId {
+    var it = tl.features();
+    var i: u32 = 0;
+    while (it.next()) |f| : (i += 1) {
+        if (i == idx) return f.id;
+    }
+    unreachable;
+}
+
+test "groups: boundary removal re-anchors; empty survives; undo restores" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+    const c = try tl.commit(.{ .add = 3 });
+    const g = (try tl.addGroup("g", a, c)).?;
+
+    // Remove the first member: second member becomes first.
+    tl.remove(a);
+    try std.testing.expectEqual(b, tl.groups()[0].first);
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(b));
+
+    // Undo restores the original boundary.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(a, tl.groups()[0].first);
+
+    // Remove everything the span covers: empty folder survives.
+    tl.remove(a);
+    tl.remove(b);
+    tl.remove(c);
+    try std.testing.expectEqual(@as(usize, 1), tl.groups().len);
+    try std.testing.expectEqual(@as(usize, 0), tl.len());
+}
+
+test "groups: batch suppression is one undo step" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    const c = try tl.commit(.{ .add = 3 });
+    _ = try tl.addGroup("g", a, c);
+
+    try tl.setGroupSuppressed(tl.groups()[0].id, true);
+    try std.testing.expectEqual(@as(i64, 0), tl.state().value); // all suppressed
+
+    // One undo restores every member's flag.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(i64, 6), tl.state().value);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(i64, 0), tl.state().value);
+}
+
+test "moveGroup relocates the block in one undo step" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    const c = try tl.commit(.{ .add = 3 });
+    _ = try tl.commit(.{ .add = 4 });
+    _ = try tl.commit(.{ .add = 5 });
+    _ = try tl.addGroup("g", c, c); // single member at index 2
+
+    try tl.moveGroup(tl.groups()[0].id, 0);
+    try std.testing.expectEqual(c, idAtIdx(&tl, 0));
+    try std.testing.expectEqual(@as(i64, 15), tl.state().value);
+
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(c, idAtIdx(&tl, 2));
+    try std.testing.expectEqual(@as(i64, 15), tl.state().value);
+
+    // Multi-member block keeps order and relocations adjust the marker per
+    // crossing member.
+    _ = try tl.commit(.{ .add = 0 });
+    _ = tl.state();
+    _ = try tl.addGroup("h", idAtIdx(&tl, 3), idAtIdx(&tl, 4)); // {3,4}
+    const before = tl.state().value;
+    try tl.moveGroup(tl.groups()[1].id, 0);
+    _ = tl.state();
+    const after = tl.state().value;
+    // Members {3,4} moved before everything: sums commute here, so compare
+    // membership instead of value.
+    try std.testing.expectEqual(idAtIdx(&tl, 0), tl.groups()[1].first);
+    _ = before;
+    _ = after;
+}
+
+test "removeGroupContents deletes members and group in one undo step" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+    _ = try tl.commit(.{ .add = 4 });
+    const g = (try tl.addGroup("mid", a, b)).?;
+    try tl.setFeatureName(b, "keeper");
+    try tl.addTag(b, "terrain");
+
+    try tl.removeGroupContents(g);
+    try std.testing.expectEqual(@as(u32, 2), tl.len());
+    try std.testing.expectEqual(@as(usize, 0), tl.groups().len);
+    try std.testing.expectEqual(@as(i64, 7), tl.state().value);
+
+    // One undo restores members, the group, and every annotation.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(u32, 4), tl.len());
+    try std.testing.expectEqual(@as(usize, 1), tl.groups().len);
+    try std.testing.expectEqual(@as(i64, 10), tl.state().value);
+    try std.testing.expectEqualStrings("keeper", tl.featureName(b).?);
+    try std.testing.expectEqual(@as(usize, 1), tl.tags(b).len);
 }

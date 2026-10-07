@@ -1,6 +1,6 @@
 //! The annotation layer: user-authored metadata about the timeline that
 //! never affects document computation — feature names, chapters, provenance,
-//! tags (groups arrive in a later milestone of the same wave).
+//! tags, and contiguous groups (spans).
 //!
 //! Everything is anchored to `FeatureId`s, never indices, and the layer
 //! participates fully in undo (via journal entries and structural fixup
@@ -41,6 +41,29 @@ pub const ChapterFix = struct {
     old_mark: Mark,
 };
 
+pub const GroupId = u64;
+
+/// A contiguous named span (folder). Membership is *computed* as the
+/// features between the `first` and `last` anchors, so inserts inside the
+/// span join it and reordering a member out leaves it — Fusion folder
+/// behavior. Dead anchors (their feature deleted with no member left to
+/// re-anchor to) make the span empty; the group survives as an empty folder.
+pub const Group = struct {
+    id: GroupId,
+    /// Owned by whoever holds the group.
+    name: []const u8,
+    first: ft.FeatureId,
+    last: ft.FeatureId,
+};
+
+/// One group boundary re-anchor caused by removing a member; journaled so
+/// undo restores the exact previous span.
+pub const GroupFix = struct {
+    group_id: GroupId,
+    old_first: ft.FeatureId,
+    old_last: ft.FeatureId,
+};
+
 pub const Annotations = struct {
     const Self = @This();
 
@@ -52,6 +75,7 @@ pub const Annotations = struct {
     /// Per-feature tags in insertion order; strings owned. Set semantics:
     /// a tag is either present or absent, never duplicated.
     tags: std.AutoHashMapUnmanaged(ft.FeatureId, std.ArrayList([]const u8)) = .empty,
+    groups: std.ArrayList(Group) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Self {
         return .{ .gpa = gpa };
@@ -70,6 +94,8 @@ pub const Annotations = struct {
             e.value_ptr.deinit(self.gpa);
         }
         self.tags.deinit(self.gpa);
+        for (self.groups.items) |*g| self.gpa.free(g.name);
+        self.groups.deinit(self.gpa);
     }
 
     // -- feature names ---------------------------------------------------
@@ -245,6 +271,67 @@ pub const Annotations = struct {
     pub fn freeTags(self: *Self, owned: [][]const u8) void {
         for (owned) |t| self.gpa.free(@constCast(t));
         self.gpa.free(owned);
+    }
+
+    // -- groups ----------------------------------------------------------------
+
+    pub fn groupList(self: *const Self) []const Group {
+        return self.groups.items;
+    }
+
+    /// Mutable access for boundary fixups (internal).
+    pub fn groupsMut(self: *Self) []Group {
+        return self.groups.items;
+    }
+
+    pub fn groupById(self: *const Self, id: GroupId) ?*const Group {
+        for (self.groups.items) |*g| {
+            if (g.id == id) return g;
+        }
+        return null;
+    }
+
+    pub fn addGroup(self: *Self, id: GroupId, name: []const u8, first: ft.FeatureId, last: ft.FeatureId) error{OutOfMemory}!void {
+        try self.groups.append(self.gpa, .{
+            .id = id,
+            .name = try self.gpa.dupe(u8, name),
+            .first = first,
+            .last = last,
+        });
+    }
+
+    pub fn removeGroup(self: *Self, id: GroupId) void {
+        for (self.groups.items, 0..) |g, i| {
+            if (g.id == id) {
+                const dead = self.groups.orderedRemove(i);
+                self.gpa.free(dead.name);
+                return;
+            }
+        }
+    }
+
+    pub fn renameGroup(self: *Self, id: GroupId, new_name: []const u8) error{OutOfMemory}!void {
+        const g = self.mutableGroup(id) orelse return;
+        const duped = try self.gpa.dupe(u8, new_name);
+        self.gpa.free(g.name);
+        g.name = duped;
+    }
+
+    fn mutableGroup(self: *Self, id: GroupId) ?*Group {
+        for (self.groups.items) |*g| {
+            if (g.id == id) return g;
+        }
+        return null;
+    }
+
+    /// Restore boundaries recorded by boundary fixups.
+    pub fn applyGroupFixes(self: *Self, fixes: []const GroupFix) void {
+        for (fixes) |f| {
+            if (self.mutableGroup(f.group_id)) |g| {
+                g.first = f.old_first;
+                g.last = f.old_last;
+            }
+        }
     }
 
     // -- structural hooks --------------------------------------------------
