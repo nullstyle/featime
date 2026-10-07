@@ -99,6 +99,23 @@ for (tl.features()) |f| {
 }
 ```
 
+## Examples
+
+`examples/` holds small, commented programs that each teach one part of the
+interface — every one is a complete application with its own Domain:
+
+```sh
+zig build basic_slider          # commit, scrub the slider, mid-history insert
+zig build edit_undo             # parametric edit, suppress, remove, undo/redo
+zig build caching               # apply-counted tour of the checkpoint cache
+zig build persistence_roundtrip # save/load with app-written codecs
+zig build background_rebuild    # worker-thread jobs, cancellation, staleness
+zig build examples              # all of the above
+```
+
+`zig build run` remains the full terrain-editor demo (including the
+hierarchical globe/region walkthrough from the previous section).
+
 ## Contracts
 
 - **Ops are plain data.** Op payloads must not own heap memory or hold
@@ -217,6 +234,7 @@ src/journal.zig    undo/redo journal (internal)
 src/persistence.zig save/load container format
 src/nested_demo.zig two-level globe/region demo (hierarchical timelines)
 src/main.zig       terrain-editor demo
+examples/          focused usage examples (zig build examples)
 tests/oracle.zig   differential tests vs a naive reference model
 ```
 

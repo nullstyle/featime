@@ -152,6 +152,35 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_oracle_tests.step);
 
+    // Usage examples: small, commented programs that each teach one part of
+    // the API. `zig build <name>` runs one; `zig build examples` runs all.
+    const examples_step = b.step("examples", "Run all usage examples");
+    const example_names = [_][]const u8{
+        "basic_slider",
+        "edit_undo",
+        "caching",
+        "persistence_roundtrip",
+        "background_rebuild",
+    };
+    for (example_names) |name| {
+        const example_exe = b.addExecutable(.{
+            .name = b.fmt("example-{s}", .{name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "featuretree_zig", .module = mod },
+                },
+            }),
+        });
+        const run_example = b.addRunArtifact(example_exe);
+        run_example.step.dependOn(b.getInstallStep());
+        const single = b.step(name, b.fmt("Run the {s} example", .{name}));
+        single.dependOn(&run_example.step);
+        examples_step.dependOn(&run_example.step);
+    }
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
