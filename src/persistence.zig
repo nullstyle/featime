@@ -99,6 +99,20 @@ pub fn save(
         try writeFramed(writer, c.name);
     }
 
+    var tag_count: u32 = 0;
+    var tag_it = tl.ann.tags.iterator();
+    while (tag_it.next()) |e| {
+        tag_count += @intCast(e.value_ptr.items.len);
+    }
+    try writer.writeInt(u32, tag_count, .little);
+    tag_it = tl.ann.tags.iterator();
+    while (tag_it.next()) |e| {
+        for (e.value_ptr.items) |t| {
+            try writer.writeInt(u64, e.key_ptr.*, .little);
+            try writeFramed(writer, t);
+        }
+    }
+
     var prov_count: u32 = 0;
     var pit = tl.ann.prov.iterator();
     while (pit.next()) |_| prov_count += 1;
@@ -178,6 +192,15 @@ pub fn load(
             defer gpa.free(fr.bytes);
             try tl.ann.addChapter(cid, fr.bytes, .{ .after = if (after_raw == 0) null else after_raw });
             if (cid >= tl.next_id) tl.next_id = cid +% 1;
+        }
+
+        const tag_count = try reader.takeInt(u32, .little);
+        var tg: u32 = 0;
+        while (tg < tag_count) : (tg += 1) {
+            const fid = try reader.takeInt(u64, .little);
+            const fr = try framedReader(gpa, reader);
+            defer gpa.free(fr.bytes);
+            _ = tl.ann.addTag(fid, fr.bytes) catch {};
         }
 
         const prov_count = try reader.takeInt(u32, .little);
@@ -351,6 +374,8 @@ test "round trip preserves annotations and timeline identity" {
     const a = try tl.commitWithMeta(.{ .add = 1 }, .{ .author = 7, .ts = 42 });
     const b = try tl.commit(.{ .add = 2 });
     try tl.setFeatureName(a, "ridge");
+    try tl.addTag(a, "terrain");
+    try tl.addTag(a, "review");
     _ = try tl.addChapter("before ridge", .{ .after = null });
     _ = try tl.addChapter("after ridge", .{ .after = a });
     tl.setSuppressed(b, true);
@@ -366,6 +391,9 @@ test "round trip preserves annotations and timeline identity" {
 
     try std.testing.expectEqual(original_id, loaded.timelineId());
     try std.testing.expectEqualStrings("ridge", loaded.featureName(a).?);
+    try std.testing.expectEqual(@as(usize, 2), loaded.tags(a).len);
+    try std.testing.expectEqualStrings("terrain", loaded.tags(a)[0]);
+    try std.testing.expectEqualStrings("review", loaded.tags(a)[1]);
     try std.testing.expectEqual(ft.Meta{ .author = 7, .ts = 42 }, loaded.provenance(a).?);
     try std.testing.expectEqual(@as(usize, 2), loaded.chapters().len);
     try std.testing.expectEqualStrings("before ridge", loaded.chapters()[0].name);

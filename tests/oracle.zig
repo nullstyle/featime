@@ -50,7 +50,16 @@ const NaiveFeature = ft.Feature(Domain.Op);
 const NaiveEntry = union(enum) {
     commit: struct { idx: u32, op: Domain.Op },
     edit: struct { idx: u32, old: Domain.Op, new: Domain.Op },
-    remove: struct { idx: u32, op: Domain.Op, suppressed: bool, marker_pre: u32, name: ?[]u8 },
+    remove: struct {
+        idx: u32,
+        op: Domain.Op,
+        suppressed: bool,
+        marker_pre: u32,
+        name: ?[]u8,
+        tags: [][]u8,
+    },
+    tag_add: struct { idx: u32, tag: []u8 },
+    tag_remove: struct { idx: u32, tag: []u8 },
     suppress: struct { idx: u32, prev: bool },
     move: struct { idx: u32, to: u32, marker_pre: u32 },
     name_set: struct { idx: u32, old: ?[]u8, new: ?[]u8 },
@@ -78,6 +87,8 @@ const Naive = struct {
     /// Per-index display names (index-mirrored; strings owned).
     names: std.ArrayList(?[]u8) = .empty,
     chapters: std.ArrayList(NaiveChapter) = .empty,
+    /// Per-index tags (index-mirrored; strings owned).
+    tag_lists: std.ArrayList(std.ArrayList([]u8)) = .empty,
 
     fn deinit(self: *Naive) void {
         for (self.features.items) |*f| self.freeStatus(f);
@@ -88,6 +99,11 @@ const Naive = struct {
             if (n) |owned| self.gpa.free(owned);
         }
         self.names.deinit(self.gpa);
+        for (self.tag_lists.items) |*list| {
+            for (list.items) |t| self.gpa.free(t);
+            list.deinit(self.gpa);
+        }
+        self.tag_lists.deinit(self.gpa);
         for (self.chapters.items) |*c| self.gpa.free(c.name);
         self.chapters.deinit(self.gpa);
     }
@@ -103,6 +119,7 @@ const Naive = struct {
     fn commit(self: *Naive, op: Domain.Op) !void {
         try self.features.insert(self.gpa, self.marker, .{ .id = 0, .op = op });
         try self.names.insert(self.gpa, self.marker, null);
+        try self.tag_lists.insert(self.gpa, self.marker, .empty);
         for (self.features.items[self.marker + 1 ..]) |*f| self.freeStatus(f);
         self.record(.{ .commit = .{ .idx = self.marker, .op = op } });
         self.marker += 1;
@@ -119,15 +136,25 @@ const Naive = struct {
         self.record(.{ .edit = .{ .idx = idx, .old = old, .new = op } });
     }
 
+    fn freeTagListAt(self: *Naive, idx: u32) void {
+        const list = &self.tag_lists.items[idx];
+        for (list.items) |t| self.gpa.free(t);
+        list.clearRetainingCapacity();
+        list.deinit(self.gpa);
+    }
+
     fn remove(self: *Naive, idx: u32) void {
         const f = self.features.items[idx];
         const owned_name = self.names.orderedRemove(idx); // moves to the entry
+        const owned_tags: [][]u8 = self.tag_lists.items[idx].toOwnedSlice(self.gpa) catch &.{};
+        _ = self.tag_lists.orderedRemove(idx); // keep index-aligned with features
         self.record(.{ .remove = .{
             .idx = idx,
             .op = f.op,
             .suppressed = f.suppressed,
             .marker_pre = self.marker,
             .name = owned_name,
+            .tags = owned_tags,
         } });
         for (self.features.items[idx..]) |*f2| self.freeStatus(f2);
         _ = self.features.orderedRemove(idx);
@@ -156,7 +183,11 @@ const Naive = struct {
             },
             .remove => |r| {
                 if (r.name) |n| self.gpa.free(n);
+                for (r.tags) |t| self.gpa.free(t);
+                self.gpa.free(r.tags);
             },
+            .tag_add => |t| self.gpa.free(t.tag),
+            .tag_remove => |t| self.gpa.free(t.tag),
             else => {},
         }
     }
@@ -191,6 +222,8 @@ const Naive = struct {
         self.features.insert(self.gpa, to_c, f) catch unreachable;
         const n = self.names.orderedRemove(idx);
         self.names.insert(self.gpa, to_c, n) catch unreachable;
+        const tags_moved = self.tag_lists.orderedRemove(idx);
+        self.tag_lists.insert(self.gpa, to_c, tags_moved) catch unreachable;
         self.shiftChapterAnchors(.remove, idx);
         self.shiftChapterAnchors(.insert, to_c);
         if (idx < self.marker and to_c >= self.marker) {
@@ -229,6 +262,26 @@ const Naive = struct {
         if (idx == to_c) return;
         self.record(.{ .move = .{ .idx = idx, .to = to_c, .marker_pre = self.marker } });
         self.moveFeature(idx, to_c);
+    }
+
+    fn addTagRaw(self: *Naive, idx: u32, tag: []const u8) void {
+        const list = &self.tag_lists.items[idx];
+        for (list.items) |t| {
+            if (std.mem.eql(u8, t, tag)) return;
+        }
+        const stored = self.gpa.dupe(u8, tag) catch return;
+        list.append(self.gpa, stored) catch self.gpa.free(stored);
+    }
+
+    fn removeTagRaw(self: *Naive, idx: u32, tag: []const u8) void {
+        const list = &self.tag_lists.items[idx];
+        for (list.items, 0..) |t, i| {
+            if (std.mem.eql(u8, t, tag)) {
+                const dead = list.orderedRemove(i);
+                self.gpa.free(dead);
+                return;
+            }
+        }
     }
 
     /// Set a name by index without journaling (journal handlers).
@@ -284,6 +337,35 @@ const Naive = struct {
         self.record(.{ .chapter_rename = .{ .pos = pos, .old = old_copy, .new = new_copy } });
     }
 
+    fn addTag(self: *Naive, idx: u32, tag: []const u8) !void {
+        const list = &self.tag_lists.items[idx];
+        for (list.items) |t| {
+            if (std.mem.eql(u8, t, tag)) return; // set semantics
+        }
+        const stored = try self.gpa.dupe(u8, tag);
+        errdefer self.gpa.free(stored);
+        const entry_tag = try self.gpa.dupe(u8, tag);
+        errdefer self.gpa.free(entry_tag);
+        try list.append(self.gpa, stored);
+        self.record(.{ .tag_add = .{ .idx = idx, .tag = entry_tag } });
+    }
+
+    fn removeTag(self: *Naive, idx: u32, tag: []const u8) void {
+        const list = &self.tag_lists.items[idx];
+        for (list.items, 0..) |t, i| {
+            if (std.mem.eql(u8, t, tag)) {
+                const dead = list.orderedRemove(i);
+                const entry_tag = self.gpa.dupe(u8, dead) catch {
+                    self.gpa.free(dead);
+                    return;
+                };
+                self.gpa.free(dead);
+                self.record(.{ .tag_remove = .{ .idx = idx, .tag = entry_tag } });
+                return;
+            }
+        }
+    }
+
     fn canUndo(self: *const Naive) bool {
         return self.log_head > 0;
     }
@@ -301,6 +383,8 @@ const Naive = struct {
                 for (self.features.items[c.idx..]) |*f| self.freeStatus(f);
                 if (self.names.items[c.idx]) |owned| self.gpa.free(owned);
                 _ = self.names.orderedRemove(c.idx);
+                self.freeTagListAt(c.idx);
+                _ = self.tag_lists.orderedRemove(c.idx);
                 _ = self.features.orderedRemove(c.idx);
                 self.marker = c.idx;
                 self.shiftChapterAnchors(.remove, c.idx);
@@ -317,6 +401,23 @@ const Naive = struct {
                 }) catch return false;
                 const restored: ?[]u8 = if (r.name) |n| (self.gpa.dupe(u8, n) catch return false) else null;
                 self.names.insert(self.gpa, r.idx, restored) catch return false;
+                var restored_tags: std.ArrayList([]u8) = .empty;
+                for (r.tags) |t| {
+                    const dt = self.gpa.dupe(u8, t) catch {
+                        for (restored_tags.items) |x| self.gpa.free(x);
+                        restored_tags.deinit(self.gpa);
+                        return false;
+                    };
+                    restored_tags.append(self.gpa, dt) catch {
+                        self.gpa.free(dt);
+                        continue;
+                    };
+                }
+                self.tag_lists.insert(self.gpa, r.idx, restored_tags) catch {
+                    for (restored_tags.items) |x| self.gpa.free(x);
+                    restored_tags.deinit(self.gpa);
+                    return false;
+                };
                 for (self.features.items[r.idx..]) |*f| self.freeStatus(f);
                 self.marker = r.marker_pre;
                 // Undoing a removal shifts anchors like an insert at r.idx.
@@ -331,6 +432,8 @@ const Naive = struct {
                 self.marker = m.marker_pre;
             },
             .name_set => |n| self.setNameRaw(n.idx, n.old),
+            .tag_add => |t| self.removeTagRaw(t.idx, t.tag),
+            .tag_remove => |t| self.addTagRaw(t.idx, t.tag),
             .chapter_add => |c| {
                 const dead = self.chapters.orderedRemove(c.pos);
                 self.gpa.free(dead.name);
@@ -359,6 +462,7 @@ const Naive = struct {
             .commit => |c| {
                 self.features.insert(self.gpa, c.idx, .{ .id = 0, .op = c.op }) catch return false;
                 self.names.insert(self.gpa, c.idx, null) catch return false;
+                self.tag_lists.insert(self.gpa, c.idx, .empty) catch return false;
                 for (self.features.items[c.idx + 1 ..]) |*f| self.freeStatus(f);
                 self.marker = c.idx + 1;
             },
@@ -370,6 +474,8 @@ const Naive = struct {
                 for (self.features.items[r.idx..]) |*f| self.freeStatus(f);
                 if (self.names.items[r.idx]) |owned| self.gpa.free(owned);
                 _ = self.names.orderedRemove(r.idx);
+                self.freeTagListAt(r.idx);
+                _ = self.tag_lists.orderedRemove(r.idx);
                 _ = self.features.orderedRemove(r.idx);
                 self.marker = if (r.idx < r.marker_pre) r.marker_pre - 1 else r.marker_pre;
                 self.shiftChapterAnchors(.remove, r.idx);
@@ -380,6 +486,8 @@ const Naive = struct {
             },
             .move => |m| self.moveFeature(m.idx, m.to),
             .name_set => |n| self.setNameRaw(n.idx, n.new),
+            .tag_add => |t| self.addTagRaw(t.idx, t.tag),
+            .tag_remove => |t| self.removeTagRaw(t.idx, t.tag),
             .chapter_add => |c| {
                 self.chapters.insert(self.gpa, c.pos, .{
                     .name = self.gpa.dupe(u8, c.name) catch return false,
@@ -481,6 +589,17 @@ fn compare(tl: *Timeline, naive: *Naive, gpa: std.mem.Allocator) !void {
         } else {
             try expect(got.name == null);
         }
+        const want_tags = naive.tag_lists.items[i].items;
+        const got_tags = tl.tags(got.id);
+        if (want_tags.len != got_tags.len) {
+            std.debug.print("TAG MISMATCH at feature index {d} (id {d}): naive {d} tags, real {d} tags\n", .{ i, got.id, want_tags.len, got_tags.len });
+            for (want_tags) |t| std.debug.print("  naive: {s}\n", .{t});
+            for (got_tags) |t| std.debug.print("  real : {s}\n", .{t});
+        }
+        try expectEqual(want_tags.len, got_tags.len);
+        for (want_tags, got_tags) |wt, gt| {
+            try std.testing.expectEqualStrings(wt, gt);
+        }
         if (i < naive.marker) {
             try expectEqual(std.meta.activeTag(want_f.status), std.meta.activeTag(got.status));
             switch (want_f.status) {
@@ -511,18 +630,21 @@ fn runSequence(seed: u64, steps: u16) !void {
     const gpa = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
+    var step: u16 = 0;
+    var last_action: u7 = 0;
+    errdefer std.debug.print("FAIL seed={d} step={d} action={d}\n", .{ seed, step, last_action });
 
     var tl = try Timeline.init(gpa, .{}, randomConfig(random));
     defer tl.deinit();
     var naive = Naive{ .gpa = gpa, .journal_max = tl.config.max_journal };
     defer naive.deinit();
 
-    var step: u16 = 0;
     while (step < steps) : (step += 1) {
         const len: u32 = @intCast(naive.features.items.len);
         // Roll a structural action; fall back to commit when the timeline is
         // too short for index-based ones.
         const action = if (len == 0) 0 else random.uintLessThan(u7, 100);
+        last_action = action;
         switch (action) {
             0...29 => {
                 const op = randomOp(random);
@@ -543,7 +665,23 @@ fn runSequence(seed: u64, steps: u16) !void {
                     try naive.setName(idx, null);
                 }
             },
-            36...49 => {
+            36...37 => {
+                const idx = random.uintAtMost(u32, len - 1);
+                const pool = [_][]const u8{ "tA", "tB", "tC", "tD" };
+                const tag = pool[random.uintAtMost(u2, 3)];
+                try tl.addTag(idAt(&tl, idx), tag);
+                try naive.addTag(idx, tag);
+            },
+            38...39 => {
+                const idx = random.uintAtMost(u32, len - 1);
+                if (naive.tag_lists.items[idx].items.len > 0) {
+                    const pick = random.uintAtMost(usize, naive.tag_lists.items[idx].items.len - 1);
+                    const tag = naive.tag_lists.items[idx].items[pick];
+                    tl.removeTag(idAt(&tl, idx), tag);
+                    naive.removeTag(idx, tag);
+                }
+            },
+            40...49 => {
                 const pos = random.uintAtMost(u32, len);
                 tl.setMarker(pos);
                 naive.setMarker(pos);

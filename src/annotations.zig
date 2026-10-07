@@ -1,6 +1,6 @@
 //! The annotation layer: user-authored metadata about the timeline that
-//! never affects document computation — feature names, chapters, provenance
-//! (tags and groups arrive in later milestones of the same wave).
+//! never affects document computation — feature names, chapters, provenance,
+//! tags (groups arrive in a later milestone of the same wave).
 //!
 //! Everything is anchored to `FeatureId`s, never indices, and the layer
 //! participates fully in undo (via journal entries and structural fixup
@@ -49,6 +49,9 @@ pub const Annotations = struct {
     names: std.AutoHashMapUnmanaged(ft.FeatureId, []const u8) = .empty,
     prov: std.AutoHashMapUnmanaged(ft.FeatureId, Meta) = .empty,
     chapters: std.ArrayList(Chapter) = .empty,
+    /// Per-feature tags in insertion order; strings owned. Set semantics:
+    /// a tag is either present or absent, never duplicated.
+    tags: std.AutoHashMapUnmanaged(ft.FeatureId, std.ArrayList([]const u8)) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Self {
         return .{ .gpa = gpa };
@@ -61,6 +64,12 @@ pub const Annotations = struct {
         self.prov.deinit(self.gpa);
         for (self.chapters.items) |*c| self.gpa.free(c.name);
         self.chapters.deinit(self.gpa);
+        var tit = self.tags.iterator();
+        while (tit.next()) |e| {
+            for (e.value_ptr.items) |t| self.gpa.free(t);
+            e.value_ptr.deinit(self.gpa);
+        }
+        self.tags.deinit(self.gpa);
     }
 
     // -- feature names ---------------------------------------------------
@@ -165,6 +174,77 @@ pub const Annotations = struct {
         for (fixes) |f| {
             if (self.mutableChapter(f.chapter_id)) |c| c.mark = f.old_mark;
         }
+    }
+
+    // -- tags ----------------------------------------------------------------
+
+    /// The feature's tags in insertion order. Empty for absent features.
+    pub fn tagList(self: *const Self, id: ft.FeatureId) []const []const u8 {
+        if (self.tags.get(id)) |list| return list.items;
+        return &.{};
+    }
+
+    pub fn hasTag(self: *const Self, id: ft.FeatureId, tag: []const u8) bool {
+        for (self.tagList(id)) |t| {
+            if (std.mem.eql(u8, t, tag)) return true;
+        }
+        return false;
+    }
+
+    /// Add a tag (no-op if already present). Returns true when added.
+    pub fn addTag(self: *Self, id: ft.FeatureId, tag: []const u8) error{OutOfMemory}!bool {
+        if (self.hasTag(id, tag)) return false;
+        const gop = try self.tags.getOrPut(self.gpa, id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.gpa, try self.gpa.dupe(u8, tag));
+        return true;
+    }
+
+    /// Remove a tag. Returns true when a tag was removed (the caller
+    /// journals the tag string it removed).
+    pub fn removeTag(self: *Self, id: ft.FeatureId, tag: []const u8) bool {
+        const list = self.tags.getPtr(id) orelse return false;
+        for (list.items, 0..) |t, i| {
+            if (std.mem.eql(u8, t, tag)) {
+                const dead = list.orderedRemove(i);
+                self.gpa.free(dead);
+                if (list.items.len == 0) {
+                    list.deinit(self.gpa);
+                    _ = self.tags.remove(id);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Move all of a feature's tags out (ownership transfers to the caller);
+    /// used when deleting the feature so undo can restore them.
+    pub fn takeTags(self: *Self, id: ft.FeatureId) error{OutOfMemory}![][]const u8 {
+        var list = self.tags.fetchRemove(id) orelse return &.{};
+        const out = try self.gpa.dupe([]const u8, list.value.items);
+        errdefer self.gpa.free(out);
+        list.value.deinit(self.gpa); // frees the ArrayList buffer; strings move
+        return out;
+    }
+
+    /// Store already-owned tag strings for a feature (ownership transfers
+    /// in). Replaces any existing tags.
+    pub fn giveTags(self: *Self, id: ft.FeatureId, owned: [][]const u8) error{OutOfMemory}!void {
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer list.deinit(self.gpa);
+        try list.appendSlice(self.gpa, owned);
+        if (self.tags.getPtr(id)) |old| {
+            for (old.items) |t| self.gpa.free(t);
+            old.deinit(self.gpa);
+        }
+        try self.tags.put(self.gpa, id, list);
+    }
+
+    /// Free an owned tag array (the strings and the slice).
+    pub fn freeTags(self: *Self, owned: [][]const u8) void {
+        for (owned) |t| self.gpa.free(@constCast(t));
+        self.gpa.free(owned);
     }
 
     // -- structural hooks --------------------------------------------------

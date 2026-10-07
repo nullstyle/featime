@@ -287,6 +287,7 @@ pub fn Timeline(comptime Domain: type) type {
             else
                 null;
             const fixes = self.ann.reanchorAfterRemove(id, replacement) catch @as([]annotations.ChapterFix, &.{});
+            const tags_snap = self.ann.takeTags(id) catch @as([][]const u8, &.{});
 
             self.record(.{ .remove = .{
                 .id = id,
@@ -297,6 +298,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .name = name_snap,
                 .meta = self.ann.provenance(id),
                 .chapter_fixes = fixes,
+                .tags = tags_snap,
             } });
             self.ann.removeFeature(id);
             self.annTouch();
@@ -356,6 +358,55 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn provenance(self: *const Self, id: ft.FeatureId) ?ft.Meta {
             return self.ann.provenance(id);
         }
+
+        /// Add a tag to a feature (set semantics: no-op if already present).
+        pub fn addTag(self: *Self, id: ft.FeatureId, tag: []const u8) error{OutOfMemory}!void {
+            if (self.indexOf(id) == null) return;
+            const entry_tag = try self.gpa.dupe(u8, tag);
+            errdefer self.gpa.free(entry_tag);
+            const added = try self.ann.addTag(id, tag);
+            if (!added) {
+                self.gpa.free(entry_tag);
+                return;
+            }
+            self.record(.{ .tag_add = .{ .id = id, .tag = entry_tag } });
+            self.annTouch();
+        }
+
+        /// Remove a tag from a feature. No-op if absent.
+        pub fn removeTag(self: *Self, id: ft.FeatureId, tag: []const u8) void {
+            if (!self.ann.hasTag(id, tag)) return;
+            const entry_tag = self.gpa.dupe(u8, tag) catch return;
+            _ = self.ann.removeTag(id, tag);
+            self.record(.{ .tag_remove = .{ .id = id, .tag = entry_tag } });
+            self.annTouch();
+        }
+
+        /// The feature's tags in insertion order. Valid until the next
+        /// annotation mutation.
+        pub fn tags(self: *const Self, id: ft.FeatureId) []const []const u8 {
+            return self.ann.tagList(id);
+        }
+
+        /// Iterate feature ids carrying `tag`, oldest-first.
+        pub fn featuresTagged(self: *const Self, tag: []const u8) TaggedIter {
+            return .{ .tl = self, .tag = tag };
+        }
+
+        pub const TaggedIter = struct {
+            tl: *const Self,
+            tag: []const u8,
+            i: u32 = 0,
+
+            pub fn next(self: *TaggedIter) ?ft.FeatureId {
+                while (self.i < self.tl.list.items.len) {
+                    const id = self.tl.list.items[self.i].id;
+                    self.i += 1;
+                    if (self.tl.ann.hasTag(id, self.tag)) return id;
+                }
+                return null;
+            }
+        };
 
         /// Add a named chapter (a slider bookmark) at `mark`. Chapter ids
         /// share the feature id space and are never reused.
@@ -586,6 +637,22 @@ pub fn Timeline(comptime Domain: type) type {
                     if (e.name) |n| self.ann.setName(e.id, n) catch {};
                     if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     self.ann.applyFixes(e.chapter_fixes);
+                    if (e.tags.len > 0) {
+                        var restore: std.ArrayList([]const u8) = .empty;
+                        for (e.tags) |t| {
+                            if (self.gpa.dupe(u8, t) catch null) |d| {
+                                restore.append(self.gpa, d) catch self.gpa.free(d);
+                            }
+                        }
+                        const owned = restore.toOwnedSlice(self.gpa) catch @as([][]const u8, &.{});
+                        if (self.ann.giveTags(e.id, owned)) |_| {
+                            // Strings transferred to the map; free the
+                            // temporary pointer slice.
+                            self.gpa.free(owned);
+                        } else |_| {
+                            self.ann.freeTags(owned);
+                        }
+                    }
                     self.annTouch();
                 },
                 .suppress => |e| {
@@ -601,6 +668,14 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .name_set => |e| {
                     self.ann.setName(e.id, e.old) catch {};
+                    self.annTouch();
+                },
+                .tag_add => |e| {
+                    _ = self.ann.removeTag(e.id, e.tag);
+                    self.annTouch();
+                },
+                .tag_remove => |e| {
+                    _ = self.ann.addTag(e.id, e.tag) catch {};
                     self.annTouch();
                 },
                 .chapter_add => |e| {
@@ -639,7 +714,7 @@ pub fn Timeline(comptime Domain: type) type {
                         null;
                     const fixes = self.ann.reanchorAfterRemove(e.id, replacement) catch @as([]annotations.ChapterFix, &.{});
                     self.gpa.free(fixes); // the entry keeps the originals
-                    self.ann.removeFeature(e.id);
+                    self.ann.removeFeature(e.id); // frees name/tags
                     self.resetStatuses(idx);
                     _ = self.list.orderedRemove(idx);
                     self.marker_pos = if (e.at < e.marker_pre) e.marker_pre - 1 else e.marker_pre;
@@ -654,6 +729,14 @@ pub fn Timeline(comptime Domain: type) type {
                 .move => |e| self.rawMove(e.id, e.to),
                 .name_set => |e| {
                     self.ann.setName(e.id, e.new) catch {};
+                    self.annTouch();
+                },
+                .tag_add => |e| {
+                    _ = self.ann.addTag(e.id, e.tag) catch {};
+                    self.annTouch();
+                },
+                .tag_remove => |e| {
+                    _ = self.ann.removeTag(e.id, e.tag);
                     self.annTouch();
                 },
                 .chapter_add => |e| {
@@ -1855,4 +1938,46 @@ test "annotation edits do not invalidate document state or jobs" {
     try std.testing.expect(!tl.dirty());
     try std.testing.expectEqual(gen_before, tl.gen);
     try std.testing.expect(tl.annotationsVersion() != v_before);
+}
+
+test "tags: add, iterate, filter, undo/redo, remove round trip" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+
+    try tl.addTag(a, "terrain");
+    try tl.addTag(a, "terrain"); // set semantics: no duplicate
+    try tl.addTag(a, "review");
+    try tl.addTag(b, "terrain");
+    try std.testing.expectEqual(@as(usize, 2), tl.tags(a).len);
+    try std.testing.expectEqualStrings("terrain", tl.tags(a)[0]);
+    try std.testing.expectEqualStrings("review", tl.tags(a)[1]);
+
+    // Filter: oldest-first feature ids.
+    var found: usize = 0;
+    var it = tl.featuresTagged("terrain");
+    while (it.next()) |id| {
+        try std.testing.expect(found == 0 or found == 1);
+        if (found == 0) try std.testing.expectEqual(a, id) else try std.testing.expectEqual(b, id);
+        found += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), found);
+
+    // Removal is undoable; add is undoable.
+    tl.removeTag(a, "review");
+    try std.testing.expectEqual(@as(usize, 1), tl.tags(a).len);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(usize, 2), tl.tags(a).len);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(@as(usize, 1), tl.tags(a).len);
+
+    // Feature removal snapshots tags; undo restores them exactly.
+    tl.remove(a);
+    try std.testing.expectEqual(@as(usize, 0), tl.tags(a).len);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(usize, 1), tl.tags(a).len);
+    try std.testing.expectEqualStrings("terrain", tl.tags(a)[0]);
 }

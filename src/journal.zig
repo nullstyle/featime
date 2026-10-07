@@ -42,10 +42,13 @@ pub fn Journal(comptime Op: type) type {
                 name: ?[]const u8 = null, // owned by this entry
                 meta: ?annotations.Meta = null,
                 chapter_fixes: []annotations.ChapterFix = &.{}, // owned slice
+                tags: [][]const u8 = &.{}, // owned strings + owned slice
             },
             suppress: struct { id: ft.FeatureId, prev: bool },
             move: struct { id: ft.FeatureId, from: u32, to: u32, marker_pre: u32 },
             name_set: struct { id: ft.FeatureId, old: ?[]const u8, new: ?[]const u8 },
+            tag_add: struct { id: ft.FeatureId, tag: []const u8 },
+            tag_remove: struct { id: ft.FeatureId, tag: []const u8 },
             chapter_add: struct { chapter: annotations.Chapter },
             chapter_remove: struct { chapter: annotations.Chapter },
             chapter_rename: struct { id: annotations.ChapterId, old: []const u8, new: []const u8 },
@@ -70,11 +73,15 @@ pub fn Journal(comptime Op: type) type {
                 .remove => |r| {
                     if (r.name) |n| self.gpa.free(n);
                     self.gpa.free(r.chapter_fixes);
+                    for (r.tags) |t| self.gpa.free(t);
+                    self.gpa.free(r.tags);
                 },
                 .name_set => |n| {
                     if (n.old) |o| self.gpa.free(o);
                     if (n.new) |x| self.gpa.free(x);
                 },
+                .tag_add => |t| self.gpa.free(t.tag),
+                .tag_remove => |t| self.gpa.free(t.tag),
                 .chapter_add => |c| self.gpa.free(c.chapter.name),
                 .chapter_remove => |c| self.gpa.free(c.chapter.name),
                 .chapter_rename => |c| {
