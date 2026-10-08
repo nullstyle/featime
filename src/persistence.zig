@@ -1,23 +1,27 @@
 //! Save/load timelines: a small versioned binary container framing
 //! application-encoded payloads.
 //!
-//! FTZ2 layout (all integers little-endian):
+//! FTZ3 layout (all integers little-endian; "framed" = u32 length + bytes):
 //!
-//!   magic "FTZ2"
+//!   magic "FTZ3"
 //!   u64 timeline_id
-//!   u32 seed_doc_len   + bytes from `Domain.encodeDoc`
-//!   u32 feature_count
-//!   feature_count × { u64 id, u8 suppressed, u32 op_len + bytes from
-//!                     `Domain.encodeOp` }
+//!   framed seed document              (bytes from `Domain.encodeDoc`)
+//!   u32 feature_count × { u64 id, u8 suppressed, framed op (`Domain.encodeOp`) }
 //!   u32 marker
+//!   u32 param_count   × { u64 id, u64 value (f64 bit pattern), framed name }
 //!   --- annotation sections ---
-//!   u32 name_count     × { u64 feature_id, framed name }
-//!   u32 chapter_count  × { u64 chapter_id, u64 after (0 = end-pinned),
-//!                          framed name }
-//!   u32 provenance_ct  × { u64 feature_id, u64 author, u64 ts }
+//!   u32 name_count    × { u64 feature_id, framed name }
+//!   u32 chapter_count × { u64 chapter_id, u64 after (0 = end-pinned), framed name }
+//!   u32 group_count   × { u64 group_id, u64 first, u64 last, framed name }
+//!   u32 tag_count     × { u64 feature_id, framed tag }
+//!   u32 provenance_ct × { u64 feature_id, u64 author, u64 ts }
 //!
-//! FTZ1 files load as timelines with no annotations (and a fresh
-//! timeline_id); the versioned-container promise, exercised.
+//! Older containers still load: FTZ2 has no parameter section; FTZ1 has no
+//! parameters, no annotations, and no timeline_id (a fresh one is generated).
+//!
+//! Frame lengths are never trusted: payloads are read in bounded chunks
+//! (`readFramedAlloc`), so a corrupt or hostile length costs at most one
+//! chunk of allocation beyond the bytes that actually exist.
 //!
 //! Features are the source of truth (this is parametric history, not a
 //! snapshot): loading replays lazily exactly like a fresh edit session. Ids,
@@ -37,6 +41,27 @@ pub const magic_v2 = "FTZ2";
 pub const magic_v1 = "FTZ1";
 
 pub const LoadError = error{BadMagic};
+
+/// Upper bound on a single allocation while reading a framed payload.
+pub const frame_chunk: usize = 64 * 1024;
+
+/// Read a u32-framed payload (length prefix + bytes) into owned memory
+/// without trusting the length: bytes are pulled in `frame_chunk` steps, so
+/// a length larger than the remaining input fails with `EndOfStream` after
+/// allocating at most one extra chunk. Shared with the sync wire codec.
+pub fn readFramedAlloc(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    const len = try reader.takeInt(u32, .little);
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    var remaining: usize = len;
+    while (remaining > 0) {
+        const step: usize = @min(remaining, frame_chunk);
+        const dest = try list.addManyAsSlice(gpa, step);
+        try reader.readSliceAll(dest);
+        remaining -= step;
+    }
+    return list.toOwnedSlice(gpa);
+}
 
 fn validateCodecs(comptime Domain: type) void {
     if (!@hasDecl(Domain, "encodeOp"))
@@ -262,8 +287,7 @@ const FramedReader = struct {
 };
 
 fn framedReader(gpa: std.mem.Allocator, reader: *std.Io.Reader) !FramedReader {
-    const len = try reader.takeInt(u32, .little);
-    const bytes = try reader.readAlloc(gpa, len);
+    const bytes = try readFramedAlloc(gpa, reader);
     return .{ .reader = std.Io.Reader.fixed(bytes), .bytes = bytes };
 }
 
@@ -387,6 +411,24 @@ test "bad magic is rejected" {
     try std.testing.expectError(error.BadMagic, load(PersistDomain, gpa, .{}, &reader));
 }
 
+var hostile_frame_arena: [1 << 20]u8 = undefined;
+
+test "frame lengths are not trusted: a hostile length cannot force a huge allocation" {
+    // A 20-byte file whose seed frame claims 4 GiB. With a 1 MiB bump
+    // allocator this used to fail with OutOfMemory (the 4 GiB request); now
+    // the read is chunked and fails honestly at end of input.
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try w.writeAll(magic);
+    try w.writeInt(u64, 1, .little);
+    try w.writeInt(u32, 0xFFFF_FFFF, .little);
+    try w.writeInt(u32, 0, .little);
+
+    var fba = std.heap.FixedBufferAllocator.init(&hostile_frame_arena);
+    var reader = std.Io.Reader.fixed(w.buffered());
+    try std.testing.expectError(error.EndOfStream, load(PersistDomain, fba.allocator(), .{}, &reader));
+}
+
 test "truncated input errors instead of looping" {
     const gpa = std.testing.allocator;
     var tl = try PersistTimeline.init(gpa, .{}, .{});
@@ -485,9 +527,9 @@ test "FTZ2 files load with annotations but no parameters" {
     try w.writeInt(i64, 3, .little);
     try w.writeInt(u32, 0, .little); // feature count
     try w.writeInt(u32, 0, .little); // marker
-    try w.writeInt(u32, 0, .little); // groups
     try w.writeInt(u32, 0, .little); // names
     try w.writeInt(u32, 0, .little); // chapters
+    try w.writeInt(u32, 0, .little); // groups
     try w.writeInt(u32, 0, .little); // tags
     try w.writeInt(u32, 0, .little); // provenance
 

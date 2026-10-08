@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const ft = @import("root.zig");
+const persistence = @import("persistence.zig");
 const journaling = @import("journal.zig");
 const annotations = @import("annotations.zig");
 const params = @import("params.zig");
@@ -58,8 +59,8 @@ const Framed = struct {
 };
 
 fn readFramed(gpa: std.mem.Allocator, r: *std.Io.Reader) !Framed {
-    const len = try r.takeInt(u32, .little);
-    const bytes = try r.readAlloc(gpa, len);
+    // Bounded, chunked read: the length prefix is never trusted.
+    const bytes = try persistence.readFramedAlloc(gpa, r);
     return .{ .bytes = bytes, .gpa = gpa };
 }
 

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the Zig version pinned in mise.toml, the same one used locally.
+      - uses: jdx/mise-action@v2
+
+      - run: zig version
+      - run: zig fmt --check build.zig build.zig.zon src examples tests
+      - run: zig build test --summary all
+      - run: zig build test -Doptimize=ReleaseSafe --summary all
+      - run: zig build test -Doptimize=ReleaseFast --summary all
+      - run: zig build examples
+      - run: zig build run

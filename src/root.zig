@@ -127,10 +127,11 @@ pub fn FeatureView(comptime Op: type) type {
 
 /// Handed to `Domain.apply` for every feature application.
 pub const ApplyContext = struct {
-    /// Allocator for failure messages. Memory allocated from it that is not
-    /// the recorded failure message becomes the timeline's responsibility
-    /// only if recorded via `fail`; allocate anything else from your own
-    /// arena and free it before returning.
+    /// The timeline's allocator (the `gpa` passed to `Timeline.init`). Use it
+    /// for memory the document keeps — the demos append to document lists
+    /// with it — and `fail` uses it for the recorded message. Scratch memory
+    /// you do not store in the document must be freed before `apply`
+    /// returns.
     alloc: std.mem.Allocator,
 
     /// Id of the feature being applied. Ops that create named entities in

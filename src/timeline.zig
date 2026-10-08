@@ -84,8 +84,8 @@ pub fn Timeline(comptime Domain: type) type {
         /// Undo/redo journal (internal).
         journal: journaling.Journal(Op),
 
-        /// Annotation layer: names, chapters, provenance (tags and groups
-        /// arrive in later milestones). Never affects document computation.
+        /// Annotation layer: names, tags, chapters, groups, provenance.
+        /// Never affects document computation.
         ann: annotations.Annotations,
 
         /// The parameter table: named numeric values read by features via

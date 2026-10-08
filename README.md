@@ -16,6 +16,9 @@ zig build test   # unit + differential tests
 zig build run    # terrain-editor demo exercising every capability
 ```
 
+CI runs the same on Linux and macOS (`.github/workflows/ci.yml`): fmt check,
+tests in Debug / ReleaseSafe / ReleaseFast, the examples, and the demo.
+
 Requires Zig `0.17.0` (pinned via `mise`).
 
 ## Fusion capability → library facility
@@ -94,7 +97,8 @@ tl.setSuppressed(hill, true);
 _ = tl.undo(); _ = tl.redo();
 
 const doc = tl.state();             // document at the marker
-for (tl.features()) |f| {
+var it = tl.features();             // iterator of FeatureView, oldest first
+while (it.next()) |f| {
     if (f.status == .failed) warn(f.id, f.status.failed); // error badges
 }
 ```
@@ -353,7 +357,10 @@ src/timeline.zig   the Timeline(Domain) engine: marker, edits, invalidation
 src/rebuild.zig    pure replay core + background Job
 src/checkpoint.zig checkpoint cache (internal)
 src/journal.zig    undo/redo journal (internal)
-src/persistence.zig save/load container format
+src/annotations.zig names, tags, chapters, groups, provenance store (internal)
+src/params.zig     parameter table (internal)
+src/sync.zig       journal entries as a wire format: encode / decode
+src/persistence.zig save/load container format (FTZ3)
 src/nested_demo.zig two-level globe/region demo (hierarchical timelines)
 src/main.zig       terrain-editor demo
 examples/          focused usage examples (zig build examples)
