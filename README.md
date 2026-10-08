@@ -92,8 +92,8 @@ tl.setMarker(0);                    // roll all the way back
 _ = try tl.commit(.{ .smooth = .{ .passes = 2 } }); // inserts at 0!
 tl.setMarker(tl.len());             // roll to the end (incremental replay)
 
-tl.edit(hill, .{ .raise = .{ .cell = 42, .amount = 3 } }); // parametric edit
-tl.setSuppressed(hill, true);
+try tl.edit(hill, .{ .raise = .{ .cell = 42, .amount = 3 } }); // parametric edit
+try tl.setSuppressed(hill, true);
 _ = tl.undo(); _ = tl.redo();
 
 const doc = tl.state();             // document at the marker
@@ -164,7 +164,7 @@ _ = try tl.commit(.{ .scale_by_param = scale }); // op payload is a plain id
 //       switch (op) { .scale_by_param => |pid| out.param(pid), else => {} }
 //   },
 
-tl.setParam(scale, 3.0); // referencing features recompute lazily
+try tl.setParam(scale, 3.0); // referencing features recompute lazily
 ```
 
 Ops reference parameters by `ParamId` (plain u64 — op payloads stay plain
@@ -227,11 +227,11 @@ tl.beginTransaction();
 defer tl.endTransaction();
 
 _ = try tl.commit(.{ .raise = .{ .cell = 42, .amount = 9 } });
-tl.edit(hill, .{ .raise = .{ .cell = 42, .amount = 12 } });
+try tl.edit(hill, .{ .raise = .{ .cell = 42, .amount = 12 } });
 try tl.setFeatureName(hill, "steeper");
 tl.endTransaction(); // deferred end is fine
 
-tl.undo(); // the whole batch rewinds in one step
+_ = tl.undo(); // the whole batch rewinds in one step
 ```
 
 Nested begins flatten into the outermost unit; an empty transaction records
@@ -250,6 +250,12 @@ undo boundaries survive memory pressure.
   serializable.
 - **Feature ids are stable.** Assigned at commit, never reused; safe handles
   for UI selection, dependencies, and persistence.
+- **Unknown ids are errors.** Every mutator that takes an id returns
+  `error.UnknownFeature` / `UnknownChapter` / `UnknownGroup` / `UnknownParam`
+  when the id is not on this timeline, so a stale handle (say, after a
+  teammate removed the feature) surfaces instead of silently doing nothing.
+  Setting a flag or value to what it already is remains a no-op that
+  journals nothing and leaves in-flight background jobs valid.
 - **Soft failure.** `return ctx.fail("edge {d} gone", .{e})` records a failed
   status and the rebuild *continues* — a failed fillet doesn't hide the
   extrudes after it. `apply` must leave the document unmodified on this path.
@@ -315,7 +321,7 @@ The rules of the model:
   `ctx.env` and copies what it needs into the parent document. Sub rebuilds
   stay region-sized; the globe document holds summaries, not raw region ops.
 - **Invalidation is explicit.** The library cannot see external inputs, so
-  when a sub-timeline changes, the app calls `parent.refresh(occurrence_id)`
+  when a sub-timeline changes, the app calls `try parent.refresh(occurrence_id)`
   to re-run that feature and everything after it. Refresh journals nothing —
   the parent's structure didn't change.
 - **Cross-timeline skew is intended.** Scrubbing the *region* marker changes
@@ -369,7 +375,7 @@ tests/oracle.zig   differential tests vs a naive reference model
 
 ## Status & non-goals
 
-v0.6.1 — all four roadmap waves delivered; see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
+v0.7.0 — all four roadmap waves delivered; see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
 feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are

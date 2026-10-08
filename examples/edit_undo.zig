@@ -51,15 +51,15 @@ fn demo(out: *Io.Writer, arena: std.mem.Allocator) !void {
 
     // Parametric edit: change a past feature's parameters; downstream
     // features recompute automatically.
-    tl.edit(boost, .{ .scale = .{ .factor = 2.0 } }); // 40 * 2 * 0.5
+    try tl.edit(boost, .{ .scale = .{ .factor = 2.0 } }); // 40 * 2 * 0.5
     try out.print("edit boost x2.0:     brightness = {d:.1}\n", .{tl.state().brightness});
 
     // Suppress: the feature stays on the timeline but is skipped.
-    tl.setSuppressed(boost, true); // 40 * 0.5
+    try tl.setSuppressed(boost, true); // 40 * 0.5
     try out.print("suppress boost:      brightness = {d:.1}\n", .{tl.state().brightness});
 
     // Remove: gone from the timeline; the marker adjusts.
-    tl.remove(boost); // 40 * 0.5, len 2
+    try tl.remove(boost); // 40 * 0.5, len 2
     try out.print("remove boost:        brightness = {d:.1}   len {d}\n", .{ tl.state().brightness, tl.len() });
 
     // Undo walks the edits back in reverse; ids survive undo/redo.
@@ -80,7 +80,7 @@ fn demo(out: *Io.Writer, arena: std.mem.Allocator) !void {
     try out.print("undo that commit:    marker {d} (restored)\n", .{tl.marker()});
 
     // A new edit clears the redo stack, as in any editor.
-    tl.edit(preset, .{ .set = .{ .level = 10 } });
+    try tl.edit(preset, .{ .set = .{ .level = 10 } });
     try out.print("new edit:            canRedo = {}   brightness = {d:.1}\n", .{ tl.canRedo(), tl.state().brightness });
 }
 

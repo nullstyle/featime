@@ -62,7 +62,7 @@ fn demo(out: *Io.Writer, arena: std.mem.Allocator) !void {
     var first: ft.FeatureId = 0;
     var it = tl.features();
     if (it.next()) |f| first = f.id;
-    tl.edit(first, .{ .pass = .{ .iterations = 2_000_000 } });
+    try tl.edit(first, .{ .pass = .{ .iterations = 2_000_000 } });
     if (!tl.dirty()) return error.ExpectedDirty;
     try out.print("edited feature 0:            dirty = {}\n", .{tl.dirty()});
 

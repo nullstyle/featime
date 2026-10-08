@@ -1060,7 +1060,7 @@ fn stepAction(
             if (naive.tag_lists.items[idx].items.len > 0) {
                 const pick = random.uintAtMost(usize, naive.tag_lists.items[idx].items.len - 1);
                 const tag = naive.tag_lists.items[idx].items[pick];
-                tl.removeTag(idAt(tl, idx), tag);
+                try tl.removeTag(idAt(tl, idx), tag);
                 naive.removeTag(idx, tag);
             }
         },
@@ -1071,18 +1071,18 @@ fn stepAction(
         },
         55...64 => {
             const idx = random.uintAtMost(u32, len - 1);
-            tl.setSuppressed(idAt(tl, idx), !naive.features.items[idx].suppressed);
+            try tl.setSuppressed(idAt(tl, idx), !naive.features.items[idx].suppressed);
             naive.toggleSuppress(idx);
         },
         65...74 => {
             const idx = random.uintAtMost(u32, len - 1);
             const op = randomOp(random);
-            tl.edit(idAt(tl, idx), op);
+            try tl.edit(idAt(tl, idx), op);
             naive.edit(idx, op);
         },
         75...79 => {
             const idx = random.uintAtMost(u32, len - 1);
-            tl.remove(idAt(tl, idx));
+            try tl.remove(idAt(tl, idx));
             naive.remove(idx);
         },
         80...83 => {

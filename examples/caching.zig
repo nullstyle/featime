@@ -65,11 +65,11 @@ fn demo(out: *Io.Writer, arena: std.mem.Allocator) !void {
 
     // An edit below every checkpoint forces one full chunked replay — and
     // lays down checkpoints at 4, 8 along the way.
-    tl.edit(ids[0], .{ .add = 100 });
+    try tl.edit(ids[0], .{ .add = 100 });
     try report(out, &tl, "edit feature 0"); // +12 applies
 
     // An edit in the middle: only the dirty suffix replays (features 8..11).
-    tl.edit(ids[8], .{ .multiply = -1 });
+    try tl.edit(ids[8], .{ .multiply = -1 });
     try report(out, &tl, "edit feature 8"); // +4 applies, from the checkpoint at 8
 
     // Scrub back to 9: exact snapshot taken when the marker left positions.

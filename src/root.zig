@@ -259,6 +259,56 @@ pub fn validateDomain(comptime Domain: type) void {
         @compileError("Domain must declare `pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc`");
     if (!@hasDecl(Domain, "deinitDoc"))
         @compileError("Domain must declare `pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void`");
+
+    // Shapes, not just names: a wrong signature fails here, in one message,
+    // instead of deep inside the library's call sites.
+    checkHook(Domain, "apply", &.{ Domain.Op, *Domain.Doc, *ApplyContext }, void, .error_union, "fn (op: Op, doc: *Doc, ctx: *ApplyContext) anyerror!void");
+    checkHook(Domain, "cloneDoc", &.{ *const Domain.Doc, std.mem.Allocator }, Domain.Doc, .error_union, "fn (doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc");
+    checkHook(Domain, "deinitDoc", &.{ *Domain.Doc, std.mem.Allocator }, void, .exact, "fn (doc: *Doc, gpa: std.mem.Allocator) void");
+    if (@hasDecl(Domain, "dependencies"))
+        checkHook(Domain, "dependencies", &.{ Domain.Op, *DepCollector }, void, .exact, "fn (op: Op, out: *DepCollector) void");
+    if (@hasDecl(Domain, "references"))
+        checkHook(Domain, "references", &.{ Domain.Op, *ParamRefCollector }, void, .exact, "fn (op: Op, out: *ParamRefCollector) void");
+}
+
+pub const ReturnShape = enum { exact, error_union };
+
+/// Compile-time shape check for one Domain hook: parameter count and types
+/// must match exactly; the return type must be `payload` (`.exact`) or an
+/// error union whose payload is `payload` (`.error_union`, any error set).
+/// Used by `validateDomain` and by `persistence` for the codec hooks.
+pub fn checkHook(
+    comptime Domain: type,
+    comptime name: []const u8,
+    comptime param_types: []const type,
+    comptime payload: type,
+    comptime ret_shape: ReturnShape,
+    comptime shape: []const u8,
+) void {
+    const F = @TypeOf(@field(Domain, name));
+    const info = @typeInfo(F);
+    if (info != .@"fn")
+        @compileError("Domain." ++ name ++ " must be a function of the shape `" ++ shape ++ "`, found " ++ @typeName(F));
+    const f = info.@"fn";
+    if (f.param_types.len != param_types.len)
+        @compileError(std.fmt.comptimePrint("Domain.{s} takes {d} parameter(s); the library calls it as `{s}`", .{ name, f.param_types.len, shape }));
+    inline for (f.param_types, param_types, 0..) |have, want, i| {
+        const have_t = have orelse
+            @compileError(std.fmt.comptimePrint("Domain.{s}: parameter {d} must be `{s}`, not `anytype` (shape: `{s}`)", .{ name, i, @typeName(want), shape }));
+        if (have_t != want)
+            @compileError(std.fmt.comptimePrint("Domain.{s}: parameter {d} has type `{s}`, expected `{s}` (shape: `{s}`)", .{ name, i, @typeName(have_t), @typeName(want), shape }));
+    }
+    const ret = f.return_type orelse
+        @compileError("Domain." ++ name ++ " must declare its return type: `" ++ shape ++ "`");
+    switch (ret_shape) {
+        .exact => if (ret != payload)
+            @compileError(std.fmt.comptimePrint("Domain.{s} must return `{s}` (shape: `{s}`), found `{s}`", .{ name, @typeName(payload), shape, @typeName(ret) })),
+        .error_union => {
+            const ri = @typeInfo(ret);
+            if (ri != .error_union or ri.error_union.payload != payload)
+                @compileError(std.fmt.comptimePrint("Domain.{s} must return an error union of `{s}` (shape: `{s}`), found `{s}`", .{ name, @typeName(payload), shape, @typeName(ret) }));
+        },
+    }
 }
 
 test {

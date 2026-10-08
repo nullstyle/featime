@@ -302,10 +302,10 @@ pub fn Timeline(comptime Domain: type) type {
 
         /// Replace a feature's parameters (Fusion's "edit feature"). The
         /// feature keeps its id and position; the document recomputes lazily
-        /// from the nearest surviving checkpoint. No-op if absent.
-        pub fn edit(self: *Self, id: ft.FeatureId, new_op: Op) void {
+        /// from the nearest surviving checkpoint.
+        pub fn edit(self: *Self, id: ft.FeatureId, new_op: Op) error{UnknownFeature}!void {
+            const idx = self.indexOf(id) orelse return error.UnknownFeature;
             self.touch();
-            const idx = self.indexOf(id) orelse return;
             const old_op = self.list.items[idx].op;
             self.record(.{ .edit = .{ .id = id, .old_op = old_op, .new_op = new_op } });
             self.list.items[idx].op = new_op;
@@ -313,11 +313,20 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         /// Remove a feature from the timeline. The marker adjusts so the
-        /// visible document stays consistent. No-op if absent.
-        pub fn remove(self: *Self, id: ft.FeatureId) void {
+        /// visible document stays consistent.
+        pub fn remove(self: *Self, id: ft.FeatureId) error{UnknownFeature}!void {
+            const idx = self.indexOf(id) orelse return error.UnknownFeature;
             self.touch();
-            const idx = self.indexOf(id) orelse return;
+            self.removeAt(idx);
+        }
+
+        /// Remove the feature at a known-valid index, journaling annotation
+        /// snapshots for exact undo. Shared by `remove`, `removeGroupContents`
+        /// and remote integration (the observer is muted by `record` while
+        /// `applying_remote` is set).
+        fn removeAt(self: *Self, idx: u32) void {
             const f = self.list.items[idx];
+            const id = f.id;
 
             // Snapshot annotations for exact undo, then re-anchor chapters
             // that point at this feature to its successor-in-place.
@@ -354,14 +363,19 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         /// Suppress or unsuppress a feature. A suppressed feature stays on
-        /// the timeline but is skipped by rebuilds. No-op if absent or
-        /// already in the requested state.
-        pub fn setSuppressed(self: *Self, id: ft.FeatureId, suppressed: bool) void {
-            self.touch();
-            const idx = self.indexOf(id) orelse return;
+        /// the timeline but is skipped by rebuilds. Setting the flag it
+        /// already has is a no-op: nothing is journaled and in-flight
+        /// background jobs stay valid.
+        pub fn setSuppressed(self: *Self, id: ft.FeatureId, suppressed: bool) error{UnknownFeature}!void {
+            const idx = self.indexOf(id) orelse return error.UnknownFeature;
+            self.setSuppressedAt(idx, suppressed);
+        }
+
+        fn setSuppressedAt(self: *Self, idx: u32, suppressed: bool) void {
             const prev = self.list.items[idx].suppressed;
             if (prev == suppressed) return;
-            self.record(.{ .suppress = .{ .id = id, .prev = prev } });
+            self.touch();
+            self.record(.{ .suppress = .{ .id = self.list.items[idx].id, .prev = prev } });
             self.list.items[idx].suppressed = suppressed;
             self.invalidate(idx);
         }
@@ -370,10 +384,9 @@ pub fn Timeline(comptime Domain: type) type {
         // Annotations: names, chapters, provenance
         // ------------------------------------------------------------------
 
-        /// Assign (or replace) a feature's display name. No-op if the
-        /// feature is absent.
-        pub fn setFeatureName(self: *Self, id: ft.FeatureId, new_name: []const u8) error{OutOfMemory}!void {
-            if (self.indexOf(id) == null) return;
+        /// Assign (or replace) a feature's display name.
+        pub fn setFeatureName(self: *Self, id: ft.FeatureId, new_name: []const u8) error{ OutOfMemory, UnknownFeature }!void {
+            if (self.indexOf(id) == null) return error.UnknownFeature;
             const old = self.ann.nameOf(id);
             const old_snap: ?[]const u8 = if (old) |o| try self.gpa.dupe(u8, o) else null;
             errdefer if (old_snap) |o| self.gpa.free(o);
@@ -384,9 +397,9 @@ pub fn Timeline(comptime Domain: type) type {
             self.annTouch();
         }
 
-        /// Remove a feature's display name. No-op if the feature or its
-        /// name is absent.
-        pub fn clearFeatureName(self: *Self, id: ft.FeatureId) error{OutOfMemory}!void {
+        /// Remove a feature's display name. No-op if it has none.
+        pub fn clearFeatureName(self: *Self, id: ft.FeatureId) error{ OutOfMemory, UnknownFeature }!void {
+            if (self.indexOf(id) == null) return error.UnknownFeature;
             const old = self.ann.nameOf(id) orelse return;
             const old_snap = try self.gpa.dupe(u8, old);
             errdefer self.gpa.free(old_snap);
@@ -405,8 +418,8 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         /// Add a tag to a feature (set semantics: no-op if already present).
-        pub fn addTag(self: *Self, id: ft.FeatureId, tag: []const u8) error{OutOfMemory}!void {
-            if (self.indexOf(id) == null) return;
+        pub fn addTag(self: *Self, id: ft.FeatureId, tag: []const u8) error{ OutOfMemory, UnknownFeature }!void {
+            if (self.indexOf(id) == null) return error.UnknownFeature;
             const entry_tag = try self.gpa.dupe(u8, tag);
             errdefer self.gpa.free(entry_tag);
             const added = try self.ann.addTag(id, tag);
@@ -418,10 +431,12 @@ pub fn Timeline(comptime Domain: type) type {
             self.annTouch();
         }
 
-        /// Remove a tag from a feature. No-op if absent.
-        pub fn removeTag(self: *Self, id: ft.FeatureId, tag: []const u8) void {
+        /// Remove a tag from a feature. No-op if the feature does not carry
+        /// the tag.
+        pub fn removeTag(self: *Self, id: ft.FeatureId, tag: []const u8) error{ OutOfMemory, UnknownFeature }!void {
+            if (self.indexOf(id) == null) return error.UnknownFeature;
             if (!self.ann.hasTag(id, tag)) return;
-            const entry_tag = self.gpa.dupe(u8, tag) catch return;
+            const entry_tag = try self.gpa.dupe(u8, tag);
             _ = self.ann.removeTag(id, tag);
             self.record(.{ .tag_remove = .{ .id = id, .tag = entry_tag } });
             self.annTouch();
@@ -465,14 +480,14 @@ pub fn Timeline(comptime Domain: type) type {
             return cid;
         }
 
-        /// Remove a chapter. No-op if absent.
-        pub fn removeChapter(self: *Self, id: ft.ChapterId) void {
-            const c = self.ann.chapterById(id) orelse return;
+        /// Remove a chapter.
+        pub fn removeChapter(self: *Self, id: ft.ChapterId) error{ OutOfMemory, UnknownChapter }!void {
+            const c = self.ann.chapterById(id) orelse return error.UnknownChapter;
             // Copy out everything the entry needs before removal invalidates
             // the pointer into the chapters array.
             const cid = c.id;
             const mark = c.mark;
-            const entry_name = self.gpa.dupe(u8, c.name) catch return;
+            const entry_name = try self.gpa.dupe(u8, c.name);
             self.ann.removeChapter(id);
             self.record(.{ .chapter_remove = .{ .chapter = .{
                 .id = cid,
@@ -482,8 +497,8 @@ pub fn Timeline(comptime Domain: type) type {
             self.annTouch();
         }
 
-        pub fn renameChapter(self: *Self, id: ft.ChapterId, new_name: []const u8) error{OutOfMemory}!void {
-            const c = self.ann.chapterById(id) orelse return;
+        pub fn renameChapter(self: *Self, id: ft.ChapterId, new_name: []const u8) error{ OutOfMemory, UnknownChapter }!void {
+            const c = self.ann.chapterById(id) orelse return error.UnknownChapter;
             const old_snap = try self.gpa.dupe(u8, c.name);
             errdefer self.gpa.free(old_snap);
             const new_snap = try self.gpa.dupe(u8, new_name);
@@ -516,11 +531,11 @@ pub fn Timeline(comptime Domain: type) type {
         // Annotations: groups (contiguous spans)
         // ------------------------------------------------------------------
 
-        /// Create a group spanning `first`..`last` (normalized by position).
-        /// Returns null when either anchor is absent.
-        pub fn addGroup(self: *Self, name: []const u8, first: ft.FeatureId, last: ft.FeatureId) error{OutOfMemory}!?ft.annotations.GroupId {
-            const fi = self.indexOf(first) orelse return null;
-            const li = self.indexOf(last) orelse return null;
+        /// Create a group spanning `first`..`last` (normalized by position)
+        /// and return its id.
+        pub fn addGroup(self: *Self, name: []const u8, first: ft.FeatureId, last: ft.FeatureId) error{ OutOfMemory, UnknownFeature }!ft.annotations.GroupId {
+            const fi = self.indexOf(first) orelse return error.UnknownFeature;
+            const li = self.indexOf(last) orelse return error.UnknownFeature;
             const lo = @min(fi, li);
             const hi = @max(fi, li);
             const gid: ft.annotations.GroupId = self.allocId();
@@ -537,13 +552,19 @@ pub fn Timeline(comptime Domain: type) type {
             return gid;
         }
 
-        /// Ungroup: remove the group, keep the features. No-op if absent.
-        pub fn removeGroup(self: *Self, id: ft.annotations.GroupId) void {
-            const g = self.ann.groupById(id) orelse return;
+        /// Ungroup: remove the group, keep the features.
+        pub fn removeGroup(self: *Self, id: ft.annotations.GroupId) error{ OutOfMemory, UnknownGroup }!void {
+            const g = self.ann.groupById(id) orelse return error.UnknownGroup;
+            const entry_name = try self.gpa.dupe(u8, g.name);
+            self.removeGroupOwned(id, entry_name);
+        }
+
+        /// Remove a known group; `entry_name` (owned) rides the journal entry.
+        fn removeGroupOwned(self: *Self, id: ft.annotations.GroupId, entry_name: []const u8) void {
+            const g = self.ann.groupById(id).?;
             const gid = g.id;
             const first = g.first;
             const last = g.last;
-            const entry_name = self.gpa.dupe(u8, g.name) catch return;
             self.ann.removeGroup(id);
             self.record(.{ .group_remove = .{ .group = .{
                 .id = gid,
@@ -554,8 +575,8 @@ pub fn Timeline(comptime Domain: type) type {
             self.annTouch();
         }
 
-        pub fn renameGroup(self: *Self, id: ft.annotations.GroupId, new_name: []const u8) error{OutOfMemory}!void {
-            const g = self.ann.groupById(id) orelse return;
+        pub fn renameGroup(self: *Self, id: ft.annotations.GroupId, new_name: []const u8) error{ OutOfMemory, UnknownGroup }!void {
+            const g = self.ann.groupById(id) orelse return error.UnknownGroup;
             const old_snap = try self.gpa.dupe(u8, g.name);
             errdefer self.gpa.free(old_snap);
             const new_snap = try self.gpa.dupe(u8, new_name);
@@ -598,53 +619,63 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         /// Suppress or unsuppress every member of a group — one undo step
-        /// (a transaction over per-member suppress entries).
-        pub fn setGroupSuppressed(self: *Self, id: ft.annotations.GroupId, suppressed: bool) void {
-            const g = self.ann.groupById(id) orelse return;
+        /// (a transaction over per-member suppress entries). An empty group
+        /// is a no-op.
+        pub fn setGroupSuppressed(self: *Self, id: ft.annotations.GroupId, suppressed: bool) error{UnknownGroup}!void {
+            const g = self.ann.groupById(id) orelse return error.UnknownGroup;
             const span = self.groupSpan(g) orelse return;
             self.beginTransaction();
             defer self.endTransaction();
             var i: u32 = span.lo;
             while (i <= span.hi) : (i += 1) {
-                self.setSuppressed(self.list.items[i].id, suppressed);
+                self.setSuppressedAt(i, suppressed);
             }
         }
+
+        /// Largest group `moveGroup` relocates: one journal entry per member
+        /// rides in a single undo unit, and eviction never splits a unit.
+        pub const max_group_move: u32 = 4096;
+
+        pub const GroupMoveError = error{ DependencyViolation, UnknownGroup, GroupTooLarge };
 
         /// Relocate a group's members to `new_pos` (the block's first index
         /// in the resulting list), preserving member order — one undo step.
         /// Members cross the marker individually (same semantics as `move`).
-        /// No-op when absent or empty; `error.DependencyViolation` when the
-        /// resulting order would break declared dependencies.
-        pub fn moveGroup(self: *Self, id: ft.annotations.GroupId, new_pos: u32) MoveError!void {
-            self.touch();
-            const g = self.ann.groupById(id) orelse return;
+        /// An empty group is a no-op; `error.DependencyViolation` when the
+        /// resulting order would break declared dependencies;
+        /// `error.GroupTooLarge` above `max_group_move` members.
+        pub fn moveGroup(self: *Self, id: ft.annotations.GroupId, new_pos: u32) GroupMoveError!void {
+            const g = self.ann.groupById(id) orelse return error.UnknownGroup;
             const span = self.groupSpan(g) orelse return;
             const n: u32 = span.hi - span.lo + 1;
             const to = @min(new_pos, @as(u32, @intCast(self.list.items.len)) - n);
             if (to == span.lo) return;
-
+            if (n > max_group_move) return error.GroupTooLarge;
             if (comptime hasDeps(Domain)) {
                 if (self.groupMoveViolatesDeps(span, to)) return error.DependencyViolation;
             }
-            if (n > 4096) return error.OutOfMemory; // huge groups: raise later
+            self.touch();
 
-            // Transaction of per-member move entries. Sequential rawMoves:
-            // member k always sits at the old block start when its turn
-            // comes, whichever direction the block travels.
+            // A transaction of per-member move entries. Moving left, the
+            // members not yet moved keep their original indices, so member k
+            // sits at `span.lo + k` and lands at `to + k`. Moving right,
+            // each removal shifts the rest of the block down to `span.lo`
+            // and every member lands at the block's final end (`to + n - 1`):
+            // earlier members slide left into place as later ones leave.
             self.beginTransaction();
             defer self.endTransaction();
             var k: u32 = 0;
             while (k < n) : (k += 1) {
-                const member = self.list.items[span.lo].id;
-                const from: u32 = span.lo;
-                const marker_pre = self.marker_pos;
+                const from: u32 = if (to < span.lo) span.lo + k else span.lo;
+                const dest: u32 = if (to < span.lo) to + k else to + n - 1;
+                const member = self.list.items[from].id;
                 self.record(.{ .move = .{
                     .id = member,
                     .from = from,
-                    .to = to + k,
-                    .marker_pre = marker_pre,
+                    .to = dest,
+                    .marker_pre = self.marker_pos,
                 } });
-                self.rawMove(member, to + k);
+                self.rawMove(member, dest);
             }
         }
 
@@ -685,15 +716,16 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         /// Delete a group and its members in one undo step (a transaction
-        /// of per-member removes plus the group removal). No-op if the group
-        /// is absent; an empty group just disappears. Member annotations
-        /// ride the per-member remove snapshots.
-        pub fn removeGroupContents(self: *Self, id: ft.annotations.GroupId) void {
-            self.touch();
-            const g = self.ann.groupById(id) orelse return;
+        /// of per-member removes plus the group removal). An empty group
+        /// just disappears. Member annotations ride the per-member remove
+        /// snapshots.
+        pub fn removeGroupContents(self: *Self, id: ft.annotations.GroupId) error{ OutOfMemory, UnknownGroup }!void {
+            const g = self.ann.groupById(id) orelse return error.UnknownGroup;
             const gid = g.id;
+            const entry_name = try self.gpa.dupe(u8, g.name);
             const span = self.groupSpan(g);
             const count: usize = if (span) |sp| sp.hi - sp.lo + 1 else 0;
+            if (count > 0) self.touch();
 
             self.beginTransaction();
             defer self.endTransaction();
@@ -702,9 +734,9 @@ pub fn Timeline(comptime Domain: type) type {
                 // The span head keeps re-anchoring to the successor, so the
                 // first member is always at the span start.
                 const sp = self.groupSpan(self.ann.groupById(gid).?) orelse break;
-                self.remove(self.list.items[sp.lo].id);
+                self.removeAt(sp.lo);
             }
-            self.removeGroup(gid);
+            self.removeGroupOwned(gid, entry_name);
         }
 
         /// Reorder a feature to `new_pos` (clamped to the list; interpreted
@@ -715,16 +747,16 @@ pub fn Timeline(comptime Domain: type) type {
         /// returned — before any mutation — if it would place a dependency
         /// after a feature that reads it. Without the hook every move is
         /// allowed and breakage surfaces as failed features on rebuild,
-        /// exactly like Fusion. No-op if absent or already in position.
+        /// exactly like Fusion. Moving to the current position is a no-op.
         pub fn move(self: *Self, id: ft.FeatureId, new_pos: u32) MoveError!void {
-            self.touch();
-            const from = self.indexOf(id) orelse return;
+            const from = self.indexOf(id) orelse return error.UnknownFeature;
             const to = @min(new_pos, @as(u32, @intCast(self.list.items.len - 1)));
             if (from == to) return;
 
             if (comptime hasDeps(Domain)) {
                 if (self.depsViolated(from, to)) return error.DependencyViolation;
             }
+            self.touch();
 
             self.record(.{ .move = .{
                 .id = id,
@@ -735,7 +767,7 @@ pub fn Timeline(comptime Domain: type) type {
             self.rawMove(id, to);
         }
 
-        pub const MoveError = error{ DependencyViolation, OutOfMemory };
+        pub const MoveError = error{ DependencyViolation, UnknownFeature };
 
         fn hasDeps(comptime D: type) bool {
             return @hasDecl(D, "dependencies");
@@ -780,11 +812,8 @@ pub fn Timeline(comptime Domain: type) type {
             const lo = @min(from, to);
             self.resetStatuses(lo);
             const feature = self.list.orderedRemove(from);
-            self.list.insert(self.gpa, to, feature) catch {
-                // Out of memory re-inserting: restore it where it was.
-                self.list.insert(self.gpa, from, feature) catch unreachable;
-                return;
-            };
+            // Capacity is unchanged by the removal, so this cannot fail.
+            self.list.insert(self.gpa, to, feature) catch unreachable;
             // The marker counts applied features: adjust when the feature
             // crosses the applied/unapplied boundary.
             if (from < self.marker_pos and to >= self.marker_pos) {
@@ -804,10 +833,9 @@ pub fn Timeline(comptime Domain: type) type {
         /// Re-run a feature and everything after it because inputs the
         /// library cannot see changed — for example, a sub-timeline read
         /// through `ctx.env` recomputed. Nothing is journaled: the timeline
-        /// structure is untouched; this is invalidation, not an edit. No-op
-        /// if absent.
-        pub fn refresh(self: *Self, id: ft.FeatureId) void {
-            const idx = self.indexOf(id) orelse return;
+        /// structure is untouched; this is invalidation, not an edit.
+        pub fn refresh(self: *Self, id: ft.FeatureId) error{UnknownFeature}!void {
+            const idx = self.indexOf(id) orelse return error.UnknownFeature;
             self.touch();
             self.invalidate(idx);
         }
@@ -830,9 +858,10 @@ pub fn Timeline(comptime Domain: type) type {
         /// Set a parameter's value. Features referencing it (via the
         /// optional `Domain.references` hook) recompute lazily; without the
         /// hook the timeline cannot see the dependency and the app must
-        /// `refresh` affected features itself. No-op for unknown ids.
-        pub fn setParam(self: *Self, id: ft.ParamId, value: f64) void {
-            const old = self.ptab.valueOf(id) orelse return;
+        /// `refresh` affected features itself. Setting the current value is
+        /// a no-op.
+        pub fn setParam(self: *Self, id: ft.ParamId, value: f64) error{UnknownParam}!void {
+            const old = self.ptab.valueOf(id) orelse return error.UnknownParam;
             if (old == value) return;
             _ = self.ptab.set(id, value);
             self.record(.{ .param_set = .{ .id = id, .old = old, .new = value } });
@@ -841,11 +870,10 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         /// Remove a parameter. Referencing features see `ctx.param` return
-        /// null on the next rebuild and typically soft-fail. No-op for
-        /// unknown ids.
-        pub fn removeParam(self: *Self, id: ft.ParamId) void {
-            const p = self.ptab.byId(id) orelse return;
-            const entry_name = self.gpa.dupe(u8, p.name) catch return;
+        /// null on the next rebuild and typically soft-fail.
+        pub fn removeParam(self: *Self, id: ft.ParamId) error{ OutOfMemory, UnknownParam }!void {
+            const p = self.ptab.byId(id) orelse return error.UnknownParam;
+            const entry_name = try self.gpa.dupe(u8, p.name);
             _ = self.ptab.remove(id);
             self.record(.{ .param_remove = .{ .id = id, .name = entry_name, .value = p.value } });
             self.touch();
@@ -853,17 +881,13 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         /// Rename a parameter (display only — ops reference ids, not names).
-        pub fn renameParam(self: *Self, id: ft.ParamId, new_name: []const u8) error{OutOfMemory}!void {
-            const old = self.ptab.byId(id) orelse return;
+        pub fn renameParam(self: *Self, id: ft.ParamId, new_name: []const u8) error{ OutOfMemory, UnknownParam }!void {
+            const old = self.ptab.byId(id) orelse return error.UnknownParam;
             const old_snap = try self.gpa.dupe(u8, old.name);
             errdefer self.gpa.free(old_snap);
             const new_snap = try self.gpa.dupe(u8, new_name);
             errdefer self.gpa.free(new_snap);
-            if (!try self.ptab.rename(id, new_name)) {
-                self.gpa.free(old_snap);
-                self.gpa.free(new_snap);
-                return;
-            }
+            _ = try self.ptab.rename(id, new_name); // the id was just looked up
             self.record(.{ .param_rename = .{ .id = id, .old = old_snap, .new = new_snap } });
         }
 
@@ -1016,9 +1040,9 @@ pub fn Timeline(comptime Domain: type) type {
                     self.invalidate(idx);
                 },
                 .remove => |e| {
-                    if (self.indexOf(e.id) == null) return;
+                    const idx = self.indexOf(e.id) orelse return;
                     self.touch();
-                    self.removeRemote(e.id);
+                    self.removeAt(idx);
                 },
                 .suppress => |e| {
                     const idx = self.indexOf(e.id) orelse return;
@@ -1180,41 +1204,6 @@ pub fn Timeline(comptime Domain: type) type {
             self.resetStatuses(at + 1);
             if (at <= self.marker_pos) self.marker_pos += 1;
             if (at < self.built_pos) self.live_stale = true;
-        }
-
-        /// Remote removal: same snapshot flow as a local remove, journaled
-        /// silently.
-        fn removeRemote(self: *Self, id: ft.FeatureId) void {
-            const idx = self.indexOf(id) orelse return;
-            const f = self.list.items[idx];
-            const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
-                self.list.items[idx + 1].id
-            else
-                null;
-            const name_snap: ?[]const u8 = if (self.ann.nameOf(id)) |n|
-                self.gpa.dupe(u8, n) catch null
-            else
-                null;
-            const fixes = self.ann.reanchorAfterRemove(id, replacement) catch @as([]annotations.ChapterFix, &.{});
-            const tags_snap = self.ann.takeTags(id) catch @as([][]const u8, &.{});
-            const group_fixes = self.reanchorGroupBoundaries(id, idx) catch @as([]annotations.GroupFix, &.{});
-            self.journal.record(.{ .remove = .{
-                .id = id,
-                .op = f.op,
-                .at = idx,
-                .suppressed = f.suppressed,
-                .marker_pre = self.marker_pos,
-                .name = name_snap,
-                .meta = self.ann.provenance(id),
-                .chapter_fixes = fixes,
-                .tags = tags_snap,
-                .group_fixes = group_fixes,
-            } });
-            self.ann.removeFeature(id);
-            self.resetStatuses(idx);
-            _ = self.list.orderedRemove(idx);
-            if (idx < self.marker_pos) self.marker_pos -= 1;
-            self.invalidate(idx);
         }
 
         /// Open an explicit transaction: every edit recorded before the
@@ -1871,11 +1860,11 @@ test "suppress skips a feature but keeps it on the timeline" {
     _ = try tl.commit(.{ .add = 3 });
     try std.testing.expectEqual(@as(i64, 6), tl.state().value);
 
-    tl.setSuppressed(second, true);
+    try tl.setSuppressed(second, true);
     try std.testing.expectEqual(@as(i64, 4), tl.state().value);
     try std.testing.expectEqual(@as(u32, 3), tl.len());
 
-    tl.setSuppressed(second, false);
+    try tl.setSuppressed(second, false);
     try std.testing.expectEqual(@as(i64, 6), tl.state().value);
 }
 
@@ -1972,7 +1961,7 @@ test "edit recomputes downstream, keeping id and position" {
     _ = try tl.commit(.{ .add = 3 });
     try std.testing.expectEqual(@as(i64, 6), tl.state().value);
 
-    tl.edit(first, .{ .add = 10 });
+    try tl.edit(first, .{ .add = 10 });
     try std.testing.expectEqual(@as(i64, 15), tl.state().value);
 
     const f = tl.featureById(first).?;
@@ -1997,14 +1986,14 @@ test "edit replays only the dirty suffix from a checkpoint" {
 
     // Edit feature 0: nothing below any checkpoint survives, so the rebuild
     // replays all 8 — and lays down interval checkpoints at 2, 4, 6.
-    tl.edit(ids[0], .{ .add = 100 });
+    try tl.edit(ids[0], .{ .add = 100 });
     _ = tl.state();
     try std.testing.expectEqual(@as(i64, 135), tl.state().value);
     try std.testing.expectEqual(@as(usize, 8), g_applies);
 
     // Edit feature 5: the checkpoint at 4 survives; only features 4..7 replay.
     g_applies = 0;
-    tl.edit(ids[5], .{ .add = 50 });
+    try tl.edit(ids[5], .{ .add = 50 });
     _ = tl.state();
     try std.testing.expectEqual(@as(usize, 4), g_applies);
 
@@ -2031,14 +2020,14 @@ test "remove adjusts marker and state" {
     _ = try tl.commit(.{ .add = 3 });
     try std.testing.expectEqual(@as(i64, 6), tl.state().value);
 
-    tl.remove(second);
+    try tl.remove(second);
     try std.testing.expectEqual(@as(u32, 2), tl.len());
     try std.testing.expectEqual(@as(u32, 2), tl.marker());
     try std.testing.expectEqual(@as(i64, 4), tl.state().value);
 
     // Remove while rolled back so the removal is below the marker.
     tl.setMarker(2);
-    tl.remove(first);
+    try tl.remove(first);
     try std.testing.expectEqual(@as(u32, 1), tl.len());
     try std.testing.expectEqual(@as(u32, 1), tl.marker());
     try std.testing.expectEqual(@as(i64, 3), tl.state().value);
@@ -2127,14 +2116,14 @@ test "undo/redo edit and suppress" {
     const first = try tl.commit(.{ .add = 1 });
     _ = try tl.commit(.{ .add = 2 });
 
-    tl.edit(first, .{ .add = 10 });
+    try tl.edit(first, .{ .add = 10 });
     try std.testing.expectEqual(@as(i64, 12), tl.state().value);
     try std.testing.expect(tl.undo());
     try std.testing.expectEqual(@as(i64, 3), tl.state().value);
     try std.testing.expect(tl.redo());
     try std.testing.expectEqual(@as(i64, 12), tl.state().value);
 
-    tl.setSuppressed(first, true);
+    try tl.setSuppressed(first, true);
     try std.testing.expectEqual(@as(i64, 2), tl.state().value);
     try std.testing.expect(tl.undo());
     try std.testing.expectEqual(@as(i64, 12), tl.state().value);
@@ -2153,7 +2142,7 @@ test "undo remove restores feature id and marker" {
     tl.setMarker(1);
     try std.testing.expectEqual(@as(i64, 1), tl.state().value);
 
-    tl.remove(first);
+    try tl.remove(first);
     try std.testing.expectEqual(@as(u32, 2), tl.len());
     try std.testing.expectEqual(@as(u32, 0), tl.marker());
 
@@ -2343,7 +2332,7 @@ test "dependent feature fails when its dependency is removed" {
     _ = try tl.commit(.{ .base = .{ .v = 100 } });
     _ = try tl.commit(.{ .offset = .{ .base_id = b1, .amount = 5 } });
 
-    tl.remove(b1);
+    try tl.remove(b1);
     try std.testing.expectEqual(@as(i64, 100), tl.state().value);
 
     // b1 removed: remaining features are the second base and the offset.
@@ -2366,7 +2355,7 @@ test "background rebuild matches the synchronous path" {
     _ = try tl.commit(.{ .add = 3 });
     tl.setMarker(1);
     _ = tl.state();
-    tl.edit(first, .{ .add = 10 });
+    try tl.edit(first, .{ .add = 10 });
     try std.testing.expect(tl.dirty());
 
     var job = try tl.beginRebuild();
@@ -2386,7 +2375,7 @@ test "stale background jobs are rejected" {
     _ = try tl.commit(.{ .add = 2 });
     tl.setMarker(1);
     _ = tl.state();
-    tl.edit(first, .{ .add = 10 });
+    try tl.edit(first, .{ .add = 10 });
 
     var job = try tl.beginRebuild();
     _ = try tl.commit(.{ .add = 100 }); // plan changed under the job
@@ -2421,7 +2410,7 @@ test "hard failure in a background job breaks the timeline, keeps last good" {
     _ = try tl.commit(.{ .add = 1 });
     tl.setMarker(1);
     _ = tl.state();
-    tl.edit(first, .{ .poison = {} });
+    try tl.edit(first, .{ .poison = {} });
 
     var job = try tl.beginRebuild();
     defer job.deinit();
@@ -2447,9 +2436,9 @@ test "background rebuild replays only the dirty suffix from a checkpoint" {
     }
     // Force one chunked full rebuild to lay down interval checkpoints at
     // 2, 4, 6 (fast-path commits never create them).
-    tl.edit(ids[0], .{ .add = 1 }); // same value, still invalidates
+    try tl.edit(ids[0], .{ .add = 1 }); // same value, still invalidates
     _ = tl.state();
-    tl.edit(ids[5], .{ .add = 50 });
+    try tl.edit(ids[5], .{ .add = 50 });
 
     g_applies = 0;
     var job = try tl.beginRebuild(); // consumes the checkpoint at 4
@@ -2493,7 +2482,7 @@ test "refresh re-runs features whose external inputs changed" {
     try std.testing.expectEqual(@as(i64, 6), tl.state().value);
 
     // refresh re-runs the feature and everything after it.
-    tl.refresh(watcher);
+    try tl.refresh(watcher);
     try std.testing.expectEqual(@as(i64, 51), tl.state().value);
 
     // refresh is invalidation, not an edit: undo still lands on the commit.
@@ -2568,7 +2557,7 @@ test "feature names: set, view, undo/redo, survive removal round trip" {
 
     // Removal snapshots the name; undo restores it exactly.
     try tl.setFeatureName(c3, "keeper");
-    tl.remove(c3);
+    try tl.remove(c3);
     try std.testing.expect(tl.featureName(c3) == null);
     try std.testing.expect(tl.undo());
     try std.testing.expectEqualStrings("keeper", tl.featureName(c3).?);
@@ -2597,7 +2586,7 @@ test "chapters: anchor, jump, rename, and persistence of position" {
     try std.testing.expectEqualStrings("post-b", tl.chapters()[0].name);
     try std.testing.expect(tl.undo());
     try std.testing.expectEqualStrings("after b", tl.chapters()[0].name);
-    tl.removeChapter(tip);
+    try tl.removeChapter(tip);
     try std.testing.expectEqual(@as(usize, 1), tl.chapters().len);
     try std.testing.expect(tl.undo());
     try std.testing.expectEqual(@as(usize, 2), tl.chapters().len);
@@ -2623,7 +2612,7 @@ test "chapters: anchor removal re-anchors, undo restores exactly" {
     try std.testing.expectEqual(@as(u32, 2), tl.chapterPosition(ch).?);
 
     // Removing the anchor re-anchors to the successor-in-place (c).
-    tl.remove(b);
+    try tl.remove(b);
     try std.testing.expectEqual(@as(u32, 2), tl.chapterPosition(ch).?);
     try std.testing.expectEqual(c, tl.chapters()[0].mark.after.?);
 
@@ -2634,9 +2623,9 @@ test "chapters: anchor removal re-anchors, undo restores exactly" {
 
     // Removing the current anchor (b, restored by the undo above) re-anchors
     // to its successor (c); removing the last feature pins to the end.
-    tl.remove(b);
+    try tl.remove(b);
     try std.testing.expectEqual(c, tl.chapters()[0].mark.after.?);
-    tl.remove(c);
+    try tl.remove(c);
     try std.testing.expect(tl.chapters()[0].mark.after == null);
 }
 
@@ -2713,7 +2702,7 @@ test "tags: add, iterate, filter, undo/redo, remove round trip" {
     try std.testing.expectEqual(@as(usize, 2), found);
 
     // Removal is undoable; add is undoable.
-    tl.removeTag(a, "review");
+    try tl.removeTag(a, "review");
     try std.testing.expectEqual(@as(usize, 1), tl.tags(a).len);
     try std.testing.expect(tl.undo());
     try std.testing.expectEqual(@as(usize, 2), tl.tags(a).len);
@@ -2721,7 +2710,7 @@ test "tags: add, iterate, filter, undo/redo, remove round trip" {
     try std.testing.expectEqual(@as(usize, 1), tl.tags(a).len);
 
     // Feature removal snapshots tags; undo restores them exactly.
-    tl.remove(a);
+    try tl.remove(a);
     try std.testing.expectEqual(@as(usize, 0), tl.tags(a).len);
     try std.testing.expect(tl.undo());
     try std.testing.expectEqual(@as(usize, 1), tl.tags(a).len);
@@ -2739,7 +2728,7 @@ test "groups: membership computed from the span" {
     const d = try tl.commit(.{ .add = 4 });
     _ = d;
 
-    const g = (try tl.addGroup("middle", c, b)).?; // normalized: a-span b..c
+    const g = try tl.addGroup("middle", c, b); // normalized: a-span b..c
     try std.testing.expectEqual(b, tl.groups()[0].first);
     try std.testing.expectEqual(c, tl.groups()[0].last);
     try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(b));
@@ -2752,7 +2741,7 @@ test "groups: membership computed from the span" {
     try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(idAtIdx(&tl, 2)));
 
     // Ungroup keeps features.
-    tl.removeGroup(g);
+    try tl.removeGroup(g);
     try std.testing.expectEqual(@as(usize, 0), tl.groups().len);
     try std.testing.expectEqual(@as(u32, 5), tl.len());
     try std.testing.expect(tl.groupOf(b) == null);
@@ -2775,10 +2764,10 @@ test "groups: boundary removal re-anchors; empty survives; undo restores" {
     const a = try tl.commit(.{ .add = 1 });
     const b = try tl.commit(.{ .add = 2 });
     const c = try tl.commit(.{ .add = 3 });
-    const g = (try tl.addGroup("g", a, c)).?;
+    const g = try tl.addGroup("g", a, c);
 
     // Remove the first member: second member becomes first.
-    tl.remove(a);
+    try tl.remove(a);
     try std.testing.expectEqual(b, tl.groups()[0].first);
     try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(b));
 
@@ -2787,9 +2776,9 @@ test "groups: boundary removal re-anchors; empty survives; undo restores" {
     try std.testing.expectEqual(a, tl.groups()[0].first);
 
     // Remove everything the span covers: empty folder survives.
-    tl.remove(a);
-    tl.remove(b);
-    tl.remove(c);
+    try tl.remove(a);
+    try tl.remove(b);
+    try tl.remove(c);
     try std.testing.expectEqual(@as(usize, 1), tl.groups().len);
     try std.testing.expectEqual(@as(usize, 0), tl.len());
 }
@@ -2804,7 +2793,7 @@ test "groups: batch suppression is one undo step" {
     const c = try tl.commit(.{ .add = 3 });
     _ = try tl.addGroup("g", a, c);
 
-    tl.setGroupSuppressed(tl.groups()[0].id, true);
+    try tl.setGroupSuppressed(tl.groups()[0].id, true);
     try std.testing.expectEqual(@as(i64, 0), tl.state().value); // all suppressed
 
     // One undo restores every member's flag.
@@ -2859,11 +2848,11 @@ test "removeGroupContents deletes members and group in one undo step" {
     const b = try tl.commit(.{ .add = 2 });
     _ = try tl.commit(.{ .add = 3 });
     _ = try tl.commit(.{ .add = 4 });
-    const g = (try tl.addGroup("mid", a, b)).?;
+    const g = try tl.addGroup("mid", a, b);
     try tl.setFeatureName(b, "keeper");
     try tl.addTag(b, "terrain");
 
-    tl.removeGroupContents(g);
+    try tl.removeGroupContents(g);
     try std.testing.expectEqual(@as(u32, 2), tl.len());
     try std.testing.expectEqual(@as(usize, 0), tl.groups().len);
     try std.testing.expectEqual(@as(i64, 7), tl.state().value);
@@ -2890,7 +2879,7 @@ test "transactions: a batch of edits undoes and redoes as one unit" {
 
     tl.beginTransaction();
     const a = try tl.commit(.{ .add = 2 });
-    tl.edit(a, .{ .add = 20 });
+    try tl.edit(a, .{ .add = 20 });
     try tl.setFeatureName(a, "adjusted");
     try tl.addTag(a, "batch");
     tl.endTransaction();
@@ -2957,7 +2946,7 @@ test "transactions: eviction removes whole units, never a partial one" {
     var k: u32 = 0;
     while (k < 5) : (k += 1) {
         _ = try tl.commit(.{ .add = 10 });
-        tl.setSuppressed(tl.list.items[0].id, @mod(k, 2) == 0);
+        try tl.setSuppressed(tl.list.items[0].id, @mod(k, 2) == 0);
     }
     tl.endTransaction();
 
@@ -3052,7 +3041,7 @@ test "parameters: editing a value re-drives referencing features" {
     _ = try tl.commit(.{ .add = 5 }); // 25
     try std.testing.expectEqual(@as(i64, 25), tl.state().value);
 
-    tl.setParam(scale, 3.0); // 30 + 5 = 35
+    try tl.setParam(scale, 3.0); // 30 + 5 = 35
     try std.testing.expect(tl.dirty());
     try std.testing.expectEqual(@as(i64, 35), tl.state().value);
 
@@ -3082,10 +3071,10 @@ test "parameters: suffix replay invalidates from the earliest reference" {
     }
     // Fast-path commits lay no checkpoints; force one chunked rebuild
     // (a no-op-value edit still invalidates) to plant them at 2, 4, 6.
-    tl.edit(tl.list.items[0].id, .{ .add = 1 });
+    try tl.edit(tl.list.items[0].id, .{ .add = 1 });
     _ = tl.state();
     g_applies = 0;
-    tl.setParam(scale, 2.0);
+    try tl.setParam(scale, 2.0);
     _ = tl.state();
     // Over-approximate suffix replay: from the checkpoint at 4 (feature 4
     // is the earliest referencing feature), so features 4..7 replay.
@@ -3100,7 +3089,7 @@ test "parameters: unreferenced edits do not dirty the document" {
     const unused = try tl.addParam("unused", 1.0);
     _ = try tl.commit(.{ .add = 7 });
     _ = tl.state();
-    tl.setParam(unused, 99.0);
+    try tl.setParam(unused, 99.0);
     try std.testing.expect(!tl.dirty());
 }
 
@@ -3114,7 +3103,7 @@ test "parameters: removal soft-fails referencing features" {
     _ = try tl.commit(.{ .scale_by_param = scale });
     try std.testing.expectEqual(@as(i64, 20), tl.state().value);
 
-    tl.removeParam(scale);
+    try tl.removeParam(scale);
     try std.testing.expectEqual(@as(i64, 10), tl.state().value);
     var it = tl.features();
     _ = it.next().?;
@@ -3229,7 +3218,7 @@ test "sync: wire codec round-trips a remove entry with annotations" {
     var out = Outbox{ .gpa = gpa };
     defer out.deinit();
     tl.setRecordObserver(.{ .ctx = &out, .func = Outbox.observe });
-    tl.remove(a);
+    try tl.remove(a);
     try std.testing.expectEqual(@as(usize, 1), out.blobs.items.len);
 
     // Decode it back and check the payload survived the wire.
@@ -3270,8 +3259,8 @@ test "sync: replicas converge when fed each other's entries" {
     _ = try tl1.addParam("scale", 2.0);
     _ = try tl1.commit(.{ .add = 5 });
     try tl1.setFeatureName(a, "base");
-    tl1.setSuppressed(a, true);
-    tl1.setSuppressed(a, false);
+    try tl1.setSuppressed(a, true);
+    try tl1.setSuppressed(a, false);
 
     try out1.feed(&tl2);
     try expectConverged(&tl1, &tl2);
@@ -3280,17 +3269,17 @@ test "sync: replicas converge when fed each other's entries" {
 
     // Session two on replica 2 — including a param-driven edit.
     const scale = tl2.paramIdByName("scale").?;
-    tl2.setParam(scale, 3.0);
+    try tl2.setParam(scale, 3.0);
     _ = try tl2.commit(.{ .scale_by_param = scale });
     try tl2.addTag(a, "remote");
     const c = try tl2.commit(.{ .add = 1 });
-    tl2.remove(c);
+    try tl2.remove(c);
 
     try out2.feed(&tl1);
     try expectConverged(&tl1, &tl2);
     // And a third round the other way to prove no loop formed.
     const d = try tl1.commit(.{ .add = 100 });
-    tl1.edit(d, .{ .add = 200 });
+    try tl1.edit(d, .{ .add = 200 });
     try out1.feed(&tl2);
     try expectConverged(&tl1, &tl2);
 
@@ -3417,7 +3406,7 @@ test "sync: a remote commit landing during a background job makes the job stale"
     defer tl.deinit();
     const a = try tl.commit(.{ .add = 1 });
     _ = try tl.commit(.{ .add = 2 });
-    tl.edit(a, .{ .add = 5 }); // dirty: the job will compute [5, 2]
+    try tl.edit(a, .{ .add = 5 }); // dirty: the job will compute [5, 2]
     var job = try tl.beginRebuild();
     defer job.deinit();
 
@@ -3438,7 +3427,7 @@ test "sync: a remote remove landing during a background job is rejected, not a c
     defer tl.deinit();
     const a = try tl.commit(.{ .add = 1 });
     const b = try tl.commit(.{ .add = 2 });
-    tl.edit(a, .{ .add = 5 });
+    try tl.edit(a, .{ .add = 5 });
     var job = try tl.beginRebuild(); // plan: 2 features
     defer job.deinit();
 
@@ -3455,7 +3444,7 @@ test "integrate: the feature-list guard rejects a mismatched job even if the gen
     defer tl.deinit();
     const a = try tl.commit(.{ .add = 1 });
     _ = try tl.commit(.{ .add = 2 });
-    tl.edit(a, .{ .add = 5 });
+    try tl.edit(a, .{ .add = 5 });
     var job = try tl.beginRebuild();
     defer job.deinit();
 

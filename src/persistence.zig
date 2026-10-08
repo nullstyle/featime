@@ -72,6 +72,10 @@ fn validateCodecs(comptime Domain: type) void {
         @compileError("persistence requires `pub fn encodeDoc(doc: *const Doc, w: *std.Io.Writer) anyerror!void` on the Domain");
     if (!@hasDecl(Domain, "decodeDoc"))
         @compileError("persistence requires `pub fn decodeDoc(r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Doc` on the Domain");
+    ft.checkHook(Domain, "encodeOp", &.{ Domain.Op, *std.Io.Writer }, void, .error_union, "fn (op: Op, w: *std.Io.Writer) anyerror!void");
+    ft.checkHook(Domain, "decodeOp", &.{ *std.Io.Reader, std.mem.Allocator }, Domain.Op, .error_union, "fn (r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Op");
+    ft.checkHook(Domain, "encodeDoc", &.{ *const Domain.Doc, *std.Io.Writer }, void, .error_union, "fn (doc: *const Doc, w: *std.Io.Writer) anyerror!void");
+    ft.checkHook(Domain, "decodeDoc", &.{ *std.Io.Reader, std.mem.Allocator }, Domain.Doc, .error_union, "fn (r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Doc");
 }
 
 /// Serialize the timeline (feature list, ids, suppression, marker, seed).
@@ -363,8 +367,8 @@ test "round trip preserves ids, order, suppression, marker, and state" {
     const b = try tl.commit(.{ .mul = 3 });
     const c = try tl.commit(.{ .fail = 12 });
     _ = try tl.commit(.{ .add = 5 });
-    tl.setSuppressed(b, true);
-    tl.edit(a, .{ .add = 20 });
+    try tl.setSuppressed(b, true);
+    try tl.edit(a, .{ .add = 20 });
     tl.setMarker(3); // rolled partway back: marker round-trips
     _ = tl.state();
 
@@ -461,7 +465,7 @@ test "round trip preserves annotations and timeline identity" {
     try tl.addTag(a, "review");
     _ = try tl.addChapter("before ridge", .{ .after = null });
     _ = try tl.addChapter("after ridge", .{ .after = a });
-    tl.setSuppressed(b, true);
+    try tl.setSuppressed(b, true);
     const original_id = tl.timelineId();
 
     var aw: std.Io.Writer.Allocating = .init(gpa);

@@ -297,11 +297,11 @@ pub fn main(init: std.process.Init) !void {
     try app.show("3b. roll to the end (replays the suffix)");
 
     // -- 4. Edit a feature's parameters --------------------------------------
-    app.tl.edit(hill, .{ .raise = .{ .cell = 9, .amount = 3 } });
+    try app.tl.edit(hill, .{ .raise = .{ .cell = 9, .amount = 3 } });
     try app.show("4. edit the hill raise: 9 -> 3, downstream recomputes");
 
     // -- 5. Suppress a feature -----------------------------------------------
-    app.tl.setSuppressed(hill, true);
+    try app.tl.setSuppressed(hill, true);
     try app.show("5. suppress the hill raise (castle keeps its cell)");
 
     // -- 6. Reorder with dependency validation -------------------------------

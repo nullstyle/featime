@@ -84,7 +84,7 @@ fn demo(out: *Io.Writer, arena: std.mem.Allocator) !void {
     const b = try tl.commit(.{ .multiply = 2 });
     _ = try tl.commit(.{ .add = -40 });
     _ = try tl.commit(.{ .clamp_positive = {} }); // fails: total is negative
-    tl.setSuppressed(b, true);
+    try tl.setSuppressed(b, true);
     tl.setMarker(3); // rolled partway back: add(10), multiply(suppressed), add(-40)
     _ = tl.state();
     try out.print("saved state:         total = {d}   marker {d}/{d}\n", .{ tl.state().total, tl.marker(), tl.len() });

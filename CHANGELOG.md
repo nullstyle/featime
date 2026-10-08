@@ -3,9 +3,33 @@
 All notable changes to featuretree-zig. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
-## Unreleased
+## 0.7.0 — 2026-10-07
+
+### Changed (breaking)
+- Unknown ids are errors instead of silent no-ops. `edit`, `remove`,
+  `setSuppressed`, `refresh`, `setFeatureName`, `clearFeatureName`,
+  `addTag`, `removeTag` and `move` return `error.UnknownFeature`; chapter,
+  group and parameter mutators return `error.UnknownChapter`,
+  `error.UnknownGroup` and `error.UnknownParam`. Mutators that were `void`
+  now return error unions: add `try`.
+- `addGroup` returns `GroupId` (was `?GroupId`); an unknown anchor is
+  `error.UnknownFeature`.
+- `moveGroup` returns `GroupMoveError`: `error.GroupTooLarge` above
+  `max_group_move` (4096) members instead of a misleading `OutOfMemory`.
+  `MoveError` is `{ DependencyViolation, UnknownFeature }` (a move cannot run
+  out of memory).
+- `validateDomain` checks every hook's parameter types and return shape, so
+  a wrong signature fails with one message at `Timeline(Domain)` instead of
+  inside the library. Persistence checks its codec hooks the same way.
+- The demo binary is `zig-out/bin/featuretree-demo`.
 
 ### Fixed
+- `moveGroup` relocated the wrong features for multi-member blocks (it
+  always took the feature at the old block start); blocks now move intact in
+  both directions.
+- No-op edits (an unknown id, suppressing to the current flag, moving to the
+  current index, a refused move) no longer bump the rebuild generation, so
+  they no longer discard in-flight background jobs.
 - Persistence and sync no longer trust frame lengths from the input:
   payloads are read in 64 KiB chunks, so a corrupt or hostile length cannot
   force a multi-gigabyte allocation.

@@ -160,7 +160,7 @@ pub fn run(out: *Io.Writer, arena: std.mem.Allocator) !void {
     try out.writeAll("\n-- 3. region raises a hill; globe stale, then refreshed ------\n");
     _ = try region.commit(.{ .raise = .{ .cell = 0, .amount = 3 } });
     try printGlobe(out, &globe); // still the old merge: cell 0 still flooded
-    globe.refresh(occurrence);
+    try globe.refresh(occurrence);
     try printGlobe(out, &globe); // flooded drops: cell 0 is now above sea level
 
     // 4. Cross-timeline skew is intended Fusion semantics: scrubbing the
@@ -168,7 +168,7 @@ pub fn run(out: *Io.Writer, arena: std.mem.Allocator) !void {
     try out.writeAll("\n-- 4. region scrubbed back before planting; refresh ----------\n");
     region.setMarker(2);
     try printRegion(out, &region);
-    globe.refresh(occurrence);
+    try globe.refresh(occurrence);
     try printGlobe(out, &globe); // trees drop to 0
 
     // 5. Rolling the GLOBE back past the occurrence leaves the region
@@ -203,19 +203,19 @@ test "occurrence merges region state; refresh picks up changes" {
     try std.testing.expectEqual(@as(u32, 3), globe.state().region_trees);
 
     // Refresh re-runs the occurrence.
-    globe.refresh(occurrence);
+    try globe.refresh(occurrence);
     try std.testing.expectEqual(@as(u32, 7), globe.state().region_trees);
 
     // Scrubbing the region marker changes what the occurrence reads: at
     // marker 1 only the first planting (3 trees) is applied.
     region.setMarker(1);
-    globe.refresh(occurrence);
+    try globe.refresh(occurrence);
     try std.testing.expectEqual(@as(u32, 3), globe.state().region_trees);
 
     // Suppressing the occurrence removes the merge entirely.
     region.setMarker(region.len());
-    globe.refresh(occurrence);
-    globe.setSuppressed(occurrence, true);
+    try globe.refresh(occurrence);
+    try globe.setSuppressed(occurrence, true);
     try std.testing.expectEqual(@as(u32, 0), globe.state().region_trees);
     try std.testing.expectEqual(@as(u32, 0), globe.state().flooded);
 }
