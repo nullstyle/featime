@@ -53,7 +53,15 @@ pub fn Journal(comptime Op: type) type {
                 group_fixes: []annotations.GroupFix = &.{}, // owned slice
             },
             suppress: struct { id: ft.FeatureId, prev: bool },
-            move: struct { id: ft.FeatureId, from: u32, to: u32, marker_pre: u32 },
+            move: struct {
+                id: ft.FeatureId,
+                from: u32,
+                to: u32,
+                marker_pre: u32,
+                /// Group boundaries this move re-anchored (a boundary member
+                /// leaving its span); owned slice, exact undo/redo.
+                group_fixes: []annotations.GroupFix = &.{},
+            },
             name_set: struct { id: ft.FeatureId, old: ?[]const u8, new: ?[]const u8 },
             tag_add: struct { id: ft.FeatureId, tag: []const u8 },
             tag_remove: struct { id: ft.FeatureId, tag: []const u8 },
@@ -108,6 +116,7 @@ pub fn Journal(comptime Op: type) type {
                     self.gpa.free(r.tags);
                     self.gpa.free(r.group_fixes);
                 },
+                .move => |m| self.gpa.free(m.group_fixes),
                 .name_set => |n| {
                     if (n.old) |o| self.gpa.free(o);
                     if (n.new) |x| self.gpa.free(x);

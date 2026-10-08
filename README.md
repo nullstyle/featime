@@ -133,8 +133,11 @@ persistence, anchored to feature ids so it survives structural edits:
   feature X (null pins to the tip); `markPosition` resolves a jump target.
   Removing the anchor re-anchors to the successor, exactly reversed by undo.
 - **Groups** — contiguous `{first, last}` spans with computed membership:
-  inserts inside join, member moves out leave (Fusion folders). Batch
-  operations are single undo steps: `setGroupSuppressed`, `moveGroup`
+  inserts inside join, member moves out leave (Fusion folders). Dragging a
+  boundary member out re-anchors the folder to its remaining members (undo
+  restores it exactly); a folder's only member carries the folder along;
+  `moveGroup` relocates the whole folder intact. Batch operations are
+  single undo steps: `setGroupSuppressed`, `moveGroup`
   (dependency-validated), `removeGroupContents`.
 - **Provenance** — `commitWithMeta(op, .{ .author, .ts })`; plain `commit`
   auto-stamps when `Config.now` supplies a clock.
@@ -196,6 +199,10 @@ var entry = try ft.sync.decode(MyApp, gpa, &reader);
 tl.applyRemote(&entry);          // journaled locally; observer NOT fired
 ft.sync.deinit(MyApp.Op, gpa, &entry);
 ```
+
+Every encoded entry starts with `sync.wire_version` (2 as of 0.7.0);
+`decode` rejects other versions with `error.UnsupportedWireVersion` instead
+of misparsing them.
 
 `applyRemote` preserves identity exactly — feature/chapter/group/param ids
 are random-anchored per timeline (seed the anchor from OS randomness with
@@ -347,10 +354,13 @@ and globe rollback leaving the region untouched.
 
 - Unit tests cover each behavior (co-located `test` blocks).
 - `tests/oracle.zig` is a differential harness: randomized operation
-  sequences across randomized configs run against a naive replay-everything
-  reference model, asserting identical documents, statuses, and undo
-  capabilities after *every* step. This is the primary net for
-  cache-invalidation and journal bugs.
+  sequences (commits, edits, removes, moves, suppression, names, tags,
+  chapters, groups including `moveGroup` and `removeGroupContents`,
+  parameters, transactions, undo/redo) across randomized configs run against
+  a naive replay-everything reference model, asserting identical documents,
+  statuses, annotations, parameters, and undo/redo availability after
+  *every* step. This is the primary net for cache-invalidation, anchor, and
+  journal bugs.
 - `src/main.zig` is a terrain-editor demo that exercises every capability
   end-to-end (`zig build run`).
 

@@ -340,7 +340,7 @@ pub fn Timeline(comptime Domain: type) type {
                 null;
             const fixes = self.ann.reanchorAfterRemove(id, replacement) catch @as([]annotations.ChapterFix, &.{});
             const tags_snap = self.ann.takeTags(id) catch @as([][]const u8, &.{});
-            const group_fixes = self.reanchorGroupBoundaries(id, idx) catch @as([]annotations.GroupFix, &.{});
+            const group_fixes = self.reanchorGroupBoundaries(id, idx, null) catch @as([]annotations.GroupFix, &.{});
 
             self.record(.{ .remove = .{
                 .id = id,
@@ -669,11 +669,16 @@ pub fn Timeline(comptime Domain: type) type {
                 const from: u32 = if (to < span.lo) span.lo + k else span.lo;
                 const dest: u32 = if (to < span.lo) to + k else to + n - 1;
                 const member = self.list.items[from].id;
+                // Other folders re-anchor as members pass through them; the
+                // folder being moved keeps its anchors (they travel with
+                // the block).
+                const gfixes = self.reanchorGroupBoundaries(member, from, id) catch @as([]annotations.GroupFix, &.{});
                 self.record(.{ .move = .{
                     .id = member,
                     .from = from,
                     .to = dest,
                     .marker_pre = self.marker_pos,
+                    .group_fixes = gfixes,
                 } });
                 self.rawMove(member, dest);
             }
@@ -758,11 +763,17 @@ pub fn Timeline(comptime Domain: type) type {
             }
             self.touch();
 
+            // Fusion folder semantics: a boundary member dragged out of its
+            // span leaves the group, which re-anchors to the remaining
+            // members (journaled for exact undo). Membership itself is
+            // positional, so dragging a feature into a span joins it.
+            const gfixes = self.reanchorGroupBoundaries(id, from, null) catch @as([]annotations.GroupFix, &.{});
             self.record(.{ .move = .{
                 .id = id,
                 .from = from,
                 .to = to,
                 .marker_pre = self.marker_pos,
+                .group_fixes = gfixes,
             } });
             self.rawMove(id, to);
         }
@@ -1060,11 +1071,15 @@ pub fn Timeline(comptime Domain: type) type {
                     const to = @min(e.to, @as(u32, @intCast(self.list.items.len - 1)));
                     if (from == to) return;
                     self.touch();
+                    // Boundary fixups are computed from the local state, not
+                    // taken from the remote entry.
+                    const gfixes = self.reanchorGroupBoundaries(e.id, from, null) catch @as([]annotations.GroupFix, &.{});
                     self.journal.record(.{ .move = .{
                         .id = e.id,
                         .from = from,
                         .to = to,
                         .marker_pre = self.marker_pos,
+                        .group_fixes = gfixes,
                     } });
                     self.rawMove(e.id, to);
                 },
@@ -1277,9 +1292,11 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .move => |e| {
                     self.rawMove(e.id, e.from);
+                    self.ann.applyGroupFixes(e.group_fixes);
                     // Restore the pre-move marker (rawMove's crossing
                     // adjustment started from the post-undo marker).
                     self.marker_pos = e.marker_pre;
+                    self.annTouch();
                 },
                 .name_set => |e| {
                     self.ann.setName(e.id, e.old) catch {};
@@ -1355,8 +1372,7 @@ pub fn Timeline(comptime Domain: type) type {
                         null;
                     const fixes = self.ann.reanchorAfterRemove(e.id, replacement) catch @as([]annotations.ChapterFix, &.{});
                     self.gpa.free(fixes); // the entry keeps the originals
-                    const gfixes = self.reanchorGroupBoundaries(e.id, idx) catch @as([]annotations.GroupFix, &.{});
-                    self.gpa.free(gfixes);
+                    self.ann.applyGroupFixesForward(e.group_fixes);
                     self.ann.removeFeature(e.id); // frees name/tags
                     self.resetStatuses(idx);
                     _ = self.list.orderedRemove(idx);
@@ -1369,7 +1385,11 @@ pub fn Timeline(comptime Domain: type) type {
                     self.list.items[idx].suppressed = !e.prev;
                     self.invalidate(idx);
                 },
-                .move => |e| self.rawMove(e.id, e.to),
+                .move => |e| {
+                    self.rawMove(e.id, e.to);
+                    self.ann.applyGroupFixesForward(e.group_fixes);
+                    self.annTouch();
+                },
                 .name_set => |e| {
                     self.ann.setName(e.id, e.new) catch {};
                     self.annTouch();
@@ -1424,25 +1444,41 @@ pub fn Timeline(comptime Domain: type) type {
             }
         }
 
-        /// Re-anchor group boundaries when a member at `idx` is removed:
-        /// the second member becomes `first`, the predecessor becomes `last`;
-        /// with no members left the anchors go dead (empty folder). Returns
-        /// the fixes needed to undo this exactly.
-        fn reanchorGroupBoundaries(self: *Self, removed_id: ft.FeatureId, idx: u32) error{OutOfMemory}![]annotations.GroupFix {
+        /// Re-anchor group boundaries when the member at `idx` leaves its
+        /// position (removed, or moved elsewhere): the second member becomes
+        /// `first`, the predecessor becomes `last`. A folder whose only
+        /// member leaves keeps that member as both anchors — removed, the
+        /// anchors go dead (empty folder); moved, the folder travels with it.
+        /// `exempt` (the folder `moveGroup` is relocating) is left alone.
+        /// Returns the fixes needed to undo and redo this exactly; groups
+        /// whose anchors did not change are not reported.
+        fn reanchorGroupBoundaries(self: *Self, leaving_id: ft.FeatureId, idx: u32, exempt: ?ft.annotations.GroupId) error{OutOfMemory}![]annotations.GroupFix {
             var fixes: std.ArrayList(annotations.GroupFix) = .empty;
             errdefer fixes.deinit(self.gpa);
             for (self.ann.groupsMut()) |*g| {
+                if (exempt) |x| {
+                    if (g.id == x) continue;
+                }
                 const span = self.spanOf(g.first, g.last) orelse continue;
                 const at_first = idx == span.lo;
                 const at_last = idx == span.hi;
                 if (!at_first and !at_last) continue;
-                try fixes.append(self.gpa, .{ .group_id = g.id, .old_first = g.first, .old_last = g.last });
+                const old_first = g.first;
+                const old_last = g.last;
                 if (at_first) {
-                    g.first = if (span.lo + 1 <= span.hi) self.list.items[span.lo + 1].id else removed_id;
+                    g.first = if (span.lo + 1 <= span.hi) self.list.items[span.lo + 1].id else leaving_id;
                 }
                 if (at_last) {
-                    g.last = if (span.hi >= span.lo + 1) self.list.items[span.hi - 1].id else removed_id;
+                    g.last = if (span.hi >= span.lo + 1) self.list.items[span.hi - 1].id else leaving_id;
                 }
+                if (g.first == old_first and g.last == old_last) continue;
+                try fixes.append(self.gpa, .{
+                    .group_id = g.id,
+                    .old_first = old_first,
+                    .old_last = old_last,
+                    .new_first = g.first,
+                    .new_last = g.last,
+                });
             }
             return fixes.toOwnedSlice(self.gpa);
         }
@@ -3483,4 +3519,119 @@ test "sync: a remote insert moves the local marker only when it lands at or befo
     tl.applyRemote(&.{ .commit = .{ .id = 7003, .op = .{ .add = 1000 }, .at = 5, .meta = null } });
     try std.testing.expectEqual(tl.len(), tl.marker());
     try std.testing.expectEqual(@as(i64, 1116), tl.state().value);
+}
+
+test "groups: moving a boundary member out re-anchors the span; undo restores it exactly" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+    const c = try tl.commit(.{ .add = 3 });
+    const d = try tl.commit(.{ .add = 4 });
+    const g = try tl.addGroup("g", a, c); // [a b c] d
+
+    // Drag the first member below the folder: it leaves, b becomes first.
+    try tl.move(a, 3); // [b c] d a
+    try std.testing.expectEqual(b, tl.groups()[0].first);
+    try std.testing.expectEqual(c, tl.groups()[0].last);
+    try std.testing.expect(tl.groupOf(a) == null);
+    try std.testing.expect(tl.groupOf(d) == null);
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(b));
+    try std.testing.expect(tl.undo()); // [a b c] d
+    try std.testing.expectEqual(a, tl.groups()[0].first);
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(a));
+
+    // Drag the last member out past d: it leaves, b becomes last.
+    try tl.move(c, 3); // [a b] d c
+    try std.testing.expectEqual(b, tl.groups()[0].last);
+    try std.testing.expect(tl.groupOf(c) == null);
+    try std.testing.expect(tl.groupOf(d) == null);
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(c, tl.groups()[0].last);
+    try std.testing.expect(tl.redo());
+    try std.testing.expectEqual(b, tl.groups()[0].last);
+    try std.testing.expect(tl.undo());
+
+    // A non-member dragged inside joins; undo takes it back out.
+    try tl.move(d, 1); // [a d b c]
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(d));
+    try std.testing.expect(tl.undo());
+    try std.testing.expect(tl.groupOf(d) == null);
+
+    // The only member of a one-feature folder carries the folder along.
+    const h = try tl.addGroup("h", d, d);
+    try tl.move(d, 0); // d [a b c]
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, h), tl.groupOf(d));
+    try std.testing.expectEqual(d, tl.groups()[1].first);
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(a));
+}
+
+test "moveGroup moves multi-member blocks intact in both directions and keeps the folder" {
+    const gpa = std.testing.allocator;
+    var tl = try makeTimeline(gpa);
+    defer tl.deinit();
+
+    var f: [6]ft.FeatureId = undefined;
+    for (&f, 0..) |*slot, i| slot.* = try tl.commit(.{ .add = @intCast(i + 1) });
+    const g = try tl.addGroup("g", f[1], f[2]);
+
+    // Right: [0 1 2 3 4 5] -> [0 3 4 5 1 2].
+    try tl.moveGroup(g, 4);
+    const want_right = [_]ft.FeatureId{ f[0], f[3], f[4], f[5], f[1], f[2] };
+    for (want_right, 0..) |id, i| try std.testing.expectEqual(id, idAtIdx(&tl, @intCast(i)));
+    try std.testing.expectEqual(f[1], tl.groups()[0].first);
+    try std.testing.expectEqual(f[2], tl.groups()[0].last);
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(f[1]));
+    try std.testing.expect(tl.groupOf(f[5]) == null);
+    try std.testing.expectEqual(@as(i64, 21), tl.state().value);
+
+    try std.testing.expect(tl.undo());
+    for (f, 0..) |id, i| try std.testing.expectEqual(id, idAtIdx(&tl, @intCast(i)));
+    try std.testing.expectEqual(f[1], tl.groups()[0].first);
+
+    // Left: [0 1 2 3 4 5] -> [1 2 0 3 4 5].
+    try tl.moveGroup(g, 0);
+    const want_left = [_]ft.FeatureId{ f[1], f[2], f[0], f[3], f[4], f[5] };
+    for (want_left, 0..) |id, i| try std.testing.expectEqual(id, idAtIdx(&tl, @intCast(i)));
+    try std.testing.expectEqual(@as(?ft.annotations.GroupId, g), tl.groupOf(f[2]));
+    try std.testing.expect(tl.groupOf(f[0]) == null);
+    try std.testing.expect(tl.undo());
+    for (f, 0..) |id, i| try std.testing.expectEqual(id, idAtIdx(&tl, @intCast(i)));
+    try std.testing.expect(tl.redo());
+    for (want_left, 0..) |id, i| try std.testing.expectEqual(id, idAtIdx(&tl, @intCast(i)));
+}
+
+test "sync: wire codec round-trips a move entry with group fixes" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    const a = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+    const c = try tl.commit(.{ .add = 3 });
+    const g = try tl.addGroup("g", a, c);
+
+    var out = Outbox{ .gpa = gpa };
+    defer out.deinit();
+    tl.setRecordObserver(.{ .ctx = &out, .func = Outbox.observe });
+    try tl.move(a, 2); // a leaves the folder: g re-anchors to b..c
+    try std.testing.expectEqual(@as(usize, 1), out.blobs.items.len);
+
+    var reader = std.Io.Reader.fixed(out.blobs.items[0]);
+    var entry = try syncing.decode(ParamDomain, gpa, &reader);
+    defer syncing.deinit(ParamDomain.Op, gpa, &entry);
+    try std.testing.expectEqual(a, entry.move.id);
+    try std.testing.expectEqual(@as(usize, 1), entry.move.group_fixes.len);
+    try std.testing.expectEqual(g, entry.move.group_fixes[0].group_id);
+    try std.testing.expectEqual(a, entry.move.group_fixes[0].old_first);
+    try std.testing.expectEqual(b, entry.move.group_fixes[0].new_first);
+    try std.testing.expectEqual(c, entry.move.group_fixes[0].new_last);
+}
+
+test "sync: entries from another wire version are rejected" {
+    const gpa = std.testing.allocator;
+    const bytes = [_]u8{ syncing.wire_version + 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var reader = std.Io.Reader.fixed(&bytes);
+    try std.testing.expectError(error.UnsupportedWireVersion, syncing.decode(ParamDomain, gpa, &reader));
 }

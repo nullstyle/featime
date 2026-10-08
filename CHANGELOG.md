@@ -21,9 +21,17 @@ All notable changes to featuretree-zig. The format follows
 - `validateDomain` checks every hook's parameter types and return shape, so
   a wrong signature fails with one message at `Timeline(Domain)` instead of
   inside the library. Persistence checks its codec hooks the same way.
+- Sync wire format: every encoded entry now starts with a version byte
+  (`sync.wire_version`, 2); `decode` returns `error.UnsupportedWireVersion`
+  for anything else. Move entries carry the group boundary fixups they
+  caused, and `GroupFix` carries old and new anchors.
 - The demo binary is `zig-out/bin/featuretree-demo`.
 
 ### Fixed
+- Dragging a group's first or last member out of its span inverted the span
+  and the folder appeared empty. The folder now re-anchors to its remaining
+  members and undo restores it exactly; a folder's only member carries the
+  folder along; `moveGroup` keeps the moved block as the folder.
 - `moveGroup` relocated the wrong features for multi-member blocks (it
   always took the feature at the old block start); blocks now move intact in
   both directions.
@@ -44,6 +52,9 @@ All notable changes to featuretree-zig. The format follows
   binary is now `zig-out/bin/featuretree-demo`.
 
 ### Added
+- The differential oracle now exercises chapters, groups (including
+  `moveGroup` and `removeGroupContents`) and parameters, and compares
+  anchors and resolved positions after every step.
 - GitHub Actions CI: fmt check, tests in Debug/ReleaseSafe/ReleaseFast, the
   examples and the demo, on Linux and macOS.
 - This changelog.

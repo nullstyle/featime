@@ -189,3 +189,8 @@ load-bearing), and anything UI-shaped — the library stays headless.
 - Parameter edits use suffix replay as a correct over-approximation in v1.
 - Timestamps come only from an injected clock hook; the library itself
   remains time-source-free.
+- Groups keep Fusion folder semantics under moves (0.7.0): a boundary member
+  dragged out re-anchors the folder to the remaining members, a folder's only
+  member carries it along, `moveGroup` relocates the folder as a block; the
+  fixups ride the move's journal entry so undo and redo are exact.
+- Unknown ids are errors, never silent no-ops (0.7.0).

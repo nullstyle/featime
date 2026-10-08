@@ -21,6 +21,14 @@ const journaling = @import("journal.zig");
 const annotations = @import("annotations.zig");
 const params = @import("params.zig");
 
+/// Version byte written in front of every encoded entry. Bump it whenever
+/// an entry's layout changes; `decode` rejects other versions with
+/// `error.UnsupportedWireVersion` instead of misparsing them.
+///
+/// History: 1 — 0.6.x (implicit, no byte); 2 — 0.7.0 (version byte, move
+/// entries carry group fixes, group fixes carry old and new anchors).
+pub const wire_version: u8 = 2;
+
 /// True when the remote edit's provenance wins over the local one by
 /// timestamp (ties favor the remote — the caller chose to deliver it).
 pub fn lastWriterWins(local: ft.Meta, remote: ft.Meta) bool {
@@ -143,6 +151,8 @@ fn writeGroupFixes(w: *std.Io.Writer, fixes: []const annotations.GroupFix) !void
         try w.writeInt(u64, f.group_id, .little);
         try w.writeInt(u64, f.old_first, .little);
         try w.writeInt(u64, f.old_last, .little);
+        try w.writeInt(u64, f.new_first, .little);
+        try w.writeInt(u64, f.new_last, .little);
     }
 }
 
@@ -158,6 +168,8 @@ fn readGroupFixes(gpa: std.mem.Allocator, r: *std.Io.Reader) ![]annotations.Grou
         f.group_id = try r.takeInt(u64, .little);
         f.old_first = try r.takeInt(u64, .little);
         f.old_last = try r.takeInt(u64, .little);
+        f.new_first = try r.takeInt(u64, .little);
+        f.new_last = try r.takeInt(u64, .little);
         filled += 1;
     }
     return out;
@@ -190,6 +202,7 @@ pub fn encode(
     gpa: std.mem.Allocator,
     w: *std.Io.Writer,
 ) !void {
+    try w.writeAll(&[1]u8{wire_version});
     switch (entry.*) {
         .commit => |e| {
             try w.writeAll(&[1]u8{1});
@@ -228,6 +241,7 @@ pub fn encode(
             try w.writeInt(u32, e.from, .little);
             try w.writeInt(u32, e.to, .little);
             try w.writeInt(u32, e.marker_pre, .little);
+            try writeGroupFixes(w, e.group_fixes);
         },
         .name_set => |e| {
             try w.writeAll(&[1]u8{6});
@@ -311,12 +325,15 @@ pub fn encode(
 }
 
 /// Deserialize an owned entry (strings and slices allocated from `gpa`);
-/// free it with `deinit` after use.
+/// free it with `deinit` after use. Entries written by another
+/// `wire_version` are rejected with `error.UnsupportedWireVersion`.
 pub fn decode(
     comptime Domain: type,
     gpa: std.mem.Allocator,
     r: *std.Io.Reader,
 ) !journaling.Journal(Domain.Op).Entry {
+    const version = (try r.take(1))[0];
+    if (version != wire_version) return error.UnsupportedWireVersion;
     const tag = (try r.take(1))[0];
     switch (tag) {
         1 => return .{ .commit = .{
@@ -351,6 +368,7 @@ pub fn decode(
             .from = try r.takeInt(u32, .little),
             .to = try r.takeInt(u32, .little),
             .marker_pre = try r.takeInt(u32, .little),
+            .group_fixes = try readGroupFixes(gpa, r),
         } },
         6 => return .{ .name_set = .{
             .id = try r.takeInt(u64, .little),
@@ -440,6 +458,7 @@ pub fn deinit(comptime Op: type, gpa: std.mem.Allocator, entry: *journaling.Jour
             gpa.free(e.tags);
             gpa.free(e.group_fixes);
         },
+        .move => |*e| gpa.free(e.group_fixes),
         .name_set => |*e| {
             if (e.old) |o| gpa.free(o);
             if (e.new) |n| gpa.free(n);

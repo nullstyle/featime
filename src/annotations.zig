@@ -56,12 +56,15 @@ pub const Group = struct {
     last: ft.FeatureId,
 };
 
-/// One group boundary re-anchor caused by removing a member; journaled so
-/// undo restores the exact previous span.
+/// One group boundary re-anchor caused by removing or moving a boundary
+/// member; journaled so undo restores the exact previous span and redo
+/// re-applies the exact new one.
 pub const GroupFix = struct {
     group_id: GroupId,
     old_first: ft.FeatureId,
     old_last: ft.FeatureId,
+    new_first: ft.FeatureId,
+    new_last: ft.FeatureId,
 };
 
 pub const Annotations = struct {
@@ -324,12 +327,22 @@ pub const Annotations = struct {
         return null;
     }
 
-    /// Restore boundaries recorded by boundary fixups.
+    /// Restore the boundaries recorded by boundary fixups (undo).
     pub fn applyGroupFixes(self: *Self, fixes: []const GroupFix) void {
         for (fixes) |f| {
             if (self.mutableGroup(f.group_id)) |g| {
                 g.first = f.old_first;
                 g.last = f.old_last;
+            }
+        }
+    }
+
+    /// Re-apply the boundaries recorded by boundary fixups (redo).
+    pub fn applyGroupFixesForward(self: *Self, fixes: []const GroupFix) void {
+        for (fixes) |f| {
+            if (self.mutableGroup(f.group_id)) |g| {
+                g.first = f.new_first;
+                g.last = f.new_last;
             }
         }
     }
