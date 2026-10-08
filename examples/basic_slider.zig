@@ -13,8 +13,9 @@ const common = @import("common.zig");
 
 // ---------------------------------------------------------------------------
 // A Domain is the whole integration surface: document type, feature types
-// (one tagged union), and how a feature applies. Everything else the library
-// needs (cloning documents for checkpoints) is two more small functions.
+// (one tagged union), and how a feature applies. A plain-data document like
+// this one needs nothing else; a document that owns heap memory adds
+// `cloneDoc` / `deinitDoc` (see src/main.zig).
 // ---------------------------------------------------------------------------
 
 const Ledger = struct {
@@ -31,16 +32,6 @@ const Ledger = struct {
             .add => |n| doc.total += n,
             .multiply => |n| doc.total *= n,
         }
-    }
-
-    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
-        _ = gpa;
-        return doc.*;
-    }
-
-    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
-        _ = doc;
-        _ = gpa;
     }
 };
 

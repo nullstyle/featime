@@ -23,14 +23,6 @@ const Ledger = struct {
             .multiply => |n| doc.total *= n,
         }
     }
-    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
-        _ = gpa;
-        return doc.*;
-    }
-    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
-        _ = doc;
-        _ = gpa;
-    }
 };
 
 fn printTimeline(tl: *const ft.Timeline(Ledger), out: *Io.Writer) !void {

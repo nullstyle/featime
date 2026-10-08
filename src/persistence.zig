@@ -313,14 +313,6 @@ const PersistDomain = struct {
             .fail => |code| return ctx.fail("failure code {d}", .{code}),
         }
     }
-    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
-        _ = gpa;
-        return doc.*;
-    }
-    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
-        _ = doc;
-        _ = gpa;
-    }
     pub fn encodeOp(op: Op, w: *std.Io.Writer) anyerror!void {
         switch (op) {
             .add => |n| {

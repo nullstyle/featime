@@ -81,12 +81,12 @@ pub fn Checkpoints(comptime Domain: type) type {
             }
             var entry: Entry = .{
                 .pos = pos,
-                .doc = Domain.cloneDoc(doc, self.gpa) catch return,
+                .doc = ft.cloneDoc(Domain, doc, self.gpa) catch return,
                 .statuses = &.{},
             };
             entry.statuses = self.cloneStatuses(features[0..pos]) catch {
                 var dead = entry.doc;
-                Domain.deinitDoc(&dead, self.gpa);
+                ft.deinitDoc(Domain, &dead, self.gpa);
                 return;
             };
             while (self.entries.items.len >= self.max) {
@@ -112,7 +112,7 @@ pub fn Checkpoints(comptime Domain: type) type {
                 else => {},
             };
             self.gpa.free(e.statuses);
-            Domain.deinitDoc(&e.doc, self.gpa);
+            ft.deinitDoc(Domain, &e.doc, self.gpa);
         }
 
         fn cloneStatuses(self: *Self, features: []const ft.Feature(Domain.Op)) ![]ft.Status {

@@ -119,7 +119,7 @@ pub fn Timeline(comptime Domain: type) type {
         // ------------------------------------------------------------------
 
         pub fn init(gpa: std.mem.Allocator, seed_doc: Doc, config: ft.Config) !Self {
-            const live = try Domain.cloneDoc(&seed_doc, gpa);
+            const live = try ft.cloneDoc(Domain, &seed_doc, gpa);
             // Random id anchor: independently created timelines (other
             // peers, other processes) must allocate from disjoint id ranges,
             // and `allocId` only ever moves the counter forward from here.
@@ -161,8 +161,8 @@ pub fn Timeline(comptime Domain: type) type {
             self.journal.deinit();
             self.ann.deinit();
             self.ptab.deinit();
-            Domain.deinitDoc(&self.seed_doc, self.gpa);
-            Domain.deinitDoc(&self.live_doc, self.gpa);
+            ft.deinitDoc(Domain, &self.seed_doc, self.gpa);
+            ft.deinitDoc(Domain, &self.live_doc, self.gpa);
         }
 
         /// This timeline's stable identity (see `timeline_id`).
@@ -1565,8 +1565,8 @@ pub fn Timeline(comptime Domain: type) type {
                     have_base = true;
                 }
             }
-            if (!have_base) base = try Domain.cloneDoc(&self.seed_doc, self.gpa);
-            errdefer Domain.deinitDoc(&base, self.gpa);
+            if (!have_base) base = try ft.cloneDoc(Domain, &self.seed_doc, self.gpa);
+            errdefer ft.deinitDoc(Domain, &base, self.gpa);
 
             const features_copy = try self.gpa.dupe(ft.Feature(Op), self.list.items);
             errdefer self.gpa.free(features_copy);
@@ -1610,7 +1610,7 @@ pub fn Timeline(comptime Domain: type) type {
                     return false;
                 },
             }
-            Domain.deinitDoc(&self.live_doc, self.gpa);
+            ft.deinitDoc(Domain, &self.live_doc, self.gpa);
             self.live_doc = job.base;
             self.resetStatuses(job.start_pos);
             var i: u32 = job.start_pos;
@@ -1697,7 +1697,7 @@ pub fn Timeline(comptime Domain: type) type {
             // 1. Exact checkpoint restore — the slider fast path. Scrubbing
             //    back to a snapshotted position costs zero applies.
             if (self.cps.takeExact(self.marker_pos)) |taken| {
-                Domain.deinitDoc(&self.live_doc, self.gpa);
+                ft.deinitDoc(Domain, &self.live_doc, self.gpa);
                 self.live_doc = taken.doc;
                 self.resetStatuses(0);
                 for (taken.statuses, 0..) |s, i| self.list.items[i].status = s;
@@ -1734,7 +1734,7 @@ pub fn Timeline(comptime Domain: type) type {
                     base = &e.doc;
                 }
             }
-            var scratch = Domain.cloneDoc(base, self.gpa) catch |err| {
+            var scratch = ft.cloneDoc(Domain, base, self.gpa) catch |err| {
                 self.broken = err;
                 return;
             };
@@ -1747,7 +1747,7 @@ pub fn Timeline(comptime Domain: type) type {
                     self.marker_pos;
                 var applied: u32 = pos;
                 ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.gpa, self.env, self.ptab.items(), &applied) catch |err| {
-                    Domain.deinitDoc(&scratch, self.gpa);
+                    ft.deinitDoc(Domain, &scratch, self.gpa);
                     self.broken = err;
                     return; // live_doc still holds the last good state
                 };
@@ -1756,7 +1756,7 @@ pub fn Timeline(comptime Domain: type) type {
                     self.cps.add(end, &scratch, self.list.items);
                 }
             }
-            Domain.deinitDoc(&self.live_doc, self.gpa);
+            ft.deinitDoc(Domain, &self.live_doc, self.gpa);
             self.live_doc = scratch;
             self.built_pos = self.marker_pos;
             self.live_stale = false;
@@ -3028,14 +3028,6 @@ const ParamDomain = struct {
             .scale_by_param => |pid| out.param(pid),
             .add => {},
         }
-    }
-    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
-        _ = gpa;
-        return doc.*;
-    }
-    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
-        _ = doc;
-        _ = gpa;
     }
     pub fn encodeOp(op: Op, w: *std.Io.Writer) anyerror!void {
         switch (op) {

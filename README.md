@@ -66,7 +66,9 @@ const MyApp = struct {
         }
     }
 
-    // Required: deep-copy / destroy documents (seed + checkpoints).
+    // Only because this Doc owns heap memory (`entities`): deep-copy /
+    // destroy documents (seed + checkpoints). A plain-data Doc — no pointers
+    // or slices anywhere inside — needs neither; it is copied bitwise.
     pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc { ... }
     pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void { ... }
 

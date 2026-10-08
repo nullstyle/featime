@@ -43,14 +43,6 @@ const Region = struct {
             },
         }
     }
-    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
-        _ = gpa;
-        return doc.*;
-    }
-    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
-        _ = doc;
-        _ = gpa;
-    }
 };
 
 const RegionTimeline = ft.Timeline(Region);
@@ -97,14 +89,6 @@ const Globe = struct {
                 }
             },
         }
-    }
-    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
-        _ = gpa;
-        return doc.*;
-    }
-    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
-        _ = doc;
-        _ = gpa;
     }
 };
 

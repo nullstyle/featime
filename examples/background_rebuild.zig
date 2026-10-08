@@ -30,16 +30,6 @@ const Renderer = struct {
         doc.frame = acc;
         applies += 1;
     }
-
-    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
-        _ = gpa;
-        return doc.*;
-    }
-
-    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
-        _ = doc;
-        _ = gpa;
-    }
 };
 
 const Timeline = ft.Timeline(Renderer);

@@ -29,7 +29,9 @@
 //!     // Required. Applies one feature to the document.
 //!     pub fn apply(op: Op, doc: *Doc, ctx: *ApplyContext) anyerror!void { ... }
 //!
-//!     // Required. Deep-copy / destroy documents (for the seed and checkpoints).
+//!     // Only when Doc owns heap memory (pointers or slices anywhere inside
+//!     // it): deep-copy and destroy documents (seed + checkpoints). A plain-
+//!     // data document is copied bitwise and needs neither.
 //!     pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc { ... }
 //!     pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void { ... }
 //! };
@@ -255,20 +257,62 @@ pub fn validateDomain(comptime Domain: type) void {
         @compileError("Domain.Op must be a tagged union of feature payloads, got " ++ @typeName(Domain.Op));
     if (!@hasDecl(Domain, "apply"))
         @compileError("Domain must declare `pub fn apply(op: Op, doc: *Doc, ctx: *ApplyContext) anyerror!void`");
-    if (!@hasDecl(Domain, "cloneDoc"))
-        @compileError("Domain must declare `pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc`");
-    if (!@hasDecl(Domain, "deinitDoc"))
-        @compileError("Domain must declare `pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void`");
+    // Documents that own references need the copy/destroy pair; plain-data
+    // documents (no pointers or slices anywhere inside) are copied bitwise.
+    if (!@hasDecl(Domain, "cloneDoc") and !isPlainData(Domain.Doc))
+        @compileError("Domain.Doc contains pointers or slices, so Domain must declare `pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc` (a deep copy, for the seed and checkpoints)");
+    if (!@hasDecl(Domain, "deinitDoc") and !isPlainData(Domain.Doc))
+        @compileError("Domain.Doc contains pointers or slices, so Domain must declare `pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void` (frees what cloneDoc allocated)");
 
     // Shapes, not just names: a wrong signature fails here, in one message,
     // instead of deep inside the library's call sites.
     checkHook(Domain, "apply", &.{ Domain.Op, *Domain.Doc, *ApplyContext }, void, .error_union, "fn (op: Op, doc: *Doc, ctx: *ApplyContext) anyerror!void");
-    checkHook(Domain, "cloneDoc", &.{ *const Domain.Doc, std.mem.Allocator }, Domain.Doc, .error_union, "fn (doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc");
-    checkHook(Domain, "deinitDoc", &.{ *Domain.Doc, std.mem.Allocator }, void, .exact, "fn (doc: *Doc, gpa: std.mem.Allocator) void");
+    if (@hasDecl(Domain, "cloneDoc"))
+        checkHook(Domain, "cloneDoc", &.{ *const Domain.Doc, std.mem.Allocator }, Domain.Doc, .error_union, "fn (doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc");
+    if (@hasDecl(Domain, "deinitDoc"))
+        checkHook(Domain, "deinitDoc", &.{ *Domain.Doc, std.mem.Allocator }, void, .exact, "fn (doc: *Doc, gpa: std.mem.Allocator) void");
     if (@hasDecl(Domain, "dependencies"))
         checkHook(Domain, "dependencies", &.{ Domain.Op, *DepCollector }, void, .exact, "fn (op: Op, out: *DepCollector) void");
     if (@hasDecl(Domain, "references"))
         checkHook(Domain, "references", &.{ Domain.Op, *ParamRefCollector }, void, .exact, "fn (op: Op, out: *ParamRefCollector) void");
+}
+
+/// True when a value of `T` can be duplicated with `=` and needs no cleanup:
+/// no pointers, slices, or other references anywhere inside it. Documents of
+/// such types get `cloneDoc` and `deinitDoc` for free.
+pub fn isPlainData(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .int, .float, .bool, .void, .@"enum", .enum_literal, .error_set => true,
+        .array => |a| isPlainData(a.child),
+        .vector => |v| isPlainData(v.child),
+        .optional => |o| isPlainData(o.child),
+        .@"struct" => |s| allPlainData(s.field_types),
+        .@"union" => |u| allPlainData(u.field_types),
+        else => false,
+    };
+}
+
+fn allPlainData(comptime types: []const type) bool {
+    inline for (types) |t| {
+        if (!isPlainData(t)) return false;
+    }
+    return true;
+}
+
+/// Deep-copy a document through the Domain's `cloneDoc`, or bitwise for a
+/// plain-data document that declares none.
+pub fn cloneDoc(comptime Domain: type, doc: *const Domain.Doc, gpa: std.mem.Allocator) anyerror!Domain.Doc {
+    if (comptime @hasDecl(Domain, "cloneDoc")) {
+        return Domain.cloneDoc(doc, gpa);
+    } else {
+        return doc.*;
+    }
+}
+
+/// Destroy a document through the Domain's `deinitDoc`; nothing to do for a
+/// plain-data document that declares none.
+pub fn deinitDoc(comptime Domain: type, doc: *Domain.Doc, gpa: std.mem.Allocator) void {
+    if (comptime @hasDecl(Domain, "deinitDoc")) Domain.deinitDoc(doc, gpa);
 }
 
 pub const ReturnShape = enum { exact, error_union };

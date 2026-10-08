@@ -19,14 +19,6 @@ const Ledger = struct {
             .multiply => |n| doc.total *= n,
         }
     }
-    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
-        _ = gpa;
-        return doc.*;
-    }
-    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
-        _ = doc;
-        _ = gpa;
-    }
     pub fn encodeOp(op: Op, w: *Io.Writer) anyerror!void {
         switch (op) {
             .add => |n| {

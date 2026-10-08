@@ -144,7 +144,7 @@ pub fn Job(comptime Domain: type) type {
                 }
             }
             self.gpa.free(self.features);
-            Domain.deinitDoc(&self.base, self.gpa);
+            ft.deinitDoc(Domain, &self.base, self.gpa);
             self.state = .consumed;
         }
     };
@@ -162,14 +162,6 @@ test "applyRange records soft failures and continues" {
                 .add => |n| doc.value += n,
                 .fail => |msg| return ctx.fail("{s}", .{msg}),
             }
-        }
-        pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
-            _ = gpa;
-            return doc.*;
-        }
-        pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
-            _ = doc;
-            _ = gpa;
         }
     };
 

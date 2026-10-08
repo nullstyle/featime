@@ -52,6 +52,11 @@ All notable changes to featuretree-zig. The format follows
   binary is now `zig-out/bin/featuretree-demo`.
 
 ### Added
+- `cloneDoc` and `deinitDoc` are optional for plain-data documents (no
+  pointers or slices anywhere inside `Doc`): a bitwise copy is a deep copy.
+  `isPlainData(T)`, `cloneDoc(Domain, ...)` and `deinitDoc(Domain, ...)` are
+  public. Documents that own references still must declare both; the error
+  says so in one sentence.
 - The differential oracle now exercises chapters, groups (including
   `moveGroup` and `removeGroupContents`) and parameters, and compares
   anchors and resolved positions after every step.
