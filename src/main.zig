@@ -378,3 +378,9 @@ test "demo domain: dependency move violation is refused" {
 
     try std.testing.expectError(error.DependencyViolation, tl.move(beautify, 0));
 }
+
+// `main` is not analyzed in test builds, so the hierarchical demo's own
+// tests are only reached through an explicit reference here.
+test {
+    _ = @import("nested_demo.zig");
+}

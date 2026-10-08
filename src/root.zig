@@ -219,6 +219,14 @@ pub const Clock = *const fn () u64;
 pub const Config = struct {
     /// Wall clock used to stamp provenance on plain commits (see `Clock`).
     now: ?Clock = null,
+    /// Entropy for this timeline's random id anchor: the start of the shared
+    /// feature/chapter/group/param id counter and the `timeline_id`.
+    /// Replicas must allocate ids from disjoint ranges, so in multi-process
+    /// or multi-machine deployments pass fresh OS randomness per timeline
+    /// (for example 8 bytes from `Io.random`). When null the library mixes
+    /// ASLR'd addresses with a process-local counter: always distinct within
+    /// one process, likely but not guaranteed distinct across processes.
+    id_seed: ?u64 = null,
     /// Write an extra checkpoint every N applied features during a rebuild.
     /// 0 disables interval checkpoints.
     checkpoint_interval: u32 = 256,

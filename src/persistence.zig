@@ -173,8 +173,11 @@ pub fn load(
     var tl = try ft.Timeline(Domain).init(gpa, seed, config);
     errdefer tl.deinit();
 
+    // Loaded ids are foreign to this timeline's fresh id counter and never
+    // move it: `Timeline.allocId` skips ids already present, and the random
+    // start keeps new ids disjoint from those of any other replica that
+    // loads the same file (two replicas must never share a counter).
     const count = try reader.takeInt(u32, .little);
-    var max_id: ft.FeatureId = 0;
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         const id = try reader.takeInt(u64, .little);
@@ -183,10 +186,8 @@ pub fn load(
         defer gpa.free(op_reader.bytes);
         const op = try Domain.decodeOp(&op_reader.reader, gpa);
         try tl.list.append(gpa, .{ .id = id, .op = op, .suppressed = suppressed });
-        if (id > max_id) max_id = id;
     }
     tl.marker_pos = @min(try reader.takeInt(u32, .little), tl.len());
-    if (max_id >= tl.next_id) tl.next_id = max_id +% 1;
     if (v3) {
         const param_count = try reader.takeInt(u32, .little);
         var pm: u32 = 0;
@@ -196,7 +197,6 @@ pub fn load(
             const fr = try framedReader(gpa, reader);
             defer gpa.free(fr.bytes);
             tl.ptab.add(pid, fr.bytes, value) catch {};
-            if (pid >= tl.next_id) tl.next_id = pid +% 1;
         }
     }
 
@@ -222,7 +222,6 @@ pub fn load(
             const fr = try framedReader(gpa, reader);
             defer gpa.free(fr.bytes);
             try tl.ann.addChapter(cid, fr.bytes, .{ .after = if (after_raw == 0) null else after_raw });
-            if (cid >= tl.next_id) tl.next_id = cid +% 1;
         }
 
         const group_count = try reader.takeInt(u32, .little);
@@ -234,7 +233,6 @@ pub fn load(
             const fr = try framedReader(gpa, reader);
             defer gpa.free(fr.bytes);
             try tl.ann.addGroup(gid, fr.bytes, first, last);
-            if (gid >= tl.next_id) tl.next_id = gid +% 1;
         }
 
         const tag_count = try reader.takeInt(u32, .little);

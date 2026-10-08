@@ -194,13 +194,22 @@ ft.sync.deinit(MyApp.Op, gpa, &entry);
 ```
 
 `applyRemote` preserves identity exactly — feature/chapter/group/param ids
-are random-anchored per timeline, replicas share a `timelineId`, and the
-local id counter skips past remote ids — while positions are hints: indices
-are clamped, unknown ids are dropped, duplicate commits are ignored
-(re-delivery is safe). Remote integrations are journaled like local edits
-so undo is uniform, but never re-broadcast: replicas feeding each other
-cannot loop. Two replicas exchanging every entry in a consistent order
-converge; concurrent positional edits are the app's layer
+are random-anchored per timeline (seed the anchor from OS randomness with
+`Config.id_seed` when replicas live in different processes), replicas share
+a `timelineId`, and remote ids never move the local id counter (each
+replica keeps allocating from its own range, so two users committing
+concurrently get distinct ids) — while positions are hints: indices are
+clamped, unknown ids are dropped, duplicate commits are ignored
+(re-delivery is safe). A remote insert at or before your marker shifts it
+by one so the features you were looking at stay in view (a marker at the
+tip follows the tip); a remote insert in the grey future leaves your slider
+alone. Remote integrations are journaled like local edits so undo is
+uniform, but never re-broadcast: replicas feeding each other cannot loop.
+Structural remote entries bump the rebuild generation like local edits, so
+a background job that was in flight is rejected at `integrate` instead of
+being installed over a changed plan. Two replicas exchanging every entry in
+a consistent order converge;
+concurrent positional edits are the app's layer
 (`sync.lastWriterWins(local_meta, remote_meta)` is the provided
 tie-breaker when provenance timestamps exist).
 
@@ -258,7 +267,8 @@ undo boundaries survive memory pressure.
 .{ .checkpoint_interval = 256,  // extra checkpoints every N applied features
    .max_checkpoints     = 4,    // document copies kept (memory knob)
    .checkpoint_on_scrub = true, // snapshot when the marker leaves a position
-   .max_journal         = 1024 } // undo depth; 0 disables
+   .max_journal         = 1024, // undo depth; 0 disables
+   .id_seed             = null } // OS randomness for the id anchor (multi-replica apps)
 ```
 
 Globe-sized documents: raise the interval, lower `max_checkpoints`. The
@@ -352,7 +362,7 @@ tests/oracle.zig   differential tests vs a naive reference model
 
 ## Status & non-goals
 
-v0.6.0 — all four roadmap waves delivered; see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
+v0.6.1 — all four roadmap waves delivered; see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
 feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are

@@ -4,7 +4,7 @@ Consolidated plan for the library's next four waves plus a deferred tail.
 Background on the library's design (Domain contract, seams, threading model)
 lives in README.md; this document only plans forward work.
 
-Current state: v0.2.x — core timeline, checkpoint cache, undo/redo journal,
+Current state: v0.6.1 — all four waves below are delivered, on top of the core timeline, checkpoint cache, undo/redo journal,
 dependency-aware moves, persistence, background rebuilds, hierarchical
 timelines via the reference model.
 

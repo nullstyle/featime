@@ -13,8 +13,9 @@ const annotations = @import("annotations.zig");
 const params = @import("params.zig");
 const syncing = @import("sync.zig");
 
-/// Mixes into feature-id salts so separately created timelines (including in
-/// different processes / peers) are unlikely to assign colliding ids.
+/// Process-local counter mixed into the fallback id-anchor entropy so two
+/// timelines created in one process never share an id range (see
+/// `Config.id_seed` for the multi-process story).
 var init_counter = std.atomic.Value(u64).init(0);
 
 pub fn Timeline(comptime Domain: type) type {
@@ -67,6 +68,9 @@ pub fn Timeline(comptime Domain: type) type {
         /// fresh. `state()` keeps returning the live document pointer.
         broken: ?anyerror = null,
 
+        /// Next id to hand out — see `allocId`. Starts at a random 64-bit
+        /// value per timeline so independently created replicas allocate
+        /// from disjoint ranges; only local allocation ever advances it.
         next_id: ft.FeatureId,
 
         /// Generation counter: bumped by every mutation (structural edits and
@@ -116,9 +120,13 @@ pub fn Timeline(comptime Domain: type) type {
 
         pub fn init(gpa: std.mem.Allocator, seed_doc: Doc, config: ft.Config) !Self {
             const live = try Domain.cloneDoc(&seed_doc, gpa);
-            // Random-looking id start so ids from independently created
-            // timelines (e.g. different peers) are unlikely to collide.
-            var prng = std.Random.DefaultPrng.init(idEntropy(&live));
+            // Random id anchor: independently created timelines (other
+            // peers, other processes) must allocate from disjoint id ranges,
+            // and `allocId` only ever moves the counter forward from here.
+            // `Config.id_seed` carries OS randomness in multi-replica
+            // deployments; the fallback mixes ASLR'd addresses with a
+            // process-local counter (see `idEntropy`).
+            var prng = std.Random.DefaultPrng.init(config.id_seed orelse idEntropy(&live));
             return .{
                 .gpa = gpa,
                 .config = config,
@@ -129,13 +137,21 @@ pub fn Timeline(comptime Domain: type) type {
                 .journal = journaling.Journal(Op).init(gpa, config.max_journal),
                 .ann = annotations.Annotations.init(gpa),
                 .ptab = params.ParamTable.init(gpa),
-                .timeline_id = (prng.random().int(u64) ^ idEntropy(&config)) | 1,
+                .timeline_id = prng.random().int(u64) | 1,
             };
         }
 
-        fn idEntropy(anchor: *const anyopaque) u64 {
+        /// Fallback entropy when `Config.id_seed` is null: a stack address
+        /// (stack ASLR), a code address and a global's address (image
+        /// slide), and a process-local counter. Always distinct within one
+        /// process; across processes it relies on the OS randomizing the
+        /// address space, which is likely but not guaranteed to differ.
+        fn idEntropy(stack_anchor: *const anyopaque) u64 {
             const c = init_counter.fetchAdd(1, .monotonic);
-            return @as(u64, @intFromPtr(anchor)) ^ (c << 32) ^ 0x9E3779B97F4A7C15;
+            const stack: u64 = @intFromPtr(stack_anchor);
+            const code: u64 = @intFromPtr(&idEntropy);
+            const data: u64 = @intFromPtr(&init_counter);
+            return stack ^ std.math.rotl(u64, code, 17) ^ std.math.rotl(u64, data, 41) ^ (c << 32) ^ 0x9E3779B97F4A7C15;
         }
 
         pub fn deinit(self: *Self) void {
@@ -249,8 +265,7 @@ pub fn Timeline(comptime Domain: type) type {
 
         fn commitInner(self: *Self, op: Op, meta: ?ft.Meta) error{OutOfMemory}!ft.FeatureId {
             self.touch();
-            const id = self.next_id;
-            self.next_id +%= 1;
+            const id = self.allocId();
             const at = self.marker_pos;
 
             try self.list.insert(self.gpa, at, .{ .id = id, .op = op });
@@ -441,8 +456,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// Add a named chapter (a slider bookmark) at `mark`. Chapter ids
         /// share the feature id space and are never reused.
         pub fn addChapter(self: *Self, name: []const u8, mark: ft.Mark) error{OutOfMemory}!ft.ChapterId {
-            const cid: ft.ChapterId = self.next_id;
-            self.next_id +%= 1;
+            const cid: ft.ChapterId = self.allocId();
             const entry_name = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(entry_name);
             try self.ann.addChapter(cid, name, mark);
@@ -509,8 +523,7 @@ pub fn Timeline(comptime Domain: type) type {
             const li = self.indexOf(last) orelse return null;
             const lo = @min(fi, li);
             const hi = @max(fi, li);
-            const gid: ft.annotations.GroupId = self.next_id;
-            self.next_id +%= 1;
+            const gid: ft.annotations.GroupId = self.allocId();
             const entry_name = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(entry_name);
             try self.ann.addGroup(gid, name, self.list.items[lo].id, self.list.items[hi].id);
@@ -806,8 +819,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// Add a named numeric parameter and return its stable id. Names are
         /// unique; fails on a duplicate.
         pub fn addParam(self: *Self, name: []const u8, value: f64) error{ OutOfMemory, DuplicateParam }!ft.ParamId {
-            const pid: ft.ParamId = self.next_id;
-            self.next_id +%= 1;
+            const pid: ft.ParamId = self.allocId();
             const entry_name = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(entry_name);
             try self.ptab.add(pid, name, value);
@@ -951,12 +963,16 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         /// Integrate an edit that originated on another replica. Identity is
-        /// exact — feature/chapter/group/param ids are preserved (and the
-        /// local id counter skips past them) — while positions are hints:
-        /// indices are clamped and entries referencing unknown ids are
-        /// silently dropped. The effect is journaled locally (undo works
+        /// exact — feature/chapter/group/param ids are preserved — while
+        /// positions are hints: indices are clamped and entries referencing
+        /// unknown ids are silently dropped. Remote ids never move the local
+        /// id counter (see `allocId`): each replica keeps allocating from its
+        /// own random-anchored range, so concurrent commits on two replicas
+        /// get distinct ids. The effect is journaled locally (undo works
         /// uniformly) but does not fire the record observer, so feeding
-        /// replicas' entries to each other cannot loop.
+        /// replicas' entries to each other cannot loop. Structural remote
+        /// entries bump the rebuild generation exactly like local edits, so
+        /// a background job that was in flight is rejected at `integrate`.
         ///
         /// Two replicas that exchange every entry in a consistent order
         /// converge; concurrent positional edits are the application
@@ -977,7 +993,7 @@ pub fn Timeline(comptime Domain: type) type {
                     if (self.indexOf(e.id) != null) return;
                     const at = @min(e.at, @as(u32, @intCast(self.list.items.len)));
                     self.list.insert(self.gpa, at, .{ .id = e.id, .op = e.op }) catch return;
-                    if (e.id >= self.next_id) self.next_id = e.id +% 1;
+                    self.touch();
                     if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     self.journal.record(.{ .commit = .{
                         .id = e.id,
@@ -985,10 +1001,11 @@ pub fn Timeline(comptime Domain: type) type {
                         .at = at,
                         .meta = e.meta,
                     } });
-                    self.afterInsert(at);
+                    self.afterRemoteInsert(at);
                 },
                 .edit => |e| {
                     const idx = self.indexOf(e.id) orelse return;
+                    self.touch();
                     const old_op = self.list.items[idx].op;
                     self.journal.record(.{ .edit = .{
                         .id = e.id,
@@ -1000,12 +1017,14 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .remove => |e| {
                     if (self.indexOf(e.id) == null) return;
+                    self.touch();
                     self.removeRemote(e.id);
                 },
                 .suppress => |e| {
                     const idx = self.indexOf(e.id) orelse return;
                     const prev_flag = self.list.items[idx].suppressed;
                     if (prev_flag == e.prev) return;
+                    self.touch();
                     self.journal.record(.{ .suppress = .{ .id = e.id, .prev = prev_flag } });
                     self.list.items[idx].suppressed = !e.prev;
                     self.invalidate(idx);
@@ -1016,6 +1035,7 @@ pub fn Timeline(comptime Domain: type) type {
                     const from = self.indexOf(e.id).?;
                     const to = @min(e.to, @as(u32, @intCast(self.list.items.len - 1)));
                     if (from == to) return;
+                    self.touch();
                     self.journal.record(.{ .move = .{
                         .id = e.id,
                         .from = from,
@@ -1052,7 +1072,6 @@ pub fn Timeline(comptime Domain: type) type {
                 .chapter_add => |e| {
                     if (self.ann.chapterById(e.chapter.id) != null) return;
                     self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch return;
-                    if (e.chapter.id >= self.next_id) self.next_id = e.chapter.id +% 1;
                     self.journal.record(.{ .chapter_add = .{ .chapter = .{
                         .id = e.chapter.id,
                         .name = self.gpa.dupe(u8, e.chapter.name) catch return,
@@ -1085,7 +1104,6 @@ pub fn Timeline(comptime Domain: type) type {
                         // (dead anchors) rather than dropping the group.
                     }
                     self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch return;
-                    if (e.group.id >= self.next_id) self.next_id = e.group.id +% 1;
                     self.journal.record(.{ .group_add = .{ .group = .{
                         .id = e.group.id,
                         .name = self.gpa.dupe(u8, e.group.name) catch return,
@@ -1116,7 +1134,6 @@ pub fn Timeline(comptime Domain: type) type {
                 .param_add => |e| {
                     if (self.ptab.byId(e.id) != null) return;
                     self.ptab.add(e.id, e.name, e.value) catch return;
-                    if (e.id >= self.next_id) self.next_id = e.id +% 1;
                     self.journal.record(.{ .param_add = .{
                         .id = e.id,
                         .name = self.gpa.dupe(u8, e.name) catch return,
@@ -1125,6 +1142,7 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .param_remove => |e| {
                     if (self.ptab.byId(e.id) == null) return;
+                    self.touch();
                     _ = self.ptab.remove(e.id);
                     self.journal.record(.{ .param_remove = .{
                         .id = e.id,
@@ -1136,6 +1154,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .param_set => |e| {
                     const old = self.ptab.valueOf(e.id) orelse return;
                     if (old == e.new) return;
+                    self.touch();
                     _ = self.ptab.set(e.id, e.new);
                     self.journal.record(.{ .param_set = .{ .id = e.id, .old = old, .new = e.new } });
                     self.invalidateReferencing(e.id);
@@ -1148,6 +1167,19 @@ pub fn Timeline(comptime Domain: type) type {
                     self.journal.record(.{ .param_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
                 },
             }
+        }
+
+        /// Bookkeeping after a *remote* feature lands at `at`. Unlike a local
+        /// commit, the local marker is not moved onto the new feature: it
+        /// shifts by one only when the insert happened at or before it, so
+        /// the features the local user was looking at stay in view and a
+        /// marker at the tip follows the tip. A remote insert in the grey
+        /// future leaves the slider alone. The rebuild happens lazily.
+        fn afterRemoteInsert(self: *Self, at: u32) void {
+            self.cps.noteMutation(at);
+            self.resetStatuses(at + 1);
+            if (at <= self.marker_pos) self.marker_pos += 1;
+            if (at < self.built_pos) self.live_stale = true;
         }
 
         /// Remote removal: same snapshot flow as a local remove, journaled
@@ -1537,7 +1569,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// cancelled, or failed — a failed-but-fresh job marks the timeline
         /// broken, exactly like a synchronous rebuild.
         pub fn integrate(self: *Self, job: *ft.rebuild.Job(Domain)) bool {
-            if (job.generation != self.gen) {
+            if (job.generation != self.gen or !self.jobMatchesList(job)) {
                 job.deinit();
                 return false;
             }
@@ -1576,6 +1608,43 @@ pub fn Timeline(comptime Domain: type) type {
 
         fn touch(self: *Self) void {
             self.gen += 1;
+        }
+
+        /// Belt and braces for `integrate`: the job's private feature copy
+        /// must still mirror the live list over the range it computed, or
+        /// its statuses would land on the wrong features (or past the end).
+        /// Every mutation path bumps the generation, which `integrate`
+        /// checks first; this guard turns any future gap into a rejected
+        /// job instead of corrupted state.
+        fn jobMatchesList(self: *const Self, job: *const ft.rebuild.Job(Domain)) bool {
+            if (job.features.len != self.list.items.len) return false;
+            if (job.target > self.list.items.len) return false;
+            for (job.features[0..job.target], self.list.items[0..job.target]) |jf, lf| {
+                if (jf.id != lf.id) return false;
+            }
+            return true;
+        }
+
+        /// Hand out the next id from this timeline's random-anchored counter.
+        /// Features, chapters, groups, and parameters share the space. Ids
+        /// already present locally — including ones that arrived through
+        /// `applyRemote` or `persistence.load` — are skipped, and 0 is
+        /// reserved (chapter marks encode "end-pinned" as 0). Foreign ids
+        /// never *advance* the counter: if they did, two replicas would hold
+        /// identical counters after a single exchange and their next
+        /// concurrent commits would collide.
+        fn allocId(self: *Self) u64 {
+            while (self.next_id == 0 or self.idInUse(self.next_id)) self.next_id +%= 1;
+            const id = self.next_id;
+            self.next_id +%= 1;
+            return id;
+        }
+
+        fn idInUse(self: *const Self, id: u64) bool {
+            return self.indexOf(id) != null or
+                self.ann.chapterById(id) != null or
+                self.ann.groupById(id) != null or
+                self.ptab.byId(id) != null;
         }
 
         fn indexOf(self: *const Self, id: ft.FeatureId) ?u32 {
@@ -3267,7 +3336,162 @@ test "sync: remote edits undo locally as normal units" {
     try std.testing.expectEqual(@as(i64, 1), tl.state().value);
     try std.testing.expect(tl.redo());
     try std.testing.expectEqual(@as(i64, 11), tl.state().value);
-    // The id counter skips past the remote id.
+    // A fresh local id never collides with the remote one, and the remote id
+    // did not move the local counter (see allocId).
     const fresh = try tl.commit(.{ .add = 1 });
-    try std.testing.expect(fresh > 4242);
+    try std.testing.expect(fresh != 4242);
+    var seen: usize = 0;
+    var it = tl.features();
+    while (it.next()) |f| {
+        if (f.id == fresh) seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen);
+}
+
+test "ids: local allocation skips ids already present and never re-issues a foreign id" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    // Park the local counter just below a foreign id, then integrate it.
+    tl.next_id = 999;
+    tl.applyRemote(&.{ .commit = .{ .id = 1000, .op = .{ .add = 1 }, .at = 0, .meta = null } });
+    try std.testing.expectEqual(@as(u64, 999), tl.next_id); // foreign ids do not move the counter
+
+    const x = try tl.commit(.{ .add = 2 });
+    const y = try tl.commit(.{ .add = 3 });
+    try std.testing.expectEqual(@as(u64, 999), x);
+    try std.testing.expectEqual(@as(u64, 1001), y); // 1000 is taken, skipped
+    const chapter = try tl.addChapter("c", .{ .after = null });
+    try std.testing.expectEqual(@as(u64, 1002), chapter); // one shared id space
+
+    // 0 is reserved (chapter marks use it for "end-pinned").
+    tl.next_id = 0;
+    const z = try tl.commit(.{ .add = 4 });
+    try std.testing.expect(z != 0);
+}
+
+test "sync: concurrent commits after a round trip get distinct ids and both survive" {
+    const gpa = std.testing.allocator;
+    var alice = try SyncTl.init(gpa, .{}, .{});
+    defer alice.deinit();
+    var bob = try SyncTl.init(gpa, .{}, .{});
+    defer bob.deinit();
+    var out_a = Outbox{ .gpa = gpa };
+    defer out_a.deinit();
+    var out_b = Outbox{ .gpa = gpa };
+    defer out_b.deinit();
+    alice.setRecordObserver(.{ .ctx = &out_a, .func = Outbox.observe });
+    bob.setRecordObserver(.{ .ctx = &out_b, .func = Outbox.observe });
+
+    // One round trip. (This used to leave both replicas with the same
+    // id counter, so the next concurrent commits collided and were dropped
+    // as duplicates — silent divergence.)
+    _ = try alice.commit(.{ .add = 1 });
+    try out_a.feed(&bob);
+    _ = try bob.commit(.{ .add = 2 });
+    try out_b.feed(&alice);
+    try std.testing.expectEqual(alice.state().value, bob.state().value);
+
+    // Both users commit before the next sync.
+    const a_id = try alice.commit(.{ .add = 100 });
+    const b_id = try bob.commit(.{ .add = 200 });
+    try std.testing.expect(a_id != b_id);
+
+    try out_a.feed(&bob);
+    try out_b.feed(&alice);
+    try std.testing.expectEqual(@as(u32, 4), alice.len());
+    try std.testing.expectEqual(@as(u32, 4), bob.len());
+    try std.testing.expect(alice.featureById(b_id) != null);
+    try std.testing.expect(bob.featureById(a_id) != null);
+    // Commutative ops: identical documents even though the two concurrent
+    // inserts landed in opposite positional order (ordering concurrent
+    // positional edits is the application's layer, as documented).
+    try std.testing.expectEqual(@as(i64, 303), alice.state().value);
+    try std.testing.expectEqual(@as(i64, 303), bob.state().value);
+}
+
+test "sync: a remote commit landing during a background job makes the job stale" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    const a = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    tl.edit(a, .{ .add = 5 }); // dirty: the job will compute [5, 2]
+    var job = try tl.beginRebuild();
+    defer job.deinit();
+
+    tl.applyRemote(&.{ .commit = .{ .id = 4242, .op = .{ .add = 100 }, .at = 0, .meta = null } });
+    job.run();
+    try std.testing.expect(!tl.integrate(&job)); // the plan changed under the job
+    try std.testing.expect(tl.dirty());
+
+    // The insert landed before the marker, so the marker shifted with its
+    // features (2 -> 3) and the document is [100, 5, 2].
+    try std.testing.expectEqual(@as(u32, 3), tl.marker());
+    try std.testing.expectEqual(@as(i64, 107), tl.state().value);
+}
+
+test "sync: a remote remove landing during a background job is rejected, not a crash" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    const a = try tl.commit(.{ .add = 1 });
+    const b = try tl.commit(.{ .add = 2 });
+    tl.edit(a, .{ .add = 5 });
+    var job = try tl.beginRebuild(); // plan: 2 features
+    defer job.deinit();
+
+    tl.applyRemote(&.{ .remove = .{ .id = b, .op = .{ .add = 2 }, .at = 1, .suppressed = false, .marker_pre = 2 } });
+    try std.testing.expectEqual(@as(u32, 1), tl.len());
+    job.run();
+    try std.testing.expect(!tl.integrate(&job)); // used to index past the end of the list
+    try std.testing.expectEqual(@as(i64, 5), tl.state().value);
+}
+
+test "integrate: the feature-list guard rejects a mismatched job even if the generation matches" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    const a = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    tl.edit(a, .{ .add = 5 });
+    var job = try tl.beginRebuild();
+    defer job.deinit();
+
+    tl.applyRemote(&.{ .commit = .{ .id = 4242, .op = .{ .add = 100 }, .at = 0, .meta = null } });
+    tl.gen = job.generation; // simulate a mutation path that forgot to bump the generation
+    job.run();
+    try std.testing.expect(!tl.integrate(&job));
+    try std.testing.expect(tl.dirty());
+    try std.testing.expectEqual(@as(i64, 107), tl.state().value);
+}
+
+test "sync: a remote insert moves the local marker only when it lands at or before it" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = try tl.commit(.{ .add = 3 });
+
+    // Scrubbed back to the empty document: an insert in the grey future
+    // must not yank the slider.
+    tl.setMarker(0);
+    tl.applyRemote(&.{ .commit = .{ .id = 7001, .op = .{ .add = 10 }, .at = 3, .meta = null } });
+    try std.testing.expectEqual(@as(u32, 0), tl.marker());
+    try std.testing.expectEqual(@as(i64, 0), tl.state().value);
+
+    // Looking at [1]: an insert before the marker keeps those features in
+    // view, so the marker shifts by one and the new feature is visible.
+    tl.setMarker(1);
+    tl.applyRemote(&.{ .commit = .{ .id = 7002, .op = .{ .add = 100 }, .at = 0, .meta = null } });
+    try std.testing.expectEqual(@as(u32, 2), tl.marker());
+    try std.testing.expectEqual(@as(i64, 101), tl.state().value);
+
+    // At the tip: the tip follows.
+    tl.setMarker(tl.len());
+    tl.applyRemote(&.{ .commit = .{ .id = 7003, .op = .{ .add = 1000 }, .at = 5, .meta = null } });
+    try std.testing.expectEqual(tl.len(), tl.marker());
+    try std.testing.expectEqual(@as(i64, 1116), tl.state().value);
 }

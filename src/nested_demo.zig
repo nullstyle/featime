@@ -206,10 +206,11 @@ test "occurrence merges region state; refresh picks up changes" {
     globe.refresh(occurrence);
     try std.testing.expectEqual(@as(u32, 7), globe.state().region_trees);
 
-    // Scrubbing the region marker changes what the occurrence reads.
+    // Scrubbing the region marker changes what the occurrence reads: at
+    // marker 1 only the first planting (3 trees) is applied.
     region.setMarker(1);
     globe.refresh(occurrence);
-    try std.testing.expectEqual(@as(u32, 0), globe.state().region_trees);
+    try std.testing.expectEqual(@as(u32, 3), globe.state().region_trees);
 
     // Suppressing the occurrence removes the merge entirely.
     region.setMarker(region.len());
