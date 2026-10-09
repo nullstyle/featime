@@ -1,0 +1,2 @@
+# Keep LF everywhere: zig fmt --check on Windows rejects CRLF checkouts.
+* text=auto eol=lf
