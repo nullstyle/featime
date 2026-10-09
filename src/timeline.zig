@@ -47,6 +47,12 @@ pub fn Timeline(comptime Domain: type) type {
 
         list: std.ArrayList(Feature) = .empty,
 
+        /// Id → index, kept in sync by every list mutation (`listInsert`,
+        /// `listRemove`, `rawMove`, `rebuildIndex`), so `indexOf`,
+        /// `featureById` and the id-uniqueness check in `allocId` are O(1)
+        /// instead of a scan of the whole feature list.
+        index: std.AutoHashMapUnmanaged(ft.FeatureId, u32) = .empty,
+
         /// Pristine seed document (position 0, before any feature).
         seed_doc: Doc,
         /// The visible document: the seed with `features[0..built_pos]`
@@ -162,6 +168,7 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn deinit(self: *Self) void {
             self.resetStatuses(0);
             self.list.deinit(self.gpa);
+            self.index.deinit(self.gpa);
             self.cps.deinit();
             self.journal.deinit();
             self.ann.deinit();
@@ -278,7 +285,7 @@ pub fn Timeline(comptime Domain: type) type {
             const id = self.allocId();
             const at = self.marker_pos;
 
-            try self.list.insert(self.gpa, at, .{ .id = id, .op = op });
+            try self.listInsert(at, .{ .id = id, .op = op });
             self.record(.{ .commit = .{ .id = id, .op = op, .at = at, .meta = meta } });
             if (meta) |m| self.ann.setProvenance(id, m) catch {};
             if (meta != null) self.annTouch();
@@ -369,7 +376,7 @@ pub fn Timeline(comptime Domain: type) type {
             self.ann.removeFeature(id);
             self.annTouch();
             self.resetStatuses(idx);
-            _ = self.list.orderedRemove(idx);
+            _ = self.listRemove(idx);
             if (idx < self.marker_pos) self.marker_pos -= 1;
             self.invalidate(idx);
         }
@@ -837,6 +844,7 @@ pub fn Timeline(comptime Domain: type) type {
             const feature = self.list.orderedRemove(from);
             // Capacity is unchanged by the removal, so this cannot fail.
             self.list.insert(self.gpa, to, feature) catch unreachable;
+            self.reindexRange(@min(from, to), @max(from, to));
             // The marker counts applied features: adjust when the feature
             // crosses the applied/unapplied boundary.
             if (from < self.marker_pos and to >= self.marker_pos) {
@@ -1039,7 +1047,7 @@ pub fn Timeline(comptime Domain: type) type {
                     // commit whose id already exists here was integrated.
                     if (self.indexOf(e.id) != null) return;
                     const at = @min(e.at, @as(u32, @intCast(self.list.items.len)));
-                    self.list.insert(self.gpa, at, .{ .id = e.id, .op = e.op }) catch return;
+                    self.listInsert(at, .{ .id = e.id, .op = e.op }) catch return;
                     self.touch();
                     if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     self.journal.record(.{ .commit = .{
@@ -1391,7 +1399,7 @@ pub fn Timeline(comptime Domain: type) type {
                     if (self.ann.takeName(e.id)) |n| self.gpa.free(n);
                     _ = self.ann.removeProvenance(e.id);
                     self.resetStatuses(idx);
-                    _ = self.list.orderedRemove(idx);
+                    _ = self.listRemove(idx);
                     self.marker_pos = e.at;
                     self.invalidate(idx);
                     self.annTouch();
@@ -1402,7 +1410,7 @@ pub fn Timeline(comptime Domain: type) type {
                     self.invalidate(idx);
                 },
                 .remove => |e| {
-                    self.list.insert(self.gpa, e.at, .{
+                    self.listInsert(e.at, .{
                         .id = e.id,
                         .op = e.op,
                         .suppressed = e.suppressed,
@@ -1501,7 +1509,7 @@ pub fn Timeline(comptime Domain: type) type {
         fn forward(self: *Self, entry: journaling.Journal(Op).Entry) void {
             switch (entry) {
                 .commit => |e| {
-                    self.list.insert(self.gpa, e.at, .{ .id = e.id, .op = e.op }) catch return;
+                    self.listInsert(e.at, .{ .id = e.id, .op = e.op }) catch return;
                     self.afterInsert(e.at);
                     if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     if (e.meta != null) self.annTouch();
@@ -1522,7 +1530,7 @@ pub fn Timeline(comptime Domain: type) type {
                     self.ann.applyGroupFixesForward(e.group_fixes);
                     self.ann.removeFeature(e.id); // frees name/tags
                     self.resetStatuses(idx);
-                    _ = self.list.orderedRemove(idx);
+                    _ = self.listRemove(idx);
                     self.marker_pos = if (e.at < e.marker_pre) e.marker_pre - 1 else e.marker_pre;
                     self.invalidate(idx);
                     self.annTouch();
@@ -1825,10 +1833,45 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         fn indexOf(self: *const Self, id: ft.FeatureId) ?u32 {
-            for (self.list.items, 0..) |f, i| {
-                if (f.id == id) return @intCast(i);
+            return self.index.get(id);
+        }
+
+        /// Insert into the feature list, keeping the id index in sync. The
+        /// index slot is reserved first so a failure leaves both untouched.
+        fn listInsert(self: *Self, at: u32, feature: Feature) error{OutOfMemory}!void {
+            try self.index.ensureUnusedCapacity(self.gpa, 1);
+            try self.list.insert(self.gpa, at, feature);
+            self.reindexRange(at, @intCast(self.list.items.len - 1));
+        }
+
+        /// Remove from the feature list, keeping the id index in sync.
+        fn listRemove(self: *Self, idx: u32) Feature {
+            const removed = self.list.orderedRemove(idx);
+            _ = self.index.remove(removed.id);
+            if (idx < self.list.items.len) self.reindexRange(idx, @intCast(self.list.items.len - 1));
+            return removed;
+        }
+
+        /// Re-record the positions of `list[lo..=hi]`. Every id already has
+        /// a slot except at most one fresh id reserved by `listInsert`.
+        fn reindexRange(self: *Self, lo: u32, hi: u32) void {
+            var i: u32 = lo;
+            while (i <= hi) : (i += 1) {
+                const id = self.list.items[i].id;
+                if (self.index.getPtr(id)) |slot| {
+                    slot.* = i;
+                } else {
+                    self.index.putAssumeCapacity(id, i);
+                }
             }
-            return null;
+        }
+
+        /// Rebuild the id index from the feature list. Internal: used by
+        /// `persistence.load`, which fills the list directly.
+        pub fn rebuildIndex(self: *Self) error{OutOfMemory}!void {
+            self.index.clearRetainingCapacity();
+            try self.index.ensureTotalCapacity(self.gpa, @intCast(self.list.items.len));
+            if (self.list.items.len > 0) self.reindexRange(0, @intCast(self.list.items.len - 1));
         }
 
         /// Drop recorded statuses (freeing failure messages) for features from
@@ -4042,4 +4085,69 @@ test "allocators: without doc_allocator everything stays on the gpa" {
     try std.testing.expectEqual(gpa.ptr, tl.docAllocator().ptr);
     _ = try tl.commit(.{ .push = 1 });
     try std.testing.expectEqual(@as(usize, 1), tl.state().items.items.len);
+}
+
+fn idAtSync(tl: *SyncTl, idx: u32) ft.FeatureId {
+    var it = tl.features();
+    var i: u32 = 0;
+    while (it.next()) |f| : (i += 1) {
+        if (i == idx) return f.id;
+    }
+    unreachable;
+}
+
+fn checkIndex(tl: *SyncTl) !void {
+    try std.testing.expectEqual(tl.len(), tl.index.count());
+    var it = tl.features();
+    var i: u32 = 0;
+    while (it.next()) |f| : (i += 1) {
+        try std.testing.expectEqual(i, tl.indexOf(f.id).?);
+    }
+}
+
+test "index: id lookups stay exact across inserts, removes, moves, undo/redo and load" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    var i: u32 = 0;
+    while (i < 30) : (i += 1) _ = try tl.commit(.{ .add = @intCast(i) });
+    try checkIndex(&tl);
+
+    tl.setMarker(10);
+    _ = try tl.commit(.{ .add = 100 }); // mid-history insert shifts the suffix
+    try checkIndex(&tl);
+    try tl.remove(idAtSync(&tl, 5));
+    try checkIndex(&tl);
+    try tl.move(idAtSync(&tl, 20), 2);
+    try checkIndex(&tl);
+    try tl.move(idAtSync(&tl, 3), 25);
+    try checkIndex(&tl);
+    const g = try tl.addGroup("g", idAtSync(&tl, 8), idAtSync(&tl, 12));
+    try tl.moveGroup(g, 0);
+    try checkIndex(&tl);
+    try tl.removeGroupContents(g);
+    try checkIndex(&tl);
+    tl.applyRemote(&.{ .commit = .{ .id = 7777, .op = .{ .add = 1 }, .at = 3, .meta = null } });
+    try checkIndex(&tl);
+    try std.testing.expectEqual(@as(u32, 3), tl.indexOf(7777).?);
+
+    var k: u32 = 0;
+    while (k < 7) : (k += 1) {
+        try std.testing.expect(tl.undo());
+        try checkIndex(&tl);
+    }
+    while (k > 0) : (k -= 1) {
+        try std.testing.expect(tl.redo());
+        try checkIndex(&tl);
+    }
+
+    // Loading rebuilds the index from the file.
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try save_persistence_shim(&tl, gpa, &aw.writer);
+    var reader = std.Io.Reader.fixed(aw.written());
+    var loaded = try load_persistence_shim(gpa, &reader);
+    defer loaded.deinit();
+    try checkIndex(&loaded);
+    try std.testing.expectEqual(tl.len(), loaded.len());
 }

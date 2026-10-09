@@ -1,9 +1,31 @@
 # Benchmark baseline
 
-`zig build bench`, 2026-10-09, version 0.9.0, ReleaseFast, single thread,
-Apple Silicon laptop (`uname -m` arm64), Zig 0.17.0. Document: 64x64 f32
-heightmap (16 KiB, plain data). Default `Config` (checkpoint interval 256,
-4 checkpoints, journal 1024).
+`zig build bench`, ReleaseFast, single thread, Apple Silicon laptop
+(`uname -m` arm64), Zig 0.17.0. Document: 64x64 f32 heightmap (16 KiB,
+plain data). Default `Config` (checkpoint interval 256, 4 checkpoints,
+journal 1024).
+
+## 0.9.1 (2026-10-09): id-to-index map, journal as a deque
+
+| Operation | 1k | 10k | 100k |
+|-----------|---:|----:|-----:|
+| commit at tip (per feature) | 179 ns | 85 ns | 67 ns |
+| edit first + full replay | 0.02 ms | 0.7 ms | 45 ms |
+| edit middle + suffix replay | 0.01 ms | 0.7 ms | 33 ms |
+| scrub to middle | 0.01 ms | 0.24 ms | 8.7 ms |
+| scrub back to tip (snapshot) | 0.01 ms | 0.03 ms | 0.2 ms |
+| featureById (per lookup) | 9 ns | 17 ns | 29 ns |
+| undo middle edit + replay | 0.008 ms | 0.46 ms | 24 ms |
+| remove middle + replay | 0.014 ms | 0.67 ms | 33 ms |
+| commit mid-history | 0.006 ms | 0.05 ms | 0.8 ms |
+| save / load (lazy) | 0.08 / 0.07 ms | 0.49 / 0.46 ms | 3.8 / 3.6 ms |
+| peak live memory | 0.5 MiB | 2.6 MiB | 18.4 MiB |
+
+Commits and lookups no longer scale with the feature count: 100k commits
+take 6.7 ms instead of 2.2 s. The index costs about 2 MiB at 100k
+features. Replays are unchanged.
+
+## 0.9.0 (2026-10-09): before
 
 | Operation | 1k | 10k | 100k |
 |-----------|---:|----:|-----:|

@@ -3,13 +3,23 @@
 All notable changes to featuretree-zig. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
-## Unreleased
+## 0.9.1 — 2026-10-09
+
+### Changed
+- Id lookups are O(1): an id-to-index map is kept in sync by every feature
+  list mutation, so `featureById`, dependency validation and the
+  id-uniqueness check in every `commit` no longer scan the feature list. At
+  100k features a commit at the tip went from 22 µs to 67 ns and a lookup
+  from 19.5 µs to 29 ns.
+- The undo journal is a lazily compacted deque: evicting old units when the
+  journal is full no longer shifts the whole array on every record.
+- `Timeline.rebuildIndex()` is public for `persistence.load` (internal).
 
 ### Added
 - Benchmark suite: `zig build bench` (always ReleaseFast; `-Dbench-max=N`)
   measures commits, replays, scrubbing, lookups, undo/redo, removal and
   save/load at 1k / 10k / 100k features; `bench/BASELINE.md` records the
-  baseline. CI runs it at 10k as a smoke test.
+  numbers before and after. CI runs it at 10k as a smoke test.
 
 ## 0.9.0 — 2026-10-09
 

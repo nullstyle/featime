@@ -493,7 +493,7 @@ bench/bench.zig    benchmark suite (zig build bench); BASELINE.md has the number
 
 ## Status & non-goals
 
-v0.9.0 — all four roadmap waves plus the deferred tail delivered (minus disk-backed checkpoints); see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
+v0.9.1 — all four roadmap waves plus the deferred tail delivered (minus disk-backed checkpoints); see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
 feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are

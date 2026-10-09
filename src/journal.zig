@@ -11,6 +11,11 @@
 //! recording truncates it (standard editor semantics) and eviction below
 //! `max` removes whole units only, preserving that invariant.
 //!
+//! Storage is a deque on an array list: evicted records are retired by
+//! advancing `start` (O(1)) and the dead prefix is compacted away only once
+//! it reaches half the array, so a full journal costs amortized O(1) per
+//! record instead of a memmove of the whole journal.
+//!
 //! Entries carry owned strings (annotation names, tags); the journal owns
 //! them for the entry's lifetime and frees them at truncation, eviction,
 //! and deinit. Handlers receive entries by value and treat string fields as
@@ -115,7 +120,7 @@ pub fn Journal(comptime Op: type) type {
             n: u32 = 0,
 
             pub fn next(it: *UnitIter) ?Unit {
-                const items = it.j.entries.items;
+                const items = it.j.live();
                 if (it.i >= items.len) return null;
                 const start = it.i;
                 var end = start + 1;
@@ -161,6 +166,10 @@ pub fn Journal(comptime Op: type) type {
         /// Stamps records; null leaves `ts` at 0.
         clock: ?ft.Clock = null,
         entries: std.ArrayList(Record) = .empty,
+        /// Physical index of logical record 0 (retired records sit before it
+        /// until the next compaction).
+        start: usize = 0,
+        /// Logical index: `live()[0..head]` undoable, `live()[head..]` redoable.
         head: usize = 0,
 
         /// Open explicit-transaction depth. The first record after the
@@ -175,9 +184,25 @@ pub fn Journal(comptime Op: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.entries.items) |*r| self.deinitRecord(r);
+            for (self.live()) |*r| self.deinitRecord(r);
             self.entries.deinit(self.gpa);
             if (self.txn_label) |l| self.gpa.free(l);
+        }
+
+        /// The logical journal: every record not yet retired.
+        fn live(self: *const Self) []Record {
+            return self.entries.items[self.start..];
+        }
+
+        /// Retire `n` records from the front (already deinitialized) and
+        /// compact the array once the dead prefix reaches half of it.
+        fn retireFront(self: *Self, n: usize) void {
+            self.start += n;
+            self.head -= n;
+            if (self.start >= 32 and self.start * 2 >= self.entries.items.len) {
+                self.entries.replaceRange(self.gpa, 0, self.start, &.{}) catch return;
+                self.start = 0;
+            }
         }
 
         fn deinitRecord(self: *Self, r: *const Record) void {
@@ -279,8 +304,8 @@ pub fn Journal(comptime Op: type) type {
             }
             self.txn_pending = false; // the boundary rides on the first record
 
-            for (self.entries.items[self.head..]) |*r| self.deinitRecord(r);
-            self.entries.shrinkRetainingCapacity(self.head);
+            for (self.live()[self.head..]) |*r| self.deinitRecord(r);
+            self.entries.shrinkRetainingCapacity(self.start + self.head);
             const ts: u64 = if (self.clock) |now| now() else 0;
             self.entries.append(self.gpa, .{ .e = entry, .txn_start = starts_unit, .ts = ts, .label = label }) catch {
                 // Out of memory: drop history rather than keep a journal
@@ -288,8 +313,9 @@ pub fn Journal(comptime Op: type) type {
                 var dead = entry;
                 self.deinitEntry(&dead);
                 if (label) |l| self.gpa.free(l);
-                for (self.entries.items) |*r| self.deinitRecord(r);
+                for (self.live()) |*r| self.deinitRecord(r);
                 self.entries.clearRetainingCapacity();
+                self.start = 0;
                 self.head = 0;
                 return;
             };
@@ -302,17 +328,17 @@ pub fn Journal(comptime Op: type) type {
         /// invariant that `head` (and index 0, when non-empty) always sit on
         /// a transaction boundary.
         fn evictWholeUnits(self: *Self) void {
+            const items = self.live();
             var cut: usize = 0;
-            while (self.entries.items.len - cut > self.max) {
+            while (items.len - cut > self.max) {
                 var next = cut + 1;
-                while (next < self.entries.items.len and !self.entries.items[next].txn_start) next += 1;
-                if (next >= self.entries.items.len) break; // one giant unit
-                for (self.entries.items[cut..next]) |*r| self.deinitRecord(r);
+                while (next < items.len and !items[next].txn_start) next += 1;
+                if (next >= items.len) break; // one giant unit
+                for (items[cut..next]) |*r| self.deinitRecord(r);
                 cut = next;
             }
             if (cut == 0) return;
-            self.entries.replaceRange(self.gpa, 0, cut, &.{}) catch return;
-            self.head -|= cut;
+            self.retireFront(cut);
         }
 
         // -- introspection / memory pressure -----------------------------------
@@ -323,13 +349,13 @@ pub fn Journal(comptime Op: type) type {
         }
 
         pub fn entryCount(self: *const Self) u32 {
-            return @intCast(self.entries.items.len);
+            return @intCast(self.live().len);
         }
 
         /// Number of units that `undo` can unwind.
         pub fn undoDepth(self: *const Self) u32 {
             var n: u32 = 0;
-            for (self.entries.items[0..self.head]) |r| {
+            for (self.live()[0..self.head]) |r| {
                 if (r.txn_start) n += 1;
             }
             return n;
@@ -338,7 +364,7 @@ pub fn Journal(comptime Op: type) type {
         /// Number of units that `redo` can replay.
         pub fn redoDepth(self: *const Self) u32 {
             var n: u32 = 0;
-            for (self.entries.items[self.head..]) |r| {
+            for (self.live()[self.head..]) |r| {
                 if (r.txn_start) n += 1;
             }
             return n;
@@ -349,11 +375,11 @@ pub fn Journal(comptime Op: type) type {
         pub fn trimUndo(self: *Self, keep: u32) u32 {
             var dropped: u32 = 0;
             while (self.undoDepth() > keep) {
+                const items = self.live();
                 var next: usize = 1;
-                while (next < self.head and !self.entries.items[next].txn_start) next += 1;
-                for (self.entries.items[0..next]) |*r| self.deinitRecord(r);
-                self.entries.replaceRange(self.gpa, 0, next, &.{}) catch return dropped;
-                self.head -= next;
+                while (next < self.head and !items[next].txn_start) next += 1;
+                for (items[0..next]) |*r| self.deinitRecord(r);
+                self.retireFront(next);
                 dropped += @intCast(next);
             }
             return dropped;
@@ -361,9 +387,10 @@ pub fn Journal(comptime Op: type) type {
 
         /// Drop everything that `redo` could replay. Returns entries dropped.
         pub fn dropRedo(self: *Self) u32 {
-            const n: u32 = @intCast(self.entries.items.len - self.head);
-            for (self.entries.items[self.head..]) |*r| self.deinitRecord(r);
-            self.entries.shrinkRetainingCapacity(self.head);
+            const items = self.live();
+            const n: u32 = @intCast(items.len - self.head);
+            for (items[self.head..]) |*r| self.deinitRecord(r);
+            self.entries.shrinkRetainingCapacity(self.start + self.head);
             return n;
         }
 
@@ -374,7 +401,7 @@ pub fn Journal(comptime Op: type) type {
         }
 
         pub fn canRedo(self: *const Self) bool {
-            return self.head < self.entries.items.len;
+            return self.head < self.live().len;
         }
 
         /// Yield the next entry of the undoable unit, newest-first. The
@@ -383,7 +410,7 @@ pub fn Journal(comptime Op: type) type {
         pub fn nextUndo(self: *Self) ?UndoStep {
             if (self.head == 0) return null;
             self.head -= 1;
-            const rec = self.entries.items[self.head];
+            const rec = self.live()[self.head];
             return .{ .entry = rec.e, .unit_done = rec.txn_start };
         }
 
@@ -391,11 +418,11 @@ pub fn Journal(comptime Op: type) type {
         /// redo region always begins on a boundary; `unit_done` flags the
         /// unit's newest entry.
         pub fn nextRedo(self: *Self) ?RedoStep {
-            if (self.head >= self.entries.items.len) return null;
-            const rec = self.entries.items[self.head];
+            const items = self.live();
+            if (self.head >= items.len) return null;
+            const rec = items[self.head];
             self.head += 1;
-            const done = self.head >= self.entries.items.len or
-                self.entries.items[self.head].txn_start;
+            const done = self.head >= items.len or items[self.head].txn_start;
             return .{ .entry = rec.e, .unit_done = done };
         }
     };

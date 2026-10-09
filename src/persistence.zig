@@ -323,6 +323,7 @@ pub fn load(
         const op = try decodeOpVersioned(Domain, stored_format, &op_reader.reader, gpa);
         try tl.list.append(gpa, .{ .id = id, .op = op, .suppressed = suppressed });
     }
+    try tl.rebuildIndex();
     tl.marker_pos = @min(try reader.takeInt(u32, .little), tl.len());
     if (has_params) {
         const param_count = try reader.takeInt(u32, .little);
