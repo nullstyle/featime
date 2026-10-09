@@ -225,6 +225,16 @@ for byte budgets. Pull when real usage shows mid-history edits dominating.
    whole question — and it belongs where document size and churn are known,
    in the application. Building the arena into the library stays parked.
 
+## Open decision: references to other timelines
+
+`docs/timeline-references.md` compares four options (live links with
+library-tracked staleness, pinned references with `viewAt`, snapshots
+stored beside the feature, embedded sub-timelines — rejected) across
+identity, reading, invalidation, determinism, cycles, threads,
+persistence, sync, undo and memory. Recommendation there: live links
+first, then pins; snapshots only if containers must load alone or jobs
+must run while children are edited. Nothing is built yet.
+
 ## Standing non-goals
 
 Merge/OT/CRDT, branching timelines with merge semantics, parallel feature
