@@ -11,7 +11,9 @@ pub fn main(init: std.process.Init) !void {
     const out = &file_writer.interface;
     defer out.flush() catch {};
 
-    var args = init.minimal.args.iterate();
+    // `iterateAllocator` works on every target; plain `iterate` refuses Windows.
+    var args = try init.minimal.args.iterateAllocator(gpa);
+    defer args.deinit();
     _ = args.next();
     const cwd = std.Io.Dir.cwd();
     var script: []const u8 = world.tour;
