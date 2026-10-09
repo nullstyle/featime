@@ -37,6 +37,9 @@ Requires Zig `0.17.0` (pinned via `mise`).
 | Save / open a document | `persistence.save` / `load` |
 | Recompute off the UI thread | `beginRebuild()` / `job.run()` / `integrate()` |
 | Assemblies with component timelines | one `Timeline` per subresource + `setEnv` / `refresh` (see below) |
+| History panel ("Undo Smooth terrain") | `history()` units with kind, label, timestamp; `beginLabeledTransaction` |
+| Save a copy / branch a design | `persistence.savePrefix` + `cherryPick` |
+| Open a file from an older version | `Domain.format_version` + `migrateOp` / `migrateDoc` |
 
 ## Quick start
 
@@ -117,6 +120,9 @@ zig build caching               # apply-counted tour of the checkpoint cache
 zig build persistence_roundtrip # save/load with app-written codecs
 zig build background_rebuild    # worker-thread jobs, cancellation, staleness
 zig build annotations           # names, tags, chapters, groups, provenance
+zig build sync                  # two replicas converging on journal entries
+zig build history               # labeled transactions, history(), stats(), trim()
+zig build forks                 # savePrefix variants, cherryPick, format migration
 zig build examples              # all of the above
 ```
 
@@ -250,6 +256,27 @@ as transactions over simple entries — there are no special compound journal
 kinds. Journal eviction below `max_journal` removes whole units only, so
 undo boundaries survive memory pressure.
 
+## History
+
+The journal is inspectable, for a history panel:
+
+```zig
+try tl.beginLabeledTransaction("Smooth terrain");
+_ = try tl.commit(.{ .smooth = .{ .passes = 2 } });
+try tl.setFeatureName(hill, "ridge");
+tl.endTransaction();
+
+var it = tl.history();                 // units, oldest first
+while (it.next()) |u| {
+    // u.kind (.commit, .edit, ..., .batch), u.entries, u.label ("Smooth terrain"),
+    // u.ts (from Config.now), u.undone (sits in the redo region)
+}
+tl.undoDepth(); tl.redoDepth();
+```
+
+Marker moves are not journaled and never appear. Units are borrowed views:
+iterate before the next edit.
+
 ## Contracts
 
 - **Ops are plain data.** Op payloads must not own heap memory or hold
@@ -294,6 +321,26 @@ Globe-sized documents: raise the interval, lower `max_checkpoints`. The
 cache is an optimization — a checkpoint-free timeline still works (backward
 scrubs replay from the seed).
 
+## Memory pressure
+
+`stats()` counts what the timeline keeps alive (features, checkpoints,
+journal entries and units, parameters, chapters, groups). `trim()` releases
+memory on demand without touching the document, the structure, or in-flight
+background jobs:
+
+```zig
+_ = tl.trim(.{
+    .checkpoints = 1,   // keep the checkpoint nearest the marker
+    .undo_units = 20,   // keep the newest 20 undo units
+    .drop_redo = true,  // forget what redo could replay
+});
+```
+
+Dropping checkpoints only makes scrubbing slower; dropping journal units
+shrinks undo depth. The configured `max_checkpoints` / `max_journal` are
+unchanged — `trim` is a one-off release, called from your memory-pressure
+handler.
+
 ## Persistence
 
 `persistence.save(Domain, &tl, gpa, writer)` / `load(Domain, gpa, config, reader)`:
@@ -302,6 +349,40 @@ a small versioned binary container framing app-encoded op and seed payloads
 suppression, and the marker round-trip; statuses, checkpoints, and the undo
 journal intentionally do not — they recompute, like a Fusion document
 reopening.
+
+### Format versions
+
+Op and document encodings evolve. Declare the app's payload schema version
+and the library records it in every container and on the sync wire:
+
+```zig
+pub const format_version: u32 = 2;   // 0 when absent
+
+// Called instead of decodeOp / decodeDoc when a file or entry carries a
+// different version. Decode the old layout here and return today's types.
+pub fn migrateOp(from: u32, r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Op { ... }
+pub fn migrateDoc(from: u32, r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Doc { ... }
+```
+
+Without the hooks, a foreign version is `error.UnsupportedFormatVersion`.
+Files written before 0.8.0 are version 0. See `examples/forks.zig`.
+
+### Forks and cherry-picks
+
+`persistence.savePrefix(Domain, &tl, gpa, writer, mark, .{ .timeline_id = new_id })`
+writes `features[0..mark]` as an independent container: a scenario variant
+when it gets its own identity. The marker is clamped; names, tags and
+provenance of dropped features go with them; chapters anchored beyond the
+mark are dropped (end-pinned ones follow the new tip); groups that start
+inside the prefix are kept with their end clamped; parameters are all kept.
+`markPosition(chapter.mark)` turns a chapter into a fork point.
+
+`try variant.cherryPick(&tl, feature_id, .{})` copies one feature from
+another timeline of the same Domain (or from the same one) and commits it at
+the marker with a fresh id, as one undo unit — name, tags, provenance and
+the suppressed flag included unless the options say otherwise. Ops are plain
+data, so ids inside the op are not translated: a dependent op whose
+dependency is absent in the target simply soft-fails on rebuild.
 
 ## Hierarchical timelines
 
@@ -387,7 +468,7 @@ tests/oracle.zig   differential tests vs a naive reference model
 
 ## Status & non-goals
 
-v0.7.0 — all four roadmap waves delivered; see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
+v0.8.0 — all four roadmap waves plus the deferred tail delivered (minus disk-backed checkpoints); see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
 feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are

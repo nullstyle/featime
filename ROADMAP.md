@@ -4,7 +4,7 @@ Consolidated plan for the library's next four waves plus a deferred tail.
 Background on the library's design (Domain contract, seams, threading model)
 lives in README.md; this document only plans forward work.
 
-Current state: v0.7.0 — all four waves below are delivered, on top of the core timeline, checkpoint cache, undo/redo journal,
+Current state: v0.8.0 — all four waves below are delivered, on top of the core timeline, checkpoint cache, undo/redo journal,
 dependency-aware moves, persistence, background rebuilds, hierarchical
 timelines via the reference model.
 
@@ -152,23 +152,47 @@ documented with tests on its edges.
 
 ---
 
-## Deferred tail (post-0.6; pull when real usage demands)
+## Sprint 2 — the deferred tail (→ 0.8.0) — DELIVERED
 
-- **Journal introspection** — iterate the undo stack with labels/timestamps
-  for a history panel. Cheap anytime once the Wave 1 clock hook exists;
-  fold opportunistically into any wave.
-- **Persistence migration hooks** — `migrateOp(from_version, bytes)` for
-  evolving op schemas; becomes non-optional the moment real external
-  documents exist.
-- **Fork & cherry-pick** — `savePrefix(mark)` + load for scenario variants;
-  cherry-pick copies an op between timelines and lets it recompute. Pairs
-  naturally with chapters. Merge stays out of scope.
-- **Memory pressure API** — `trim()` to drop checkpoints/journal under
-  budget for long sessions.
-- **Disk-backed checkpoints** — session restore without replay.
+- **Journal introspection** — `history()` units with kind, size, label,
+  timestamp, undone state; `beginLabeledTransaction`; `undoDepth` /
+  `redoDepth`.
+- **Persistence migration hooks** — `Domain.format_version` recorded in
+  containers (FTZ4) and on the wire (v3); `migrateOp` / `migrateDoc` decode
+  foreign versions; `error.UnsupportedFormatVersion` without them.
+- **Fork & cherry-pick** — `persistence.savePrefix(mark, opts)` and
+  `Timeline.cherryPick(src, id, opts)`. Merge stays out of scope.
+- **Memory pressure API** — `stats()` and `trim(budget)`.
+
+## Still parked
+
+- **Disk-backed checkpoints** — session restore without replay. Parked on
+  purpose: the implications (who owns the files, how checkpoints stay valid
+  across edits, what a half-written checkpoint means on crash) are being
+  thought through before any code.
 - **Selective replay** (`touches(op, region)` filters) — parked: the
   hierarchical region-timeline partition is the better answer at the app
   level, and filters would fight the whole-document checkpoint model.
+
+## Open decision: an allocation helper for integrators
+
+Today `apply` gets `ctx.alloc` (the timeline's allocator) and owning
+documents implement `cloneDoc` / `deinitDoc`. Options on the table, not yet
+chosen:
+
+1. **Scratch arena per rebuild** — `ctx.scratch`, an arena the timeline
+   resets after every feature. Temporaries in `apply` need no `free`.
+   Document memory stays on `ctx.alloc`. Small, safe, no semantic change.
+2. **A dedicated document allocator** — `Config.doc_allocator` (defaults to
+   the gpa) threaded into `apply`, `cloneDoc`, `deinitDoc`. Lets an app
+   pool or budget document memory separately from the library's
+   bookkeeping, and makes `trim` decisions measurable. Small change.
+3. **Arena-owned documents** — the timeline owns one arena per document copy
+   (seed, live, checkpoints, job bases); `apply` and `cloneDoc` allocate
+   into it and `deinitDoc` disappears entirely. Biggest simplification for
+   integrators, but a live document that churns grows until it is cloned
+   into a fresh arena, so it needs a compaction policy (clone-on-threshold
+   or clone at every checkpoint). Medium change; decide after measuring.
 
 ## Standing non-goals
 

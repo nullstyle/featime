@@ -3,6 +3,34 @@
 All notable changes to featuretree-zig. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
+## 0.8.0 — 2026-10-09
+
+### Added
+- History introspection: `history()` iterates undo/redo units with kind,
+  entry count, label, timestamp and undone state; `undoDepth()` /
+  `redoDepth()`; `beginLabeledTransaction(label)` names a unit for history
+  panels.
+- Memory pressure: `stats()` counts what the timeline holds; `trim(budget)`
+  releases checkpoints (the ones nearest the marker survive), old undo units
+  and the redo region without touching the document or in-flight jobs.
+- Format versions: `Domain.format_version` is recorded in containers and on
+  the sync wire; payloads from another version decode through
+  `Domain.migrateOp` / `Domain.migrateDoc`, or fail with
+  `error.UnsupportedFormatVersion`.
+- Forks: `persistence.savePrefix(…, mark, .{ .timeline_id })` writes the
+  first `mark` features as an independent container (marker clamped,
+  dropped features' annotations dropped, chapters beyond the mark dropped,
+  groups clamped, parameters kept).
+- Cherry-pick: `Timeline.cherryPick(src, id, opts)` copies one feature
+  between timelines (or within one) with its annotations, as one undo unit.
+- Examples `history` and `forks`.
+
+### Changed
+- Container magic is FTZ4 (header gains `format_version`); FTZ1–FTZ3 files
+  still load.
+- Sync `wire_version` is 3: the app's format version follows the version
+  byte.
+
 ## 0.7.0 — 2026-10-09
 
 ### Changed (breaking)
