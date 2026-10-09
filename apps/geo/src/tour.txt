@@ -1,0 +1,48 @@
+# featime geo: a globe over two regions
+region new north
+region north raise 3 4
+region north raise 4 2
+region north plant 9
+region north chapter planted
+region north param erosion 0.5
+region north erode
+region new south
+region south raise 20 6
+region south plant 4
+globe sea 1.5
+globe occur north
+globe pin north planted
+globe occur south
+show
+# north changes: the live occurrence follows, the pinned one does not
+region north raise 0 3
+region north plant 3
+show
+# scrubbing the region's marker: again only the live occurrence follows
+region north marker 3
+show
+region north marker 7
+# a parameter edit re-runs the erosion feature, and so the live occurrence
+region north param erosion 2.0
+show
+# history, undo, redo
+region north history
+region north undo
+show
+region north redo
+globe history
+# a background rebuild: installed, then rejected because a region moved meanwhile
+globe sea 2.5
+globe rebuild bg
+globe rebuild bg-stale
+show
+# a labeled transaction is one undo step
+region south terraform
+region south history
+region south undo
+show
+# persistence: save the world, load it back
+save out/world
+load out/world
+show
+status

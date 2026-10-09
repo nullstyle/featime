@@ -2270,6 +2270,20 @@ pub fn Timeline(comptime Domain: type) type {
             return .{ .items = self.list.items, .ann = &self.ann };
         }
 
+        /// The feature at position `idx`, or null past the end. O(1).
+        pub fn featureAt(self: *const Self, idx: u32) ?FeatureView {
+            if (idx >= self.list.items.len) return null;
+            const f = &self.list.items[idx];
+            return .{
+                .id = f.id,
+                .op = &f.op,
+                .suppressed = f.suppressed,
+                .status = f.status,
+                .name = self.ann.nameOf(f.id),
+                .meta = self.ann.provenance(f.id),
+            };
+        }
+
         pub fn featureById(self: *const Self, id: ft.FeatureId) ?FeatureView {
             const idx = self.indexOf(id) orelse return null;
             const f = &self.list.items[idx];

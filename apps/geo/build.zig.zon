@@ -1,0 +1,10 @@
+.{
+    .name = .featime_geo,
+    .version = "0.0.0",
+    .fingerprint = 0x67cde4db06fdcd87,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .featime = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "scenarios", "README.md" },
+}

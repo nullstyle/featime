@@ -300,7 +300,8 @@ tl.endTransaction();
 var it = tl.history();                 // units, oldest first
 while (it.next()) |u| {
     // u.kind (.commit, .edit, ..., .batch), u.entries, u.label ("Smooth terrain"),
-    // u.ts (from Config.now), u.undone (sits in the redo region)
+    // u.subject (the feature/chapter/group/parameter id the unit's first entry
+    // concerns), u.ts (from Config.now), u.undone (sits in the redo region)
 }
 tl.undoDepth(); tl.redoDepth();
 ```
@@ -617,6 +618,8 @@ src/persistence.zig save/load container format (FTZ6; FTZ1–5 still load)
 src/nested_demo.zig two-level globe/region demo (hierarchical timelines)
 src/main.zig       terrain-editor demo
 examples/          focused usage examples (zig build examples)
+apps/geo/          a small globe/region editor on the public API (zig build run there)
+integrations/hamt/ a HAMT-backed document (needs hamt-zig next to this repo)
 tests/oracle.zig   differential tests vs a naive reference model
 tests/oom.zig      out-of-memory sweep (every call, every allocation)
 tests/fuzz.zig     fuzz tests for the decoders (zig build test --fuzz)

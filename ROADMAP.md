@@ -251,6 +251,17 @@ live links first, then pins.
 - Snapshots (option C) stay in reserve for containers that must load
   alone or jobs that must run while children are edited.
 
+## Open after apps/geo
+
+- **A mark at the start.** `Mark{ .after = null }` is the tip, so nothing
+  can anchor before the first feature (a chapter at position 0, a pin
+  that excludes everything). A three-way mark (start / after X / tip)
+  changes chapters on the wire and in containers; do it together with the
+  next format bump.
+- **Timeline names.** Containers carry an id, not a name; apps keep their
+  own index (`apps/geo` writes `world.txt`). A name in the header would
+  remove that boilerplate; same format bump.
+
 ## Standing non-goals
 
 Merge/OT/CRDT, branching timelines with merge semantics, parallel feature

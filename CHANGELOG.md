@@ -3,6 +3,20 @@
 All notable changes to featime (featuretree-zig until 0.10.0). The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
+## Unreleased
+
+### Added
+- `apps/geo/`: a small terminal editor over a globe timeline and region
+  timelines, written against the public API only — the first real
+  consumer. One command script drives live and pinned links, parameters,
+  chapters, labeled transactions, the history panel, background rebuilds
+  and save/load of a whole world (one container per timeline; the globe's
+  header manifest says which regions it needs). CI runs it.
+- Two things building it asked for: `Timeline.featureAt(idx)` (the
+  feature at a position, O(1)) and `history()` units carry `subject`, the
+  id their first entry concerns, so a history panel can say which feature
+  a step touched.
+
 ## 0.10.0 — 2026-10-09
 
 ### Changed (breaking)

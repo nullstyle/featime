@@ -31,3 +31,8 @@ jobs:
       - run: zig build run
       - run: zig build bench -Dbench-max=10000
       - run: zig build docs
+      # The first real consumer: a small editor built on the public API only.
+      - run: zig build test --summary all
+        working-directory: apps/geo
+      - run: zig build run
+        working-directory: apps/geo

@@ -119,6 +119,9 @@ pub fn Journal(comptime Op: type) type {
             /// Number of journal entries in the unit.
             entries: u32,
             kind: UnitKind,
+            /// The id the unit's first entry concerns: a feature, chapter,
+            /// group or parameter id (they share one id space).
+            subject: u64,
             /// Label given at `beginLabeledTransaction`, if any. Borrowed:
             /// valid until the next journal mutation.
             label: ?[]const u8,
@@ -145,6 +148,7 @@ pub fn Journal(comptime Op: type) type {
                     .index = it.n,
                     .entries = count,
                     .kind = if (count == 1) kindOf(first.e) else .batch,
+                    .subject = subjectOf(first.e),
                     .label = first.label,
                     .ts = first.ts,
                     .undone = start >= it.j.head,
@@ -154,6 +158,29 @@ pub fn Journal(comptime Op: type) type {
                 return unit;
             }
         };
+
+        fn subjectOf(e: Entry) u64 {
+            return switch (e) {
+                .commit => |x| x.id,
+                .edit => |x| x.id,
+                .remove => |x| x.id,
+                .suppress => |x| x.id,
+                .move => |x| x.id,
+                .name_set => |x| x.id,
+                .tag_add => |x| x.id,
+                .tag_remove => |x| x.id,
+                .chapter_add => |x| x.id,
+                .chapter_remove => |x| x.id,
+                .chapter_rename => |x| x.id,
+                .group_add => |x| x.id,
+                .group_remove => |x| x.id,
+                .group_rename => |x| x.id,
+                .param_add => |x| x.id,
+                .param_remove => |x| x.id,
+                .param_set => |x| x.id,
+                .param_rename => |x| x.id,
+            };
+        }
 
         fn kindOf(e: Entry) UnitKind {
             return switch (e) {
