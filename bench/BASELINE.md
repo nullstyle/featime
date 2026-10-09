@@ -5,6 +5,57 @@
 plain data). Default `Config` (checkpoint interval 256, 4 checkpoints,
 journal 1024).
 
+## Unreleased (2026-10-09): checkpoint window, heap-heavy document
+
+Interval checkpoints are now taken only at the last `max_checkpoints`
+intervals before the marker: positions that would be evicted later in the
+same pass are no longer cloned. Each clone also copied every feature status
+below it, so on the plain document a full replay at 100k features spent
+nearly all its time in 390 checkpoints that were thrown away.
+
+### Part 1: plain-data document (same workload as before)
+
+| Operation | 1k | 10k | 100k |
+|-----------|---:|----:|-----:|
+| commit at tip (per feature) | 80 ns | 44 ns | 45 ns |
+| edit first + full replay | 0.016 ms | 0.11 ms | 1.3 ms |
+| edit middle + suffix replay | 0.007 ms | 0.08 ms | 0.9 ms |
+| scrub to middle | 0.009 ms | 0.07 ms | 1.0 ms |
+| scrub back to tip (snapshot) | 0.006 ms | 0.02 ms | 0.2 ms |
+| featureById (per lookup) | 6 ns | 7 ns | 24 ns |
+| undo middle edit + replay | 0.005 ms | 0.08 ms | 0.7 ms |
+| remove middle + replay | 0.010 ms | 0.14 ms | 1.5 ms |
+| commit mid-history | 0.003 ms | 0.04 ms | 0.6 ms |
+| save / load (lazy) | 0.05 / 0.04 ms | 0.34 / 0.38 ms | 4.0 / 4.1 ms |
+| peak live memory | 0.5 MiB | 3.1 MiB | 21.3 MiB |
+
+Replays at 100k went from 33–45 ms to about 1 ms. Files grew (3.6 MB at
+100k, was 2.1 MB) because FTZ5 stores a 16-byte order key per feature.
+
+### Part 2: heap-heavy document
+
+An entity list with one owned string per entity; the document grows with
+the timeline, so each checkpoint deep-copies everything so far.
+
+| Operation | 1k | 10k | 100k | 100k before the fix |
+|-----------|---:|----:|-----:|-----:|
+| spawn (commit at tip, per feature) | 90 ns | 96 ns | 96 ns | 98 ns |
+| edit first + full replay | 0.05 ms | 0.9 ms | 14 ms | 431 ms |
+| edit middle + suffix replay | 0.04 ms | 1.0 ms | 16 ms | 415 ms |
+| scrub to middle | 0.02 ms | 0.8 ms | 9 ms | 82 ms |
+| scrub back to tip (snapshot) | 0.01 ms | 0.3 ms | 2.9 ms | 3.1 ms |
+| cloneDoc of the full document | 0.008 ms | 0.08 ms | 0.8 ms | 2.0 ms |
+| undo middle edit + replay | 0.03 ms | 0.8 ms | 8 ms | 230 ms |
+| allocations during the run | 10.6k | 208k | 2.1M | 59M |
+| peak live memory | 0.6 MiB | 6.0 MiB | 55 MiB | 60 MiB |
+
+What this says: with the window fix a checkpoint of a 100k-entity document
+costs under 1 ms and a full replay about 14 ms, almost all of it the
+replay itself. Arena-owned documents (roadmap option 3) would remove the
+clone cost entirely but it is no longer the bottleneck; the persistent-map
+integration (`integrations/hamt/`) remains the answer for documents whose
+copies are too big to clone at all.
+
 ## 0.9.1 (2026-10-09): id-to-index map, journal as a deque
 
 | Operation | 1k | 10k | 100k |

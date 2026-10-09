@@ -13,7 +13,15 @@ All notable changes to featuretree-zig. The format follows
   on envelopes. Wire version 4. Containers are FTZ5 (order keys and the
   per-origin sequence table); FTZ1–FTZ4 still load.
 
+- Interval checkpoints are taken only at the last `max_checkpoints`
+  intervals before the marker; positions that the same pass would evict
+  are no longer cloned (each clone also copied every feature status below
+  it). Full replays at 100k features: 45 ms → 1.3 ms on a 16 KiB document,
+  431 ms → 14 ms on a 100k-entity heap document; allocations 59M → 2.1M.
+
 ### Added
+- Benchmark part 2: a heap-heavy document (entity list with owned strings);
+  `bench/BASELINE.md` records before and after.
 - Deterministic order for concurrent commits: each commit carries its
   predecessor and an order key (Lamport clock + origin). Remote commits are
   placed after their predecessor and past any sibling with a greater key,

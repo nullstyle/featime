@@ -2065,6 +2065,14 @@ pub fn Timeline(comptime Domain: type) type {
             self.resetStatuses(start);
             var scratch_arena = std.heap.ArenaAllocator.init(self.gpa);
             defer scratch_arena.deinit();
+            // Only positions still in the cache when the pass ends are worth
+            // a document copy: the last `max_checkpoints` intervals before
+            // the marker. Earlier ones would be evicted by later ones in this
+            // very pass — a full clone each, for nothing (on a heap-heavy
+            // document that was the whole cost of a rebuild).
+            const interval: u64 = self.config.checkpoint_interval;
+            const window: u64 = interval * @as(u64, self.config.max_checkpoints);
+            const keep_from: u32 = if (interval == 0 or window >= self.marker_pos) 0 else @intCast(self.marker_pos - window);
             var pos: u32 = start;
             while (pos < self.marker_pos) {
                 const end = if (self.config.checkpoint_interval > 0)
@@ -2078,7 +2086,7 @@ pub fn Timeline(comptime Domain: type) type {
                     return; // live_doc still holds the last good state
                 };
                 pos = end;
-                if (end < self.marker_pos) {
+                if (end < self.marker_pos and end >= keep_from) {
                     self.cps.add(end, &scratch, self.list.items);
                 }
             }

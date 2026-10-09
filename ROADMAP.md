@@ -164,6 +164,16 @@ documented with tests on its edges.
   `Timeline.cherryPick(src, id, opts)`. Merge stays out of scope.
 - **Memory pressure API** — `stats()` and `trim(budget)`.
 
+## Checkpoint placement (partly done)
+
+The benchmark showed that interval checkpoints were cloned at every
+interval and then evicted by the same pass; they are now taken only in the
+last `max_checkpoints` intervals before the marker (full replays at 100k:
+45 ms → 1.3 ms). Still open: keeping checkpoints *spread* along the
+timeline (so a mid-history edit on a 100k timeline replays from a nearby
+checkpoint instead of the seed) and letting the Domain hint document size
+for byte budgets. Pull when real usage shows mid-history edits dominating.
+
 ## Still parked
 
 - **Disk-backed checkpoints** — session restore without replay. Parked on

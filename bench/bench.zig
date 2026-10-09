@@ -224,17 +224,135 @@ fn benchSize(io: std.Io, base_gpa: std.mem.Allocator, out: *std.Io.Writer, n: u3
     });
 }
 
+// ---------------------------------------------------------------------------
+// A heap-heavy document: a growing list of entities with owned name strings.
+// Every checkpoint deep-copies the whole document, so the clone cost grows
+// with the number of entities — the case the plain heightmap cannot show.
+// ---------------------------------------------------------------------------
+
+const Entity = struct { id: u64, cell: u32, name: []u8 };
+
+const Scene = struct {
+    pub const Doc = struct { entities: std.ArrayList(Entity) = .empty };
+    pub const Op = union(enum) {
+        spawn: struct { id: u64, cell: u32 },
+        move: struct { id: u64, cell: u32 },
+    };
+
+    pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
+        switch (op) {
+            .spawn => |sp| {
+                // A short owned name per entity: the typical "strings in the
+                // document" shape.
+                const name = try std.fmt.allocPrint(ctx.alloc, "entity-{d}", .{sp.id});
+                errdefer ctx.alloc.free(name);
+                try doc.entities.append(ctx.alloc, .{ .id = sp.id, .cell = sp.cell, .name = name });
+            },
+            .move => |mv| {
+                for (doc.entities.items) |*e| {
+                    if (e.id == mv.id) {
+                        e.cell = mv.cell;
+                        return;
+                    }
+                }
+                return ctx.fail("entity {d} does not exist", .{mv.id});
+            },
+        }
+    }
+
+    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
+        var out: Doc = .{};
+        errdefer deinitDoc(&out, gpa);
+        try out.entities.ensureTotalCapacity(gpa, doc.entities.items.len);
+        for (doc.entities.items) |e| {
+            const name = try gpa.dupe(u8, e.name);
+            out.entities.appendAssumeCapacity(.{ .id = e.id, .cell = e.cell, .name = name });
+        }
+        return out;
+    }
+
+    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
+        for (doc.entities.items) |e| gpa.free(e.name);
+        doc.entities.deinit(gpa);
+    }
+};
+
+const SceneTl = ft.Timeline(Scene);
+
+fn benchHeapDoc(io: std.Io, base_gpa: std.mem.Allocator, out: *std.Io.Writer, n: u32) !void {
+    var peak = PeakAllocator{ .inner = base_gpa };
+    const gpa = peak.allocator();
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+
+    try out.print("\n== heap-heavy document: {d} entities ==\n", .{n});
+    var tl = try SceneTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    const ids = try base_gpa.alloc(ft.FeatureId, n);
+    defer base_gpa.free(ids);
+
+    var t = Timer.begin(io);
+    for (ids, 1..) |*slot, i| slot.* = try tl.commit(.{ .spawn = .{ .id = i, .cell = random.uintLessThan(u32, 4096) } });
+    try row(out, "spawn (commit at tip)", t.ns(), n);
+
+    t = Timer.begin(io);
+    try tl.edit(ids[0], .{ .spawn = .{ .id = 1, .cell = 7 } });
+    _ = tl.state();
+    try row(out, "edit first + full replay", t.ns(), 1);
+
+    t = Timer.begin(io);
+    try tl.edit(ids[n / 2], .{ .spawn = .{ .id = n / 2 + 1, .cell = 7 } });
+    _ = tl.state();
+    try row(out, "edit middle + suffix replay", t.ns(), 1);
+
+    t = Timer.begin(io);
+    tl.setMarker(n / 2);
+    _ = tl.state();
+    try row(out, "scrub to middle", t.ns(), 1);
+    t = Timer.begin(io);
+    tl.setMarker(n);
+    _ = tl.state();
+    try row(out, "scrub back to tip (snapshot)", t.ns(), 1);
+
+    // One checkpoint of the full document, in isolation.
+    t = Timer.begin(io);
+    var copy = try Scene.cloneDoc(tl.state(), gpa);
+    const clone_ns = t.ns();
+    Scene.deinitDoc(&copy, gpa);
+    try row(out, "cloneDoc of the full document", clone_ns, 1);
+
+    t = Timer.begin(io);
+    _ = tl.undo();
+    _ = tl.state();
+    try row(out, "undo middle edit + replay", t.ns(), 1);
+
+    const s = tl.stats();
+    try out.print("  memory: peak {d:.1} MiB live, {d} allocations; {d} checkpoints, {d} journal entries\n", .{
+        @as(f64, @floatFromInt(peak.peak)) / (1024.0 * 1024.0),
+        peak.allocs,
+        s.checkpoints,
+        s.journal_entries,
+    });
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var buffer: [8192]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const out = &file_writer.interface;
 
-    try out.print("featuretree-zig benchmarks (ReleaseFast, single thread, 64x64 f32 heightmap document)\n", .{});
+    try out.print("featuretree-zig benchmarks (ReleaseFast, single thread)\n", .{});
+    try out.print("part 1: plain-data document (64x64 f32 heightmap, 16 KiB)\n", .{});
     const sizes = [_]u32{ 1_000, 10_000, 100_000 };
     for (sizes) |n| {
         if (n > build_options.max_features) break;
         try benchSize(io, init.gpa, out, n);
+        try out.flush();
+    }
+    try out.print("\npart 2: heap-heavy document (entity list with owned strings; grows with the timeline)\n", .{});
+    for (sizes) |n| {
+        if (n > build_options.max_features) break;
+        try benchHeapDoc(io, init.gpa, out, n);
         try out.flush();
     }
     try out.flush();
