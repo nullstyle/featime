@@ -4,6 +4,7 @@
 //!   zig build run             run the demo
 //!   zig build test            unit + differential tests (honors -Doptimize)
 //!   zig build examples        run every usage example; `zig build <name>` runs one
+//!   zig build bench           benchmark suite (always ReleaseFast; -Dbench-max=N caps the size)
 //!
 //! Consumers import the `featuretree_zig` module:
 //!
@@ -87,4 +88,29 @@ pub fn build(b: *std.Build) void {
         b.step(name, b.fmt("Run the {s} example", .{name})).dependOn(&run_example.step);
         examples_step.dependOn(&run_example.step);
     }
+
+    // Benchmarks: a separate ReleaseFast instance of the library so numbers
+    // never depend on -Doptimize.
+    const bench_max = b.option(u32, "bench-max", "Largest timeline the benchmark runs (default 100000)") orelse 100_000;
+    const bench_options = b.addOptions();
+    bench_options.addOption(u32, "max_features", bench_max);
+    const bench_lib = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench = b.addExecutable(.{
+        .name = "featuretree-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "featuretree_zig", .module = bench_lib },
+                .{ .name = "build_options", .module = bench_options.createModule() },
+            },
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench);
+    b.step("bench", "Run the benchmark suite (ReleaseFast; -Dbench-max=N caps the size)").dependOn(&run_bench.step);
 }

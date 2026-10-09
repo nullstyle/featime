@@ -26,3 +26,4 @@ jobs:
       - run: zig build test -Doptimize=ReleaseFast --summary all
       - run: zig build examples
       - run: zig build run
+      - run: zig build bench -Dbench-max=10000

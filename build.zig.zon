@@ -77,5 +77,6 @@
         "ROADMAP.md",
         "examples",
         "src",
+        "bench",
     },
 }

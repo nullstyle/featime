@@ -3,6 +3,14 @@
 All notable changes to featuretree-zig. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
+## Unreleased
+
+### Added
+- Benchmark suite: `zig build bench` (always ReleaseFast; `-Dbench-max=N`)
+  measures commits, replays, scrubbing, lookups, undo/redo, removal and
+  save/load at 1k / 10k / 100k features; `bench/BASELINE.md` records the
+  baseline. CI runs it at 10k as a smoke test.
+
 ## 0.9.0 — 2026-10-09
 
 ### Added

@@ -467,6 +467,9 @@ and globe rollback leaving the region untouched.
   journal bugs.
 - `src/main.zig` is a terrain-editor demo that exercises every capability
   end-to-end (`zig build run`).
+- `zig build bench` runs the benchmark suite (always ReleaseFast) at 1k,
+  10k and 100k features; `-Dbench-max=N` caps the size. `bench/BASELINE.md`
+  records the current numbers and what they mean.
 
 ## Layout
 
@@ -485,6 +488,7 @@ src/nested_demo.zig two-level globe/region demo (hierarchical timelines)
 src/main.zig       terrain-editor demo
 examples/          focused usage examples (zig build examples)
 tests/oracle.zig   differential tests vs a naive reference model
+bench/bench.zig    benchmark suite (zig build bench); BASELINE.md has the numbers
 ```
 
 ## Status & non-goals
