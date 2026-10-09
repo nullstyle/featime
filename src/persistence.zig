@@ -1,11 +1,12 @@
 //! Save/load timelines: a small versioned binary container framing
 //! application-encoded payloads.
 //!
-//! FTZ5 layout (all integers little-endian; "framed" = u32 length + bytes):
+//! FTZ6 layout (all integers little-endian; "framed" = u32 length + bytes):
 //!
-//!   magic "FTZ5"
+//!   magic "FTZ6"
 //!   u64 timeline_id
 //!   u32 format_version                (the app's `Domain.format_version`)
+//!   u32 link_count    × u64 timeline_id   (timelines the features link to; `peekHeader`)
 //!   framed seed document              (bytes from `Domain.encodeDoc`)
 //!   u32 feature_count × { u64 id, u8 suppressed, u64 order.lamport,
 //!                         u64 order.origin, framed op (`Domain.encodeOp`) }
@@ -49,7 +50,8 @@
 const std = @import("std");
 const ft = @import("root.zig");
 
-pub const magic = "FTZ5";
+pub const magic = "FTZ6";
+pub const magic_v5 = "FTZ5";
 pub const magic_v4 = "FTZ4";
 pub const magic_v3 = "FTZ3";
 pub const magic_v2 = "FTZ2";
@@ -178,6 +180,13 @@ fn saveUpTo(
     try writer.writeInt(u64, timeline_id, .little);
     try writer.writeInt(u32, formatVersion(Domain), .little);
 
+    // The manifest: which timelines the kept features link to, so a reader
+    // can fetch them first (`peekHeader`).
+    const linked = try linkedTimelines(Domain, kept_list, gpa);
+    defer gpa.free(linked);
+    try writer.writeInt(u32, @intCast(linked.len), .little);
+    for (linked) |id| try writer.writeInt(u64, id, .little);
+
     {
         var aw: std.Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
@@ -287,6 +296,66 @@ fn saveUpTo(
     }
 }
 
+/// What a container says about itself before any payload: its identity,
+/// the app format it was written with, and the timelines its features link
+/// to (FTZ6 and later; older containers report no links). Read this first
+/// to open or fetch linked timelines before loading the container itself.
+pub const Header = struct {
+    timeline_id: u64,
+    format_version: u32,
+    links: []u64,
+
+    pub fn deinit(self: *Header, gpa: std.mem.Allocator) void {
+        gpa.free(self.links);
+        self.* = undefined;
+    }
+};
+
+pub fn peekHeader(gpa: std.mem.Allocator, reader: *std.Io.Reader) !Header {
+    const head = try reader.take(4);
+    const v6 = std.mem.eql(u8, head, magic);
+    const v5 = std.mem.eql(u8, head, magic_v5);
+    const v4 = std.mem.eql(u8, head, magic_v4);
+    const v3 = std.mem.eql(u8, head, magic_v3);
+    const v2 = std.mem.eql(u8, head, magic_v2);
+    if (!v6 and !v5 and !v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
+        return error.BadMagic;
+    var h: Header = .{ .timeline_id = 0, .format_version = 0, .links = &.{} };
+    if (v6 or v5 or v4 or v3 or v2) h.timeline_id = try reader.takeInt(u64, .little);
+    if (v6 or v5 or v4) h.format_version = try reader.takeInt(u32, .little);
+    if (v6) {
+        // Grown one id at a time: a lying count stops at the end of input.
+        const link_count = try reader.takeInt(u32, .little);
+        var links: std.ArrayList(u64) = .empty;
+        errdefer links.deinit(gpa);
+        var k: u32 = 0;
+        while (k < link_count) : (k += 1) try links.append(gpa, try reader.takeInt(u64, .little));
+        h.links = try links.toOwnedSlice(gpa);
+    }
+    return h;
+}
+
+/// The ids of the timelines `features` link to (`Domain.links`), sorted,
+/// without duplicates. Empty without the hook. Caller owns the slice.
+pub fn linkedTimelines(comptime Domain: type, features: []const ft.Feature(Domain.Op), gpa: std.mem.Allocator) ![]u64 {
+    var out: std.ArrayList(u64) = .empty;
+    errdefer out.deinit(gpa);
+    if (comptime @hasDecl(Domain, "links")) {
+        var collector: ft.LinkCollector = .{ .gpa = gpa };
+        defer collector.ids.deinit(gpa);
+        for (features) |f| {
+            collector.ids.clearRetainingCapacity();
+            Domain.links(f.op, &collector);
+            if (collector.failed) return error.OutOfMemory;
+            for (collector.ids.items) |id| {
+                if (std.mem.indexOfScalar(u64, out.items, id) == null) try out.append(gpa, id);
+            }
+        }
+        std.mem.sort(u64, out.items, {}, std.sort.asc(u64));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// An in-memory scratch writer fails only for lack of memory: report that
 /// as `OutOfMemory`, so `WriteFailed` always means the caller's writer.
 pub fn scratchError(err: anyerror) anyerror {
@@ -309,21 +378,29 @@ pub fn load(
 ) anyerror!ft.Timeline(Domain) {
     validateCodecs(Domain);
     const head = try reader.take(4);
-    const v5 = std.mem.eql(u8, head, magic);
+    const v6 = std.mem.eql(u8, head, magic);
+    const v5 = std.mem.eql(u8, head, magic_v5);
     const v4 = std.mem.eql(u8, head, magic_v4);
     const v3 = std.mem.eql(u8, head, magic_v3);
     const v2 = std.mem.eql(u8, head, magic_v2);
-    if (!v5 and !v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
+    if (!v6 and !v5 and !v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
         return error.BadMagic;
-    const has_id = v5 or v4 or v3 or v2;
-    const has_format = v5 or v4;
-    const has_params = v5 or v4 or v3;
-    const has_annotations = v5 or v4 or v3 or v2;
-    const has_order = v5;
+    const has_id = v6 or v5 or v4 or v3 or v2;
+    const has_format = v6 or v5 or v4;
+    const has_params = v6 or v5 or v4 or v3;
+    const has_annotations = v6 or v5 or v4 or v3 or v2;
+    const has_order = v6 or v5;
+    const has_links = v6;
 
     var timeline_id: u64 = 0;
     if (has_id) timeline_id = try reader.takeInt(u64, .little);
     const stored_format: u32 = if (has_format) try reader.takeInt(u32, .little) else 0;
+    if (has_links) {
+        // The manifest is for `peekHeader`; the features carry the links.
+        const link_count = try reader.takeInt(u32, .little);
+        var k: u32 = 0;
+        while (k < link_count) : (k += 1) _ = try reader.takeInt(u64, .little);
+    }
 
     var doc_reader = try framedReader(gpa, reader);
     defer gpa.free(doc_reader.bytes);
@@ -878,7 +955,7 @@ test "sync entries carry the format version and migrate on decode" {
     try std.testing.expectError(error.UnsupportedFormatVersion, syncing.decode(StrictV1Domain, gpa, &reader2));
 }
 
-test "FTZ5 round-trips order keys and the seen table; FTZ4 files load with zero keys" {
+test "FTZ6 round-trips order keys and the seen table; FTZ4 files load with zero keys" {
     const gpa = std.testing.allocator;
     var tl = try PersistTimeline.init(gpa, .{}, .{});
     defer tl.deinit();
@@ -937,4 +1014,83 @@ test "FTZ5 round-trips order keys and the seen table; FTZ4 files load with zero 
     try std.testing.expectEqual(@as(i64, 7), old.state().value);
     try std.testing.expectEqual(@as(u64, 0), old.list.items[0].order.lamport);
     try std.testing.expectEqual(@as(u64, 1), old.expectedSeq(77));
+}
+
+const LinkedDomain = struct {
+    pub const Doc = struct { value: i64 = 0 };
+    pub const Op = union(enum) { add: i64, read: u64 };
+    pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
+        switch (op) {
+            .add => |n| doc.value += n,
+            .read => |t| _ = ctx.link(t) orelse return ctx.fail("no timeline {d}", .{t}),
+        }
+    }
+    pub fn links(op: Op, out: *ft.LinkCollector) void {
+        switch (op) {
+            .read => |t| out.link(t),
+            .add => {},
+        }
+    }
+    pub fn encodeOp(op: Op, w: *std.Io.Writer) anyerror!void {
+        switch (op) {
+            .add => |n| {
+                try w.writeAll(&[1]u8{1});
+                try w.writeInt(i64, n, .little);
+            },
+            .read => |t| {
+                try w.writeAll(&[1]u8{2});
+                try w.writeInt(u64, t, .little);
+            },
+        }
+    }
+    pub fn decodeOp(r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Op {
+        _ = gpa;
+        return switch ((try r.take(1))[0]) {
+            1 => .{ .add = try r.takeInt(i64, .little) },
+            2 => .{ .read = try r.takeInt(u64, .little) },
+            else => error.Malformed,
+        };
+    }
+    pub fn encodeDoc(doc: *const Doc, w: *std.Io.Writer) anyerror!void {
+        try w.writeInt(i64, doc.value, .little);
+    }
+    pub fn decodeDoc(r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Doc {
+        _ = gpa;
+        return .{ .value = try r.takeInt(i64, .little) };
+    }
+};
+
+test "FTZ6 header lists the linked timelines; peekHeader reads it without the Domain" {
+    const gpa = std.testing.allocator;
+    var tl = try ft.Timeline(LinkedDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+    _ = try tl.commit(.{ .read = 7 });
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .read = 3 });
+    _ = try tl.commit(.{ .read = 7 });
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try save(LinkedDomain, &tl, gpa, &aw.writer);
+
+    var reader = std.Io.Reader.fixed(aw.written());
+    var header = try peekHeader(gpa, &reader);
+    defer header.deinit(gpa);
+    try std.testing.expectEqual(tl.timelineId(), header.timeline_id);
+    try std.testing.expectEqualSlices(u64, &.{ 3, 7 }, header.links);
+
+    // The whole container still loads after the peek of a fresh reader.
+    var reader2 = std.Io.Reader.fixed(aw.written());
+    var loaded = try load(LinkedDomain, gpa, .{}, &reader2);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 4), loaded.len());
+
+    // A prefix carries only the links of the kept features.
+    var prefix: std.Io.Writer.Allocating = .init(gpa);
+    defer prefix.deinit();
+    try savePrefix(LinkedDomain, &tl, gpa, &prefix.writer, 2, .{});
+    var reader3 = std.Io.Reader.fixed(prefix.written());
+    var header3 = try peekHeader(gpa, &reader3);
+    defer header3.deinit(gpa);
+    try std.testing.expectEqualSlices(u64, &.{7}, header3.links);
 }

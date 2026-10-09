@@ -1,6 +1,8 @@
 # References to other timelines — options
 
-Status: exploration, no decision yet (2026-10-09). Nothing here is built.
+Status (2026-10-09): decision taken — A then B. Step 1 (A, live links) is
+built; see the README section "Hierarchical timelines and links". Step 2
+(B, pinned references) is next.
 
 A *reference* is a feature in one timeline that reads another timeline.
 Today the library supports one shape of it: the parent's `apply` reads a

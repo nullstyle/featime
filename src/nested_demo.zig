@@ -1,13 +1,12 @@
 //! Two-level demo: a globe feature timeline referencing a region
 //! sub-timeline — Fusion's assembly/component model on top of the library's
-//! seams, with no special library support beyond `setEnv` and `refresh`.
+//! link support (`Domain.links`, `setRegistry`, `ctx.link`).
 //!
 //! The region timeline is an ordinary `Timeline` over its own document; the
 //! globe timeline's occurrence features read the region's *computed state*
-//! (at the region's own marker) through the environment. When the region
-//! changes, the globe is stale until the app calls `refresh` on the
-//! occurrence — deliberately: the library cannot see external inputs, so
-//! invalidation is explicit.
+//! (at the region's own marker) through the registry. The library records
+//! which version of the region each occurrence read, so when the region
+//! changes the globe re-runs the occurrence by itself on its next `state()`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -47,11 +46,21 @@ const Region = struct {
 
 const RegionTimeline = ft.Timeline(Region);
 
-/// The application environment: the registry of sub-timelines the globe's
-/// features read through `ctx.env`. Must be acyclic — sub-timelines never
-/// point back at the globe.
-const Env = struct {
+/// The application's registry: which timelines exist, by id. The globe's
+/// occurrences name the region by its `timelineId()`; the library asks the
+/// registry for a handle and tracks the region's version by itself.
+const Registry = struct {
     region: *RegionTimeline,
+
+    fn resolve(ctx: ?*anyopaque, id: u64) ?ft.LinkHandle {
+        const self: *Registry = @ptrCast(@alignCast(ctx.?));
+        if (id == self.region.timelineId()) return self.region.linkHandle();
+        return null;
+    }
+
+    fn registry(self: *Registry) ft.Registry {
+        return .{ .ctx = self, .resolve = &resolve };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -69,18 +78,17 @@ const Globe = struct {
     };
     pub const Op = union(enum) {
         set_sea_level: struct { meters: f32 },
-        /// A component occurrence, in Fusion terms.
-        region_occurrence: struct { region: u8 },
+        /// A component occurrence, in Fusion terms: `region` is the region
+        /// timeline's id.
+        region_occurrence: struct { region: u64 },
     };
     pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
         switch (op) {
             .set_sea_level => |s| doc.sea_level = s.meters,
             .region_occurrence => |o| {
-                if (o.region != 0)
-                    return ctx.fail("unknown region {d}", .{o.region});
-                const env: *Env = @ptrCast(@alignCast(ctx.env orelse
-                    return ctx.fail("no environment registered", .{})));
-                const region_state = env.region.state();
+                const region: *RegionTimeline = @ptrCast(@alignCast(ctx.link(o.region) orelse
+                    return ctx.fail("region {d} is not registered, or is in a reference cycle", .{o.region})));
+                const region_state = region.state();
                 doc.region_heights = region_state.heights;
                 doc.region_trees = region_state.trees;
                 doc.flooded = 0;
@@ -88,6 +96,14 @@ const Globe = struct {
                     if (h < doc.sea_level) doc.flooded += 1;
                 }
             },
+        }
+    }
+    /// Which timelines an op reads: the library re-runs the feature when
+    /// one of them changes.
+    pub fn links(op: Op, out: *ft.LinkCollector) void {
+        switch (op) {
+            .region_occurrence => |o| out.link(o.region),
+            .set_sea_level => {},
         }
     }
 };
@@ -122,8 +138,8 @@ pub fn run(out: *Io.Writer, arena: std.mem.Allocator) !void {
     var globe = try GlobeTimeline.init(arena, .{}, .{});
     defer globe.deinit();
 
-    var env = Env{ .region = &region };
-    globe.setEnv(&env);
+    var registry = Registry{ .region = &region };
+    globe.setRegistry(registry.registry());
 
     // 1. Edit the region sub-timeline on its own.
     try out.writeAll("\n-- 1. region: raise and plant -------------------------------\n");
@@ -136,23 +152,21 @@ pub fn run(out: *Io.Writer, arena: std.mem.Allocator) !void {
     // 2. The globe references the region through an occurrence feature.
     try out.writeAll("\n-- 2. globe: sea level + region occurrence ------------------\n");
     _ = try globe.commit(.{ .set_sea_level = .{ .meters = 2.0 } });
-    const occurrence = try globe.commit(.{ .region_occurrence = .{ .region = 0 } });
+    _ = try globe.commit(.{ .region_occurrence = .{ .region = region.timelineId() } });
     try printGlobe(out, &globe);
 
-    // 3. Region edits do NOT flow automatically: the globe is stale until
-    //    the app refreshes the occurrence.
-    try out.writeAll("\n-- 3. region raises a hill; globe stale, then refreshed ------\n");
+    // 3. Region edits flow on their own: the globe sees that the region's
+    //    version moved and re-runs the occurrence on its next state().
+    try out.writeAll("\n-- 3. region raises a hill; globe follows -------------------\n");
     _ = try region.commit(.{ .raise = .{ .cell = 0, .amount = 3 } });
-    try printGlobe(out, &globe); // still the old merge: cell 0 still flooded
-    try globe.refresh(occurrence);
+    try out.print("  globe dirty: {}\n", .{globe.dirty()});
     try printGlobe(out, &globe); // flooded drops: cell 0 is now above sea level
 
     // 4. Cross-timeline skew is intended Fusion semantics: scrubbing the
     //    region's marker changes what the occurrence reads.
-    try out.writeAll("\n-- 4. region scrubbed back before planting; refresh ----------\n");
+    try out.writeAll("\n-- 4. region scrubbed back before planting; globe follows ----\n");
     region.setMarker(2);
     try printRegion(out, &region);
-    try globe.refresh(occurrence);
     try printGlobe(out, &globe); // trees drop to 0
 
     // 5. Rolling the GLOBE back past the occurrence leaves the region
@@ -167,51 +181,48 @@ pub fn run(out: *Io.Writer, arena: std.mem.Allocator) !void {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "occurrence merges region state; refresh picks up changes" {
+test "occurrence follows region edits and scrubs without refresh" {
     const gpa = std.testing.allocator;
     var region = try RegionTimeline.init(gpa, .{}, .{});
     defer region.deinit();
     var globe = try GlobeTimeline.init(gpa, .{}, .{});
     defer globe.deinit();
 
-    var env = Env{ .region = &region };
-    globe.setEnv(&env);
+    var registry = Registry{ .region = &region };
+    globe.setRegistry(registry.registry());
 
     _ = try region.commit(.{ .plant = .{ .count = 3 } });
     _ = try globe.commit(.{ .set_sea_level = .{ .meters = 1.0 } });
-    const occurrence = try globe.commit(.{ .region_occurrence = .{ .region = 0 } });
+    const occurrence = try globe.commit(.{ .region_occurrence = .{ .region = region.timelineId() } });
     try std.testing.expectEqual(@as(u32, 3), globe.state().region_trees);
+    try std.testing.expect(!globe.dirty());
 
-    // Region changes alone leave the globe stale.
+    // A region change makes the globe dirty; its next state() re-runs the occurrence.
     _ = try region.commit(.{ .plant = .{ .count = 4 } });
-    try std.testing.expectEqual(@as(u32, 3), globe.state().region_trees);
-
-    // Refresh re-runs the occurrence.
-    try globe.refresh(occurrence);
+    try std.testing.expect(globe.dirty());
     try std.testing.expectEqual(@as(u32, 7), globe.state().region_trees);
 
     // Scrubbing the region marker changes what the occurrence reads: at
     // marker 1 only the first planting (3 trees) is applied.
     region.setMarker(1);
-    try globe.refresh(occurrence);
     try std.testing.expectEqual(@as(u32, 3), globe.state().region_trees);
 
     // Suppressing the occurrence removes the merge entirely.
     region.setMarker(region.len());
-    try globe.refresh(occurrence);
+    try std.testing.expectEqual(@as(u32, 7), globe.state().region_trees);
     try globe.setSuppressed(occurrence, true);
     try std.testing.expectEqual(@as(u32, 0), globe.state().region_trees);
     try std.testing.expectEqual(@as(u32, 0), globe.state().flooded);
 }
 
-test "occurrence fails softly without an environment" {
+test "occurrence fails softly without a registry" {
     const gpa = std.testing.allocator;
     var globe = try GlobeTimeline.init(gpa, .{}, .{});
     defer globe.deinit();
 
-    _ = try globe.commit(.{ .region_occurrence = .{ .region = 0 } });
+    _ = try globe.commit(.{ .region_occurrence = .{ .region = 42 } });
     _ = globe.state();
     var it = globe.features();
     const f = it.next().?;
-    try std.testing.expectEqualStrings("no environment registered", f.status.failed);
+    try std.testing.expectEqualStrings("region 42 is not registered, or is in a reference cycle", f.status.failed);
 }

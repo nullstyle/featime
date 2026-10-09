@@ -138,6 +138,23 @@ pub fn Timeline(comptime Domain: type) type {
         /// Highest sequence number integrated per remote origin.
         seen: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
+        /// How linked timelines are found (`setRegistry`). Null: links
+        /// resolve to nothing and the features reading them soft-fail.
+        registry: ?ft.Registry = null,
+        /// Per linked timeline id, the version its handle reported when the
+        /// features reading it last ran (null: unresolvable at the time).
+        /// `linksStale` compares these with the handles' current versions.
+        link_seen: std.AutoHashMapUnmanaged(u64, ?u64) = .empty,
+        /// Set when the versions seen cannot be trusted (a new registry, or
+        /// a record that ran out of memory): the next check re-runs every
+        /// feature that links anything.
+        links_unknown: bool = false,
+        /// True while this timeline's features are being applied, so a
+        /// reference back to it (a cycle) is refused by `ApplyContext.link`.
+        evaluating: bool = false,
+        /// Re-entry guard for `version()` across a cycle in the link graph.
+        checking_links: bool = false,
+
         // ------------------------------------------------------------------
         // Lifecycle
         // ------------------------------------------------------------------
@@ -185,6 +202,7 @@ pub fn Timeline(comptime Domain: type) type {
             self.list.deinit(self.gpa);
             self.index.deinit(self.gpa);
             self.seen.deinit(self.gpa);
+            self.link_seen.deinit(self.gpa);
             self.cps.deinit();
             self.journal.deinit();
             self.ann.deinit();
@@ -302,7 +320,8 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn dirty(self: *const Self) bool {
             return self.broken != null or
                 self.live_stale or
-                self.built_pos != self.marker_pos;
+                self.built_pos != self.marker_pos or
+                self.linksStale();
         }
 
         /// The document at the marker: `features[0..marker]` applied to the
@@ -373,7 +392,9 @@ pub fn Timeline(comptime Domain: type) type {
                 var applied: u32 = at;
                 var scratch = std.heap.ArenaAllocator.init(self.gpa);
                 defer scratch.deinit();
-                ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.allocators(&scratch), self.env, self.ptab.items(), &applied) catch |err| {
+                self.evaluating = true;
+                defer self.evaluating = false;
+                ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.allocators(&scratch), self.env, self.registry, self.ptab.items(), &applied) catch |err| {
                     // Hard failure: features before `at` are still good on the
                     // live doc, but this op may have partially mutated it.
                     // Flag broken so nothing touches it before a full rebuild.
@@ -381,6 +402,7 @@ pub fn Timeline(comptime Domain: type) type {
                     return;
                 };
                 self.built_pos = at + 1;
+                self.recordLinks(at, at + 1);
             }
         }
 
@@ -952,6 +974,46 @@ pub fn Timeline(comptime Domain: type) type {
             const idx = self.indexOf(id) orelse return error.UnknownFeature;
             self.touch();
             self.invalidate(idx);
+        }
+
+        // ------------------------------------------------------------------
+        // Links to other timelines
+        // ------------------------------------------------------------------
+
+        /// Where this timeline finds the timelines its features link to (the
+        /// optional `Domain.links` hook names them by id; `apply` resolves
+        /// them with `ctx.link`). With a registry the library notices when a
+        /// linked timeline changed and re-runs the features that read it;
+        /// `refresh` stays for inputs it cannot see. Setting a registry
+        /// re-runs every linking feature. Must be acyclic in effect: a
+        /// feature that reads a timeline currently being evaluated gets null
+        /// from `ctx.link` and soft-fails.
+        pub fn setRegistry(self: *Self, registry: ?ft.Registry) void {
+            self.registry = registry;
+            self.links_unknown = true;
+            self.checkLinks();
+        }
+
+        /// This timeline as a link target: what a registry hands out for its
+        /// `timelineId()`. The pointer is the timeline itself; `apply` casts
+        /// it back.
+        pub fn linkHandle(self: *Self) ft.LinkHandle {
+            return .{ .ptr = self, .version = &versionErased, .evaluating = &evaluatingErased };
+        }
+
+        /// A number that changes whenever the document at the marker may
+        /// have changed: edits, marker moves, parameter edits, and changes
+        /// in the timelines this one links to. Timelines linking here
+        /// compare it to decide when to re-run.
+        pub fn version(self: *Self) u64 {
+            self.checkLinks();
+            return self.gen;
+        }
+
+        /// The ids of the timelines this timeline's features link to,
+        /// sorted, without duplicates. Caller owns the slice.
+        pub fn linkedTimelines(self: *const Self, gpa: std.mem.Allocator) ![]u64 {
+            return ft.persistence.linkedTimelines(Domain, self.list.items, gpa);
         }
 
         // ------------------------------------------------------------------
@@ -1971,6 +2033,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// integration; the synchronous `state()` remains available as a
         /// fallback and produces identical results.
         pub fn beginRebuild(self: *Self) anyerror!ft.rebuild.Job(Domain) {
+            self.checkLinks();
             var start_pos: u32 = 0;
             var base: Domain.Doc = undefined;
             var have_base = false;
@@ -1999,6 +2062,10 @@ pub fn Timeline(comptime Domain: type) type {
             // may change while the job runs; only id/value are ever read.
             const param_snap = try self.gpa.dupe(ft.Param, self.ptab.items());
             errdefer self.gpa.free(param_snap);
+            // Linked timelines may change while the job runs; `integrate`
+            // compares their versions with this snapshot.
+            const link_snap = try self.snapshotLinks(start_pos, self.marker_pos);
+            errdefer self.gpa.free(link_snap);
 
             return .{
                 .gpa = self.gpa,
@@ -2011,15 +2078,18 @@ pub fn Timeline(comptime Domain: type) type {
                 .features = features_copy,
                 .env = self.env,
                 .param_values = param_snap,
+                .registry = self.registry,
+                .link_snapshot = link_snap,
             };
         }
 
         /// Install a finished job's result (owner thread only). The job is
-        /// consumed either way. True when installed; false when stale,
+        /// consumed either way. True when installed; false when stale (this
+        /// timeline or a linked one changed since `beginRebuild`),
         /// cancelled, or failed — a failed-but-fresh job marks the timeline
         /// broken, exactly like a synchronous rebuild.
         pub fn integrate(self: *Self, job: *ft.rebuild.Job(Domain)) bool {
-            if (job.generation != self.gen or !self.jobMatchesList(job)) {
+            if (job.generation != self.gen or !self.jobMatchesList(job) or !self.linksMatch(job.link_snapshot)) {
                 job.deinit();
                 return false;
             }
@@ -2045,10 +2115,13 @@ pub fn Timeline(comptime Domain: type) type {
             }
             self.gpa.free(job.features);
             job.features = &.{};
+            self.gpa.free(job.link_snapshot);
+            job.link_snapshot = &.{};
             job.state = .consumed;
             self.built_pos = self.marker_pos;
             self.live_stale = false;
             self.broken = null;
+            self.recordLinks(job.start_pos, job.target);
             return true;
         }
 
@@ -2156,7 +2229,12 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         fn ensureRebuilt(self: *Self) void {
+            self.checkLinks();
             if (!self.dirty()) return; // clean
+            // Features applied from here may read other timelines; a read
+            // back into this one is a cycle (see `ApplyContext.link`).
+            self.evaluating = true;
+            defer self.evaluating = false;
 
             // 1. Exact checkpoint restore — the slider fast path. Scrubbing
             //    back to a snapshotted position costs zero applies.
@@ -2175,16 +2253,18 @@ pub fn Timeline(comptime Domain: type) type {
             // 2. Incremental forward pass on the live document: the prefix
             //    is valid, just apply the new suffix.
             if (self.broken == null and !self.live_stale and self.built_pos < self.marker_pos) {
-                self.resetStatuses(self.built_pos);
-                var applied: u32 = self.built_pos;
+                const from = self.built_pos;
+                self.resetStatuses(from);
+                var applied: u32 = from;
                 var scratch = std.heap.ArenaAllocator.init(self.gpa);
                 defer scratch.deinit();
-                ft.rebuild.applyRange(Domain, self.list.items, self.built_pos, self.marker_pos, &self.live_doc, self.allocators(&scratch), self.env, self.ptab.items(), &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.list.items, from, self.marker_pos, &self.live_doc, self.allocators(&scratch), self.env, self.registry, self.ptab.items(), &applied) catch |err| {
                     self.broken = err;
                     self.built_pos = applied;
                     return;
                 };
                 self.built_pos = self.marker_pos;
+                self.recordLinks(from, self.marker_pos);
                 return;
             }
 
@@ -2222,7 +2302,7 @@ pub fn Timeline(comptime Domain: type) type {
                 else
                     self.marker_pos;
                 var applied: u32 = pos;
-                ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.allocators(&scratch_arena), self.env, self.ptab.items(), &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.allocators(&scratch_arena), self.env, self.registry, self.ptab.items(), &applied) catch |err| {
                     ft.deinitDoc(Domain, &scratch, self.docAllocator());
                     self.broken = err;
                     return; // live_doc still holds the last good state
@@ -2237,6 +2317,164 @@ pub fn Timeline(comptime Domain: type) type {
             self.built_pos = self.marker_pos;
             self.live_stale = false;
             self.broken = null;
+            self.recordLinks(start, self.marker_pos);
+        }
+
+        // ------------------------------------------------------------------
+        // Links to other timelines (internals)
+        // ------------------------------------------------------------------
+
+        fn versionErased(ptr: *anyopaque) u64 {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.version();
+        }
+
+        fn evaluatingErased(ptr: *anyopaque) bool {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            return self.evaluating;
+        }
+
+        fn currentVersion(reg: ft.Registry, timeline_id: u64) ?u64 {
+            const h = reg.resolve(reg.ctx, timeline_id) orelse return null;
+            return h.version(h.ptr);
+        }
+
+        /// True when a linked timeline changed since the features reading it
+        /// last ran, or when the versions seen cannot be trusted.
+        fn linksStale(self: *const Self) bool {
+            if (comptime !@hasDecl(Domain, "links")) return false;
+            if (self.links_unknown) return true;
+            const reg = self.registry orelse return false;
+            var it = self.link_seen.iterator();
+            while (it.next()) |e| {
+                if (!std.meta.eql(currentVersion(reg, e.key_ptr.*), e.value_ptr.*)) return true;
+            }
+            return false;
+        }
+
+        /// Compare the versions seen with the current ones and invalidate
+        /// from the earliest feature that reads a changed timeline. Bumps
+        /// this timeline's version when it invalidated anything, so the
+        /// timelines linking here see the change too.
+        fn checkLinks(self: *Self) void {
+            if (comptime !@hasDecl(Domain, "links")) return;
+            if (self.checking_links) return; // a cycle in the link graph ends here
+            self.checking_links = true;
+            defer self.checking_links = false;
+            if (self.links_unknown) {
+                // Nothing seen can be trusted: every linking feature re-runs.
+                self.links_unknown = false;
+                self.link_seen.clearRetainingCapacity();
+                if (self.earliestLinking(null)) |idx| {
+                    self.invalidate(idx);
+                    self.touch();
+                }
+                return;
+            }
+            const reg = self.registry orelse return;
+            var min_idx: ?u32 = null;
+            var it = self.link_seen.iterator();
+            while (it.next()) |e| {
+                const current = currentVersion(reg, e.key_ptr.*);
+                if (std.meta.eql(current, e.value_ptr.*)) continue;
+                e.value_ptr.* = current;
+                if (self.earliestLinking(e.key_ptr.*)) |idx| {
+                    min_idx = if (min_idx) |m| @min(m, idx) else idx;
+                }
+            }
+            if (min_idx) |idx| {
+                self.invalidate(idx);
+                self.touch();
+            }
+        }
+
+        /// Index of the first feature that links `target` (any timeline
+        /// when null). Suppressed features read nothing.
+        fn earliestLinking(self: *const Self, target: ?u64) ?u32 {
+            var collector: ft.LinkCollector = .{ .gpa = self.gpa };
+            defer collector.ids.deinit(self.gpa);
+            for (self.list.items, 0..) |f, i| {
+                if (f.suppressed) continue;
+                collector.ids.clearRetainingCapacity();
+                Domain.links(f.op, &collector);
+                if (collector.failed) return 0; // cannot see: re-run everything
+                for (collector.ids.items) |id| {
+                    if (target == null or id == target.?) return @intCast(i);
+                }
+            }
+            return null;
+        }
+
+        /// After features `[from..to)` ran: remember the version of each
+        /// timeline they link to, as it is now (nothing could change it
+        /// since `apply` read it, on this thread). A pass from the start
+        /// forgets timelines no feature links any more.
+        fn recordLinks(self: *Self, from: u32, to: u32) void {
+            if (comptime !@hasDecl(Domain, "links")) return;
+            const reg = self.registry orelse return;
+            if (from == 0) self.link_seen.clearRetainingCapacity();
+            var collector: ft.LinkCollector = .{ .gpa = self.gpa };
+            defer collector.ids.deinit(self.gpa);
+            var i = from;
+            while (i < to) : (i += 1) {
+                const f = self.list.items[i];
+                if (f.suppressed) continue;
+                collector.ids.clearRetainingCapacity();
+                Domain.links(f.op, &collector);
+                if (collector.failed) {
+                    self.links_unknown = true;
+                    return;
+                }
+                for (collector.ids.items) |id| {
+                    self.link_seen.put(self.gpa, id, currentVersion(reg, id)) catch {
+                        self.links_unknown = true;
+                        return;
+                    };
+                }
+            }
+        }
+
+        /// The linked timelines of `[from..to)` with their current versions,
+        /// for a background job to compare at integrate time.
+        fn snapshotLinks(self: *const Self, from: u32, to: u32) ![]ft.LinkSeen {
+            var out: std.ArrayList(ft.LinkSeen) = .empty;
+            errdefer out.deinit(self.gpa);
+            if (comptime @hasDecl(Domain, "links")) {
+                if (self.registry) |reg| {
+                    var collector: ft.LinkCollector = .{ .gpa = self.gpa };
+                    defer collector.ids.deinit(self.gpa);
+                    var i = from;
+                    while (i < to) : (i += 1) {
+                        const f = self.list.items[i];
+                        if (f.suppressed) continue;
+                        collector.ids.clearRetainingCapacity();
+                        Domain.links(f.op, &collector);
+                        if (collector.failed) return error.OutOfMemory;
+                        for (collector.ids.items) |id| {
+                            var known = false;
+                            for (out.items) |s| {
+                                if (s.timeline == id) {
+                                    known = true;
+                                    break;
+                                }
+                            }
+                            if (known) continue;
+                            try out.append(self.gpa, .{ .timeline = id, .version = currentVersion(reg, id) });
+                        }
+                    }
+                }
+            }
+            return out.toOwnedSlice(self.gpa);
+        }
+
+        /// True when every linked timeline still has the version a job saw.
+        fn linksMatch(self: *const Self, snapshot: []const ft.LinkSeen) bool {
+            if (comptime !@hasDecl(Domain, "links")) return true;
+            const reg = self.registry orelse return snapshot.len == 0;
+            for (snapshot) |s| {
+                if (!std.meta.eql(currentVersion(reg, s.timeline), s.version)) return false;
+            }
+            return true;
         }
     };
 }
@@ -4651,4 +4889,275 @@ test "sync: envelope round-trips origin, sequence, clock, predecessor and order 
     try std.testing.expectEqual(@as(u64, 123), got.entry.commit.order.lamport);
     try std.testing.expectEqual(@as(u64, 77), got.entry.commit.order.origin);
     try std.testing.expectEqual(ft.Meta{ .author = 3, .ts = 4 }, got.entry.commit.meta.?);
+}
+
+// ---------------------------------------------------------------------------
+// Links to other timelines
+// ---------------------------------------------------------------------------
+
+const LinkDomain = struct {
+    pub const Doc = struct { value: i64 = 0 };
+    pub const Op = union(enum) {
+        add: i64,
+        /// Add another timeline's value (named by its timeline id).
+        read: u64,
+    };
+    pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
+        switch (op) {
+            .add => |n| doc.value += n,
+            .read => |tid| {
+                const other: *LinkTl = @ptrCast(@alignCast(ctx.link(tid) orelse
+                    return ctx.fail("timeline {d} is unknown or in a cycle", .{tid})));
+                doc.value += other.state().value;
+            },
+        }
+    }
+    pub fn links(op: Op, out: *ft.LinkCollector) void {
+        switch (op) {
+            .read => |tid| out.link(tid),
+            .add => {},
+        }
+    }
+};
+const LinkTl = Timeline(LinkDomain);
+
+/// A registry over a few timelines, by id.
+const LinkRegistry = struct {
+    entries: [4]?*LinkTl = .{ null, null, null, null },
+
+    fn add(self: *LinkRegistry, tl: *LinkTl) void {
+        for (&self.entries) |*slot| {
+            if (slot.* == null) {
+                slot.* = tl;
+                return;
+            }
+        }
+        unreachable;
+    }
+
+    fn resolve(ctx: ?*anyopaque, id: u64) ?ft.LinkHandle {
+        const self: *LinkRegistry = @ptrCast(@alignCast(ctx.?));
+        for (self.entries) |slot| {
+            if (slot) |tl| {
+                if (tl.timelineId() == id) return tl.linkHandle();
+            }
+        }
+        return null;
+    }
+
+    fn registry(self: *LinkRegistry) ft.Registry {
+        return .{ .ctx = self, .resolve = &resolve };
+    }
+};
+
+fn firstStatus(tl: *const LinkTl, idx: u32) ft.Status {
+    var it = tl.features();
+    var i: u32 = 0;
+    while (it.next()) |f| : (i += 1) {
+        if (i == idx) return f.status;
+    }
+    unreachable;
+}
+
+test "links: a parent re-runs when a linked timeline changes, without refresh" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var child = try LinkTl.init(gpa, .{}, .{});
+    defer child.deinit();
+    var parent = try LinkTl.init(gpa, .{}, .{});
+    defer parent.deinit();
+    reg.add(&child);
+    parent.setRegistry(reg.registry());
+
+    _ = try child.commit(.{ .add = 5 });
+    _ = try parent.commit(.{ .add = 1 });
+    _ = try parent.commit(.{ .read = child.timelineId() });
+    try std.testing.expectEqual(@as(i64, 6), parent.state().value);
+    try std.testing.expect(!parent.dirty());
+
+    // An edit in the child is noticed.
+    _ = try child.commit(.{ .add = 10 });
+    try std.testing.expect(parent.dirty());
+    try std.testing.expectEqual(@as(i64, 16), parent.state().value);
+    try std.testing.expect(!parent.dirty());
+
+    // So is a marker move in the child, and an undo.
+    child.setMarker(1);
+    try std.testing.expectEqual(@as(i64, 6), parent.state().value);
+    child.setMarker(2);
+    try std.testing.expectEqual(@as(i64, 16), parent.state().value);
+    try std.testing.expect(child.undo());
+    try std.testing.expectEqual(@as(i64, 6), parent.state().value);
+}
+
+test "links: changes reach through a middle timeline" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var a = try LinkTl.init(gpa, .{}, .{});
+    defer a.deinit();
+    var b = try LinkTl.init(gpa, .{}, .{});
+    defer b.deinit();
+    var c = try LinkTl.init(gpa, .{}, .{});
+    defer c.deinit();
+    reg.add(&a);
+    reg.add(&b);
+    reg.add(&c);
+    a.setRegistry(reg.registry());
+    b.setRegistry(reg.registry());
+
+    _ = try c.commit(.{ .add = 1 });
+    _ = try b.commit(.{ .read = c.timelineId() });
+    _ = try a.commit(.{ .read = b.timelineId() });
+    try std.testing.expectEqual(@as(i64, 1), a.state().value);
+
+    _ = try c.commit(.{ .add = 2 });
+    try std.testing.expect(a.dirty());
+    try std.testing.expectEqual(@as(i64, 3), a.state().value);
+    try std.testing.expect(!a.dirty());
+}
+
+test "links: a reference cycle fails softly instead of recursing" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var a = try LinkTl.init(gpa, .{}, .{});
+    defer a.deinit();
+    var b = try LinkTl.init(gpa, .{}, .{});
+    defer b.deinit();
+    reg.add(&a);
+    reg.add(&b);
+    a.setRegistry(reg.registry());
+    b.setRegistry(reg.registry());
+
+    _ = try a.commit(.{ .add = 1 });
+    _ = try a.commit(.{ .read = b.timelineId() });
+    _ = try b.commit(.{ .add = 10 });
+    _ = try b.commit(.{ .read = a.timelineId() });
+
+    // Whichever side is evaluated inside the other closes the cycle: that
+    // read fails softly, the other one succeeds, and every call ends.
+    _ = a.state();
+    _ = b.state();
+    const a_failed = firstStatus(&a, 1) == .failed;
+    const b_failed = firstStatus(&b, 1) == .failed;
+    try std.testing.expect(a_failed != b_failed);
+    const closing = if (a_failed) firstStatus(&a, 1) else firstStatus(&b, 1);
+    try std.testing.expect(std.mem.indexOf(u8, closing.failed, "cycle") != null);
+    if (a_failed) {
+        try std.testing.expectEqual(@as(i64, 1), a.state().value);
+        try std.testing.expectEqual(@as(i64, 11), b.state().value);
+    } else {
+        try std.testing.expectEqual(@as(i64, 10), b.state().value);
+        try std.testing.expectEqual(@as(i64, 11), a.state().value);
+    }
+
+    // Version checks across the cycle end as well, and nothing is dirty.
+    _ = a.version();
+    _ = b.version();
+    try std.testing.expect(!a.dirty());
+    try std.testing.expect(!b.dirty());
+}
+
+test "links: an unknown timeline fails softly and is picked up when it appears" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var child = try LinkTl.init(gpa, .{}, .{});
+    defer child.deinit();
+    var parent = try LinkTl.init(gpa, .{}, .{});
+    defer parent.deinit();
+    parent.setRegistry(reg.registry());
+    _ = try child.commit(.{ .add = 5 });
+    _ = try parent.commit(.{ .read = child.timelineId() });
+    try std.testing.expectEqual(@as(i64, 0), parent.state().value);
+    try std.testing.expect(firstStatus(&parent, 0) == .failed);
+    try std.testing.expect(!parent.dirty());
+
+    reg.add(&child);
+    try std.testing.expect(parent.dirty());
+    try std.testing.expectEqual(@as(i64, 5), parent.state().value);
+    try std.testing.expectEqual(ft.Status.ok, firstStatus(&parent, 0));
+}
+
+test "links: a background job is rejected when a linked timeline changed meanwhile" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var child = try LinkTl.init(gpa, .{}, .{});
+    defer child.deinit();
+    var parent = try LinkTl.init(gpa, .{}, .{});
+    defer parent.deinit();
+    reg.add(&child);
+    parent.setRegistry(reg.registry());
+    _ = try child.commit(.{ .add = 5 });
+    const first = try parent.commit(.{ .add = 1 });
+    _ = try parent.commit(.{ .read = child.timelineId() });
+    try std.testing.expectEqual(@as(i64, 6), parent.state().value);
+
+    try parent.edit(first, .{ .add = 2 });
+    var job = try parent.beginRebuild();
+    _ = try child.commit(.{ .add = 100 });
+    job.run();
+    try std.testing.expect(!parent.integrate(&job));
+    try std.testing.expectEqual(@as(i64, 107), parent.state().value);
+
+    // A quiet child: the job lands.
+    try parent.edit(first, .{ .add = 3 });
+    var job2 = try parent.beginRebuild();
+    job2.run();
+    try std.testing.expect(parent.integrate(&job2));
+    try std.testing.expectEqual(@as(i64, 108), parent.state().value);
+}
+
+test "links: setRegistry re-runs the features that link" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var child = try LinkTl.init(gpa, .{}, .{});
+    defer child.deinit();
+    var parent = try LinkTl.init(gpa, .{}, .{});
+    defer parent.deinit();
+    reg.add(&child);
+    _ = try child.commit(.{ .add = 5 });
+    _ = try parent.commit(.{ .add = 1 });
+    _ = try parent.commit(.{ .read = child.timelineId() });
+    try std.testing.expectEqual(@as(i64, 1), parent.state().value); // no registry: the read fails softly
+
+    parent.setRegistry(reg.registry());
+    try std.testing.expect(parent.dirty());
+    try std.testing.expectEqual(@as(i64, 6), parent.state().value);
+
+    parent.setRegistry(null);
+    try std.testing.expectEqual(@as(i64, 1), parent.state().value);
+}
+
+test "links: linkedTimelines lists each linked id once, sorted" {
+    const gpa = std.testing.allocator;
+    var parent = try LinkTl.init(gpa, .{}, .{});
+    defer parent.deinit();
+    _ = try parent.commit(.{ .read = 7 });
+    _ = try parent.commit(.{ .add = 1 });
+    _ = try parent.commit(.{ .read = 3 });
+    _ = try parent.commit(.{ .read = 7 });
+    const ids = try parent.linkedTimelines(gpa);
+    defer gpa.free(ids);
+    try std.testing.expectEqualSlices(u64, &.{ 3, 7 }, ids);
+}
+
+test "links: a removed link stops the tracking" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var child = try LinkTl.init(gpa, .{}, .{});
+    defer child.deinit();
+    var parent = try LinkTl.init(gpa, .{}, .{});
+    defer parent.deinit();
+    reg.add(&child);
+    parent.setRegistry(reg.registry());
+    _ = try child.commit(.{ .add = 5 });
+    _ = try parent.commit(.{ .add = 1 });
+    const reading = try parent.commit(.{ .read = child.timelineId() });
+    try std.testing.expectEqual(@as(i64, 6), parent.state().value);
+
+    try parent.remove(reading);
+    try std.testing.expectEqual(@as(i64, 1), parent.state().value);
+    _ = try child.commit(.{ .add = 100 });
+    // Nothing reads the child any more: the value stays, and the timeline settles clean.
+    try std.testing.expectEqual(@as(i64, 1), parent.state().value);
+    try std.testing.expect(!parent.dirty());
 }

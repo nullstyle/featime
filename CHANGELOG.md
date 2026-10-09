@@ -6,6 +6,10 @@ All notable changes to featuretree-zig. The format follows
 ## Unreleased
 
 ### Changed (breaking)
+- Containers are FTZ6: the header lists the ids of the timelines the
+  features link to (FTZ1–FTZ5 still load). `rebuild.applyRange` takes a
+  `registry` argument after `env`. The nested demo names its region by
+  timeline id and uses the registry instead of `setEnv`.
 - Out-of-memory policy: every mutator allocates everything it needs before
   it changes anything, so `error.OutOfMemory` always means "nothing
   happened". The journal reserves its slot first (it no longer drops the
@@ -58,6 +62,18 @@ All notable changes to featuretree-zig. The format follows
   memory as `error.OutOfMemory` instead of `error.WriteFailed`.
 
 ### Added
+- Links to other timelines, step 1 of `docs/timeline-references.md`. The
+  optional `Domain.links(op, out: *LinkCollector)` hook names the timelines
+  an op reads; `Timeline.setRegistry` installs an app-owned `Registry`
+  (timeline id → `LinkHandle`, made by `Timeline.linkHandle()`); `apply`
+  resolves one with `ctx.link(id)`. After a feature runs, the library
+  remembers each linked timeline's `version()` and re-runs the reading
+  features when it changes, through any depth of links; `dirty()` reflects
+  it, so `refresh` is only for inputs the library cannot see. A read of a
+  timeline being evaluated (a cycle) gets null and soft-fails. Background
+  jobs carry the registry and are rejected at `integrate` when a linked
+  timeline changed meanwhile. Also `Timeline.version()`,
+  `Timeline.linkedTimelines(gpa)` and `persistence.peekHeader(gpa, reader)`.
 - `tests/oom.zig`: an out-of-memory sweep over every local mutator, every
   remote entry kind, `load` and `save`. Each call is run once per
   allocation index with that allocation failing; afterwards the state must

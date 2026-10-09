@@ -418,7 +418,10 @@ a small versioned binary container framing app-encoded op and seed payloads
 (length-framed, so future readers can skip unknown op kinds). Ids, order,
 suppression, and the marker round-trip; statuses, checkpoints, and the undo
 journal intentionally do not — they recompute, like a Fusion document
-reopening.
+reopening. The header carries the timeline's id, the app format, and the
+ids of the timelines its features link to: `persistence.peekHeader(gpa,
+reader)` reads just that, so an app can open or fetch linked timelines
+before loading the container itself.
 
 ### Format versions
 
@@ -454,53 +457,76 @@ the suppressed flag included unless the options say otherwise. Ops are plain
 data, so ids inside the op are not translated: a dependent op whose
 dependency is absent in the target simply soft-fails on rebuild.
 
-## Hierarchical timelines
+## Hierarchical timelines and links
 
 Fusion's assembly/component model maps directly onto the library: parent
 features *reference* sub-timelines rather than embedding them. Each
 subresource (a region of the globe) gets its own ordinary `Timeline` over
 its own Domain; the parent timeline holds **occurrence features** whose ops
-name the subresource by id.
+name the subresource by its `timelineId()`.
 
 ```zig
 var region_tl = try ft.Timeline(Region).init(gpa, region_seed, .{});
 var globe_tl = try ft.Timeline(Globe).init(gpa, globe_seed, .{});
 
-const env = Env{ .region = &region_tl };      // app-owned registry
-globe_tl.setEnv(&env);                        // reaches apply as ctx.env
+// App-owned registry: timeline id -> handle.
+const Registry = struct {
+    region: *ft.Timeline(Region),
+    fn resolve(ctx: ?*anyopaque, id: u64) ?ft.LinkHandle {
+        const self: *Registry = @ptrCast(@alignCast(ctx.?));
+        return if (id == self.region.timelineId()) self.region.linkHandle() else null;
+    }
+};
+var registry = Registry{ .region = &region_tl };
+globe_tl.setRegistry(.{ .ctx = &registry, .resolve = &Registry.resolve });
 
 // Globe Domain:
-//   .region_occurrence => |o| read env.region.state(), merge into the doc
-const occurrence = try globe_tl.commit(.{ .region_occurrence = .{ .region = 0 } });
+//   pub fn links(op: Op, out: *ft.LinkCollector) void   -> out.link(o.region) for an occurrence
+//   apply: const region: *ft.Timeline(Region) = @ptrCast(@alignCast(
+//              ctx.link(o.region) orelse return ctx.fail("region {d} missing", .{o.region})));
+//          read region.state(), merge into the doc
+const occurrence = try globe_tl.commit(.{ .region_occurrence = .{ .region = region_tl.timelineId() } });
 ```
 
 The rules of the model:
 
 - **Computed-state merge** (recommended over replaying sub-ops in parent
   context): the parent's `apply` reads the sub-timeline's `state()` through
-  `ctx.env` and copies what it needs into the parent document. Sub rebuilds
-  stay region-sized; the globe document holds summaries, not raw region ops.
-- **Invalidation is explicit.** The library cannot see external inputs, so
-  when a sub-timeline changes, the app calls `try parent.refresh(occurrence_id)`
-  to re-run that feature and everything after it. Refresh journals nothing —
-  the parent's structure didn't change.
-- **Cross-timeline skew is intended.** Scrubbing the *region* marker changes
-  what the occurrence reads (after refresh); rolling the *globe* back past
-  an occurrence leaves the region's own history untouched — exactly how
-  Fusion assemblies treat component occurrences.
-- **Environments must be acyclic.** A parent `apply` may call
-  `sub.state()`, which may lazily rebuild the sub-timeline; sub-timelines
-  must therefore never reference back, directly or transitively.
+  `ctx.link(id)` and copies what it needs into the parent document. Sub
+  rebuilds stay region-sized; the globe document holds summaries, not raw
+  region ops.
+- **Invalidation is automatic.** `Domain.links` names the timelines an op
+  reads. After a feature runs, the library remembers each linked timeline's
+  `version()`; `dirty()` and `state()` compare, and the features that read
+  a changed timeline re-run — through any depth of links, so a change in a
+  grandchild reaches the parent. `refresh(id)` stays for inputs the library
+  cannot see (anything read through `ctx.env`).
+- **Cross-timeline skew is intended.** Scrubbing the *region* marker is a
+  change the globe follows; rolling the *globe* back past an occurrence
+  leaves the region's own history untouched — exactly how Fusion
+  assemblies treat component occurrences.
+- **Cycles fail softly.** `ctx.link` returns null for a timeline that is
+  being evaluated right now, so the read that closes a cycle soft-fails
+  instead of recursing. Which read that is depends on evaluation order, and
+  a cyclic link graph never settles: treat a cycle as an error. Pinned
+  references (planned; `docs/timeline-references.md`) will make backward
+  references legal.
+- **Background jobs** carry the registry and read linked timelines while
+  they run, so do not edit a linked timeline during a parent's job. If one
+  changes between `beginRebuild` and `integrate`, the job is rejected like
+  any stale job.
 - **Cross-level dependencies** are declared with
   `DepCollector.depIn(timeline_feature, id)`; parent-level reorder
   validation anchors them at the feature that introduces the sub-timeline.
 - **Ids remain per-timeline.** A reference from a parent is always
-  `(parent feature id naming the sub-timeline, feature id within it)`.
+  `(timeline id, feature id within it)`. `linkedTimelines(gpa)` lists the
+  ids a timeline reads, and a container's header records them
+  (`persistence.peekHeader`), so an app can open them first.
 
-For a multiuser editor this shape doubles as the future sync/merge unit:
-each sub-timeline (with its stable ids and flat journal) is an independent
+For a multiuser editor this shape doubles as the sync/merge unit: each
+sub-timeline (with its stable ids and flat journal) is an independent
 shard. `src/nested_demo.zig` (part of `zig build run`) walks the whole
-pattern: region edits, a stale globe, `refresh`, region-marker scrubbing,
+pattern: region edits, the globe following them, region-marker scrubbing,
 and globe rollback leaving the region untouched.
 
 ## Testing
@@ -540,7 +566,7 @@ src/journal.zig    undo/redo journal (internal)
 src/annotations.zig names, tags, chapters, groups, provenance store (internal)
 src/params.zig     parameter table (internal)
 src/sync.zig       journal entries as a wire format: encode / decode
-src/persistence.zig save/load container format (FTZ5; FTZ1–4 still load)
+src/persistence.zig save/load container format (FTZ6; FTZ1–5 still load)
 src/nested_demo.zig two-level globe/region demo (hierarchical timelines)
 src/main.zig       terrain-editor demo
 examples/          focused usage examples (zig build examples)

@@ -178,7 +178,22 @@ pub const ApplyContext = struct {
     /// `apply` as `ctx.param(id)`. Background jobs snapshot the slice.
     param_values: []const params.Param = &.{},
 
+    /// How linked timelines are found (`Timeline.setRegistry`), or null.
+    registry: ?Registry = null,
+
     message: ?[]const u8 = null,
+
+    /// Resolve a timeline this feature links to (`Domain.links`): the
+    /// pointer the registry holds for it, to cast to your `*Timeline(...)`
+    /// type. Null when there is no registry, the id is unknown, or that
+    /// timeline is being evaluated right now, which means a reference
+    /// cycle. Features typically soft-fail on null.
+    pub fn link(self: *const ApplyContext, timeline_id: u64) ?*anyopaque {
+        const reg = self.registry orelse return null;
+        const h = reg.resolve(reg.ctx, timeline_id) orelse return null;
+        if (h.evaluating(h.ptr)) return null;
+        return h.ptr;
+    }
 
     /// Read a parameter value by id, or null when absent (features
     /// typically soft-fail on a missing parameter).
@@ -199,6 +214,43 @@ pub const ApplyContext = struct {
         return error.FeatureFailed;
     }
 };
+
+/// Handed to the optional `Domain.links` hook: the ids of the timelines an
+/// op reads (see `Timeline.setRegistry`). With them the library re-runs a
+/// feature when a timeline it reads changed, refuses reference cycles, and
+/// records in a container which timelines it needs.
+pub const LinkCollector = struct {
+    gpa: std.mem.Allocator,
+    ids: std.ArrayList(u64) = .empty,
+    failed: bool = false,
+
+    pub fn link(self: *LinkCollector, timeline_id: u64) void {
+        self.ids.append(self.gpa, timeline_id) catch {
+            self.failed = true;
+        };
+    }
+};
+
+/// A type-erased view of a timeline that other timelines may read:
+/// `Timeline.linkHandle()` makes one for any Domain. `ptr` is the timeline
+/// itself; `version` is its change counter; `evaluating` is true while its
+/// features are being applied.
+pub const LinkHandle = struct {
+    ptr: *anyopaque,
+    version: *const fn (ptr: *anyopaque) u64,
+    evaluating: *const fn (ptr: *anyopaque) bool,
+};
+
+/// How a timeline finds the timelines its features link to: an app-owned
+/// table from `timeline_id` to `LinkHandle`. Return null for unknown ids.
+pub const Registry = struct {
+    ctx: ?*anyopaque = null,
+    resolve: *const fn (ctx: ?*anyopaque, timeline_id: u64) ?LinkHandle,
+};
+
+/// The version of a linked timeline as last seen (null: it could not be
+/// resolved at the time).
+pub const LinkSeen = struct { timeline: u64, version: ?u64 };
 
 /// One dependency edge declared through the optional `Domain.dependencies`
 /// hook. `Timeline.move` refuses reorders that would place a dependency
@@ -309,6 +361,8 @@ pub fn validateDomain(comptime Domain: type) void {
         checkHook(Domain, "dependencies", &.{ Domain.Op, *DepCollector }, void, .exact, "fn (op: Op, out: *DepCollector) void");
     if (@hasDecl(Domain, "references"))
         checkHook(Domain, "references", &.{ Domain.Op, *ParamRefCollector }, void, .exact, "fn (op: Op, out: *ParamRefCollector) void");
+    if (@hasDecl(Domain, "links"))
+        checkHook(Domain, "links", &.{ Domain.Op, *LinkCollector }, void, .exact, "fn (op: Op, out: *LinkCollector) void");
 }
 
 /// True when a value of `T` can be duplicated with `=` and needs no cleanup:

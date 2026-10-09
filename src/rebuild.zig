@@ -21,7 +21,8 @@ pub const Allocators = struct {
 /// Applies `features[from..to]` to `doc`, writing each feature's status.
 ///
 /// `env` is opaque to the library and reaches `Domain.apply` as
-/// `ApplyContext.env` (see `Timeline.setEnv`).
+/// `ApplyContext.env` (see `Timeline.setEnv`); `registry` reaches it as
+/// `ApplyContext.registry` (see `Timeline.setRegistry`).
 ///
 /// Suppressed features are skipped and marked `.suppressed`. A soft failure
 /// (`error.FeatureFailed` via `ApplyContext.fail`) is recorded as `.failed`
@@ -40,6 +41,7 @@ pub fn applyRange(
     doc: *Domain.Doc,
     allocs: Allocators,
     env: ?*anyopaque,
+    registry: ?ft.Registry,
     param_values: []const ft.Param,
     applied: *u32,
 ) anyerror!void {
@@ -58,6 +60,7 @@ pub fn applyRange(
             .gpa = allocs.gpa,
             .feature_id = feature.id,
             .env = env,
+            .registry = registry,
             .param_values = param_values,
         };
         // Whatever `apply` left in the scratch arena dies with the feature.
@@ -123,6 +126,12 @@ pub fn Job(comptime Domain: type) type {
         /// Parameter snapshot captured at begin time (owned; names are
         /// borrowed and never read by jobs).
         param_values: []ft.Param = &.{},
+        /// Registry captured at begin time; reaches `Domain.apply` as
+        /// `ApplyContext.registry`.
+        registry: ?ft.Registry = null,
+        /// Versions of the linked timelines at begin time (owned).
+        /// `Timeline.integrate` rejects the job when any of them moved.
+        link_snapshot: []ft.LinkSeen = &.{},
 
         /// Apply features `[start_pos..target)` to `base`. Thread-safe against
         /// `cancel`; touches nothing but this job.
@@ -137,7 +146,7 @@ pub fn Job(comptime Domain: type) type {
                     return;
                 }
                 var applied: u32 = self.applied;
-                ft.rebuild.applyRange(Domain, self.features, self.applied, self.applied + 1, &self.base, allocs, self.env, self.param_values, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.features, self.applied, self.applied + 1, &self.base, allocs, self.env, self.registry, self.param_values, &applied) catch |err| {
                     self.state = .failed;
                     self.err = err;
                     return;
@@ -158,6 +167,7 @@ pub fn Job(comptime Domain: type) type {
         pub fn deinit(self: *Self) void {
             if (self.state == .consumed) return;
             self.gpa.free(self.param_values);
+            self.gpa.free(self.link_snapshot);
             for (self.features[@min(self.start_pos, self.features.len)..]) |*f| {
                 switch (f.status) {
                     .failed => |msg| self.gpa.free(msg),
@@ -198,7 +208,7 @@ test "applyRange records soft failures and continues" {
     var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer scratch.deinit();
     const allocs: Allocators = .{ .gpa = std.testing.allocator, .doc = std.testing.allocator, .scratch = &scratch };
-    try applyRange(Domain, &features, 0, 4, &doc, allocs, null, &.{}, &applied);
+    try applyRange(Domain, &features, 0, 4, &doc, allocs, null, null, &.{}, &applied);
 
     try std.testing.expectEqual(@as(i64, 12), doc.value);
     try std.testing.expectEqual(@as(u32, 4), applied);

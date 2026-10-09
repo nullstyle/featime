@@ -225,15 +225,26 @@ for byte budgets. Pull when real usage shows mid-history edits dominating.
    whole question — and it belongs where document size and churn are known,
    in the application. Building the arena into the library stays parked.
 
-## Open decision: references to other timelines
+## References to other timelines (step 1 DELIVERED, unreleased)
 
 `docs/timeline-references.md` compares four options (live links with
 library-tracked staleness, pinned references with `viewAt`, snapshots
-stored beside the feature, embedded sub-timelines — rejected) across
-identity, reading, invalidation, determinism, cycles, threads,
-persistence, sync, undo and memory. Recommendation there: live links
-first, then pins; snapshots only if containers must load alone or jobs
-must run while children are edited. Nothing is built yet.
+stored beside the feature, embedded sub-timelines — rejected). Decision:
+live links first, then pins.
+
+- **Step 1, live links — DELIVERED:** `Domain.links`, `setRegistry` /
+  `Registry` / `LinkHandle`, `ctx.link`, per-timeline versions recorded
+  after each run and compared by `dirty()` / `state()` / `beginRebuild`,
+  transitive through `version()`, cycle guard (soft failure), job
+  rejection when a linked timeline moved, FTZ6 header manifest with
+  `persistence.peekHeader`, `linkedTimelines`.
+- **Step 2, pinned references — NEXT:** `viewAt(pos, *Doc)` to read a
+  timeline at a position without moving its marker, pins that keep a
+  checkpoint alive at that position, and a mark in the op so "update
+  reference" is an ordinary edit. Makes parents deterministic and backward
+  peer references legal.
+- Snapshots (option C) stay in reserve for containers that must load
+  alone or jobs that must run while children are edited.
 
 ## Standing non-goals
 
