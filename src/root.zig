@@ -221,14 +221,31 @@ pub const ApplyContext = struct {
 /// records in a container which timelines it needs.
 pub const LinkCollector = struct {
     gpa: std.mem.Allocator,
-    ids: std.ArrayList(u64) = .empty,
+    links: std.ArrayList(Link) = .empty,
     failed: bool = false,
 
+    /// A live link: the op reads the timeline's `state()`, so its marker
+    /// moves count as changes.
     pub fn link(self: *LinkCollector, timeline_id: u64) void {
-        self.ids.append(self.gpa, timeline_id) catch {
+        self.links.append(self.gpa, .{ .timeline = timeline_id, .pinned = false }) catch {
             self.failed = true;
         };
     }
+
+    /// A pinned link: the op reads the timeline at a position of its own
+    /// choosing (`viewAt`), so only edits count, not marker moves.
+    pub fn pin(self: *LinkCollector, timeline_id: u64) void {
+        self.links.append(self.gpa, .{ .timeline = timeline_id, .pinned = true }) catch {
+            self.failed = true;
+        };
+    }
+};
+
+/// One link an op declares: which timeline, and whether it reads it live
+/// (`state()`) or at a pinned position (`viewAt`).
+pub const Link = struct {
+    timeline: u64,
+    pinned: bool,
 };
 
 /// A type-erased view of a timeline that other timelines may read:
@@ -237,7 +254,10 @@ pub const LinkCollector = struct {
 /// features are being applied.
 pub const LinkHandle = struct {
     ptr: *anyopaque,
+    /// Changes on every edit and marker move (what a live link compares).
     version: *const fn (ptr: *anyopaque) u64,
+    /// Changes on edits only (what a pinned link compares).
+    structure_version: *const fn (ptr: *anyopaque) u64,
     evaluating: *const fn (ptr: *anyopaque) bool,
 };
 
@@ -250,7 +270,7 @@ pub const Registry = struct {
 
 /// The version of a linked timeline as last seen (null: it could not be
 /// resolved at the time).
-pub const LinkSeen = struct { timeline: u64, version: ?u64 };
+pub const LinkSeen = struct { link: Link, version: ?u64 };
 
 /// One dependency edge declared through the optional `Domain.dependencies`
 /// hook. `Timeline.move` refuses reorders that would place a dependency

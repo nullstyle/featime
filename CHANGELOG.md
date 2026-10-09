@@ -74,6 +74,16 @@ All notable changes to featuretree-zig. The format follows
   jobs carry the registry and are rejected at `integrate` when a linked
   timeline changed meanwhile. Also `Timeline.version()`,
   `Timeline.linkedTimelines(gpa)` and `persistence.peekHeader(gpa, reader)`.
+- Pinned references, step 2. `viewAt(pos)` / `viewAtMark(mark)` compute
+  the document at any position without moving the marker (the caller frees
+  the result with `freeView`). `LinkCollector.pin(id)` declares a pinned
+  link, compared against the other timeline's new `structureVersion()`
+  (marker moves excluded), so a pinned reader stays clean while the other
+  timeline is scrubbed and re-runs when it is edited. `pin(mark)` /
+  `unpin(mark)` keep a checkpoint at a mark's position: it survives
+  eviction and `trim`, does not count against `max_checkpoints`, and the
+  next view restores it after an invalidating edit. `Stats.pins`. The
+  nested demo gains a pinned occurrence.
 - `tests/oom.zig`: an out-of-memory sweep over every local mutator, every
   remote entry kind, `load` and `save`. Each call is run once per
   allocation index with that allocation failing; afterwards the state must

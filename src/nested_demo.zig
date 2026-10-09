@@ -79,8 +79,11 @@ const Globe = struct {
     pub const Op = union(enum) {
         set_sea_level: struct { meters: f32 },
         /// A component occurrence, in Fusion terms: `region` is the region
-        /// timeline's id.
+        /// timeline's id. Reads the region at the region's own marker.
         region_occurrence: struct { region: u64 },
+        /// A pinned occurrence: reads the region as it is right after the
+        /// feature `after` (a mark), whatever the region's marker says.
+        region_at: struct { region: u64, after: ?ft.FeatureId },
     };
     pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
         switch (op) {
@@ -88,21 +91,31 @@ const Globe = struct {
             .region_occurrence => |o| {
                 const region: *RegionTimeline = @ptrCast(@alignCast(ctx.link(o.region) orelse
                     return ctx.fail("region {d} is not registered, or is in a reference cycle", .{o.region})));
-                const region_state = region.state();
-                doc.region_heights = region_state.heights;
-                doc.region_trees = region_state.trees;
-                doc.flooded = 0;
-                for (doc.region_heights) |h| {
-                    if (h < doc.sea_level) doc.flooded += 1;
-                }
+                mergeRegion(doc, region.state());
+            },
+            .region_at => |o| {
+                const region: *RegionTimeline = @ptrCast(@alignCast(ctx.link(o.region) orelse
+                    return ctx.fail("region {d} is not registered, or is in a reference cycle", .{o.region})));
+                var view = try region.viewAtMark(.{ .after = o.after });
+                defer region.freeView(&view);
+                mergeRegion(doc, &view);
             },
         }
     }
+    fn mergeRegion(doc: *Doc, region_state: *const Region.Doc) void {
+        doc.region_heights = region_state.heights;
+        doc.region_trees = region_state.trees;
+        doc.flooded = 0;
+        for (doc.region_heights) |h| {
+            if (h < doc.sea_level) doc.flooded += 1;
+        }
+    }
     /// Which timelines an op reads: the library re-runs the feature when
-    /// one of them changes.
+    /// one of them changes. A pinned read ignores the region's marker.
     pub fn links(op: Op, out: *ft.LinkCollector) void {
         switch (op) {
             .region_occurrence => |o| out.link(o.region),
+            .region_at => |o| out.pin(o.region),
             .set_sea_level => {},
         }
     }
@@ -145,14 +158,14 @@ pub fn run(out: *Io.Writer, arena: std.mem.Allocator) !void {
     try out.writeAll("\n-- 1. region: raise and plant -------------------------------\n");
     _ = try region.commit(.{ .raise = .{ .cell = 5, .amount = 4 } });
     _ = try region.commit(.{ .raise = .{ .cell = 6, .amount = 2 } });
-    _ = try region.commit(.{ .plant = .{ .count = 9 } });
+    const planted = try region.commit(.{ .plant = .{ .count = 9 } });
     _ = region.state();
     try printRegion(out, &region);
 
     // 2. The globe references the region through an occurrence feature.
     try out.writeAll("\n-- 2. globe: sea level + region occurrence ------------------\n");
     _ = try globe.commit(.{ .set_sea_level = .{ .meters = 2.0 } });
-    _ = try globe.commit(.{ .region_occurrence = .{ .region = region.timelineId() } });
+    const occurrence = try globe.commit(.{ .region_occurrence = .{ .region = region.timelineId() } });
     try printGlobe(out, &globe);
 
     // 3. Region edits flow on their own: the globe sees that the region's
@@ -175,6 +188,18 @@ pub fn run(out: *Io.Writer, arena: std.mem.Allocator) !void {
     globe.setMarker(1);
     try printGlobe(out, &globe);
     try printRegion(out, &region);
+
+    // 6. A pinned occurrence reads the region as it was right after the
+    //    planting, whatever the region's marker says: the region is scrubbed
+    //    back to 2 right now, and the globe is not even dirty when it moves.
+    try out.writeAll("\n-- 6. pinned occurrence: the region right after planting ----\n");
+    globe.setMarker(globe.len());
+    try globe.setSuppressed(occurrence, true);
+    _ = try globe.commit(.{ .region_at = .{ .region = region.timelineId(), .after = planted } });
+    try printGlobe(out, &globe); // 9 trees although the region's marker is at 2
+    region.setMarker(1);
+    try out.print("  globe dirty after a region scrub: {}\n", .{globe.dirty()});
+    try printGlobe(out, &globe);
 }
 
 // ---------------------------------------------------------------------------
@@ -225,4 +250,31 @@ test "occurrence fails softly without a registry" {
     var it = globe.features();
     const f = it.next().?;
     try std.testing.expectEqualStrings("region 42 is not registered, or is in a reference cycle", f.status.failed);
+}
+
+test "a pinned occurrence ignores the region's marker and follows its edits" {
+    const gpa = std.testing.allocator;
+    var region = try RegionTimeline.init(gpa, .{}, .{});
+    defer region.deinit();
+    var globe = try GlobeTimeline.init(gpa, .{}, .{});
+    defer globe.deinit();
+    var registry = Registry{ .region = &region };
+    globe.setRegistry(registry.registry());
+
+    const planted = try region.commit(.{ .plant = .{ .count = 3 } });
+    const live = try globe.commit(.{ .region_occurrence = .{ .region = region.timelineId() } });
+    _ = try globe.commit(.{ .region_at = .{ .region = region.timelineId(), .after = planted } });
+    try std.testing.expectEqual(@as(u32, 3), globe.state().region_trees);
+
+    // With the live occurrence suppressed, only the pinned one reads the region.
+    try globe.setSuppressed(live, true);
+    try std.testing.expectEqual(@as(u32, 3), globe.state().region_trees);
+    region.setMarker(0);
+    try std.testing.expect(!globe.dirty());
+    try std.testing.expectEqual(@as(u32, 3), globe.state().region_trees);
+
+    // A planting inserted before the mark's feature is part of the view.
+    _ = try region.commit(.{ .plant = .{ .count = 2 } });
+    try std.testing.expect(globe.dirty());
+    try std.testing.expectEqual(@as(u32, 5), globe.state().region_trees);
 }

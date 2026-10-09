@@ -32,6 +32,10 @@ pub fn Checkpoints(comptime Domain: type) type {
         doc_gpa: std.mem.Allocator,
         max: u8,
         entries: std.ArrayList(Entry) = .empty,
+        /// Positions whose checkpoints eviction and `trimTo` must keep, and
+        /// that do not count against `max`. The timeline sets them from its
+        /// pins before any operation that may evict (`Timeline.syncPins`).
+        pinned: std.ArrayList(u32) = .empty,
 
         pub fn init(gpa: std.mem.Allocator, doc_gpa: std.mem.Allocator, max: u8) Self {
             return .{ .gpa = gpa, .doc_gpa = doc_gpa, .max = max };
@@ -40,6 +44,36 @@ pub fn Checkpoints(comptime Domain: type) type {
         pub fn deinit(self: *Self) void {
             for (self.entries.items) |*e| self.destroyEntry(e);
             self.entries.deinit(self.gpa);
+            self.pinned.deinit(self.gpa);
+        }
+
+        pub fn isPinned(self: *const Self, pos: u32) bool {
+            return std.mem.indexOfScalar(u32, self.pinned.items, pos) != null;
+        }
+
+        fn unpinnedCount(self: *const Self) usize {
+            var n: usize = 0;
+            for (self.entries.items) |e| {
+                if (!self.isPinned(e.pos)) n += 1;
+            }
+            return n;
+        }
+
+        /// Make room for one more unpinned entry: evict the oldest unpinned
+        /// ones while the unpinned count is at `max`.
+        fn makeRoom(self: *Self) void {
+            while (self.unpinnedCount() >= self.max) {
+                var victim: ?usize = null;
+                for (self.entries.items, 0..) |e, i| {
+                    if (!self.isPinned(e.pos)) {
+                        victim = i;
+                        break;
+                    }
+                }
+                const i = victim orelse return;
+                var dead = self.entries.orderedRemove(i);
+                self.destroyEntry(&dead);
+            }
         }
 
         /// Drop checkpoints invalidated by a structural mutation at `index`.
@@ -63,18 +97,19 @@ pub fn Checkpoints(comptime Domain: type) type {
         /// release of memory.
         pub fn trimTo(self: *Self, keep: u8, marker: u32) u32 {
             var dropped: u32 = 0;
-            while (self.entries.items.len > keep) {
-                var worst: usize = 0;
+            while (self.unpinnedCount() > keep) {
+                var worst: ?usize = null;
                 var worst_d: u64 = 0;
                 for (self.entries.items, 0..) |e, i| {
+                    if (self.isPinned(e.pos)) continue;
                     const d: u64 = if (e.pos > marker) e.pos - marker else marker - e.pos;
-                    const further = d > worst_d or (d == worst_d and e.pos < self.entries.items[worst].pos);
-                    if (i == 0 or further) {
+                    const further = d > worst_d or (d == worst_d and e.pos < self.entries.items[worst.?].pos);
+                    if (worst == null or further) {
                         worst = i;
                         worst_d = d;
                     }
                 }
-                var dead = self.entries.orderedRemove(worst);
+                var dead = self.entries.orderedRemove(worst.?);
                 self.destroyEntry(&dead);
                 dropped += 1;
             }
@@ -120,13 +155,29 @@ pub fn Checkpoints(comptime Domain: type) type {
                 ft.deinitDoc(Domain, &dead, self.doc_gpa);
                 return;
             };
-            while (self.entries.items.len >= self.max) {
-                var dead = self.entries.orderedRemove(0);
-                self.destroyEntry(&dead);
-            }
+            self.makeRoom();
             self.entries.append(self.gpa, entry) catch {
                 var full = entry;
                 self.destroyEntry(&full);
+            };
+        }
+
+        /// Store an already-owned document and status array as the
+        /// checkpoint at `pos` (ownership moves in, even on failure). An
+        /// existing entry at the position is replaced.
+        pub fn addOwned(self: *Self, pos: u32, doc: Doc, statuses: []ft.Status) void {
+            var entry: Entry = .{ .pos = pos, .doc = doc, .statuses = statuses };
+            if (self.max == 0) {
+                self.destroyEntry(&entry);
+                return;
+            }
+            if (self.indexOfPos(pos)) |i| {
+                var dead = self.entries.orderedRemove(i);
+                self.destroyEntry(&dead);
+            }
+            self.makeRoom();
+            self.entries.append(self.gpa, entry) catch {
+                self.destroyEntry(&entry);
             };
         }
 

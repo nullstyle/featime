@@ -342,13 +342,13 @@ pub fn linkedTimelines(comptime Domain: type, features: []const ft.Feature(Domai
     errdefer out.deinit(gpa);
     if (comptime @hasDecl(Domain, "links")) {
         var collector: ft.LinkCollector = .{ .gpa = gpa };
-        defer collector.ids.deinit(gpa);
+        defer collector.links.deinit(gpa);
         for (features) |f| {
-            collector.ids.clearRetainingCapacity();
+            collector.links.clearRetainingCapacity();
             Domain.links(f.op, &collector);
             if (collector.failed) return error.OutOfMemory;
-            for (collector.ids.items) |id| {
-                if (std.mem.indexOfScalar(u64, out.items, id) == null) try out.append(gpa, id);
+            for (collector.links.items) |l| {
+                if (std.mem.indexOfScalar(u64, out.items, l.timeline) == null) try out.append(gpa, l.timeline);
             }
         }
         std.mem.sort(u64, out.items, {}, std.sort.asc(u64));

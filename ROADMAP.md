@@ -225,7 +225,7 @@ for byte budgets. Pull when real usage shows mid-history edits dominating.
    whole question — and it belongs where document size and churn are known,
    in the application. Building the arena into the library stays parked.
 
-## References to other timelines (step 1 DELIVERED, unreleased)
+## References to other timelines (steps 1 and 2 DELIVERED, unreleased)
 
 `docs/timeline-references.md` compares four options (live links with
 library-tracked staleness, pinned references with `viewAt`, snapshots
@@ -238,11 +238,16 @@ live links first, then pins.
   transitive through `version()`, cycle guard (soft failure), job
   rejection when a linked timeline moved, FTZ6 header manifest with
   `persistence.peekHeader`, `linkedTimelines`.
-- **Step 2, pinned references — NEXT:** `viewAt(pos, *Doc)` to read a
-  timeline at a position without moving its marker, pins that keep a
-  checkpoint alive at that position, and a mark in the op so "update
-  reference" is an ordinary edit. Makes parents deterministic and backward
-  peer references legal.
+- **Step 2, pinned references — DELIVERED:** `viewAt` / `viewAtMark`
+  read a timeline at a position without moving its marker; `pin` / `unpin`
+  keep a checkpoint there (spared by eviction and `trim`); pinned links
+  (`LinkCollector.pin`) compare `structureVersion()`, so marker moves in
+  the other timeline do not re-run the reader; the mark rides in the op,
+  so "update reference" is an ordinary edit.
+- Still open after step 2: a commit-time check that a pin points
+  backwards in time (the runtime cycle guard covers correctness); versions
+  per position, so an edit *after* a pinned mark does not re-run a pinned
+  reader (today any edit in the other timeline does).
 - Snapshots (option C) stay in reserve for containers that must load
   alone or jobs that must run while children are edited.
 

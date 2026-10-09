@@ -400,8 +400,8 @@ _ = tl.trim(.{
 });
 ```
 
-Dropping checkpoints only makes scrubbing slower; dropping journal units
-shrinks undo depth. The configured `max_checkpoints` / `max_journal` are
+Dropping checkpoints only makes scrubbing slower (pinned checkpoints are
+kept); dropping journal units shrinks undo depth. The configured `max_checkpoints` / `max_journal` are
 unchanged — `trim` is a one-off release, called from your memory-pressure
 handler.
 
@@ -509,8 +509,7 @@ The rules of the model:
   being evaluated right now, so the read that closes a cycle soft-fails
   instead of recursing. Which read that is depends on evaluation order, and
   a cyclic link graph never settles: treat a cycle as an error. Pinned
-  references (planned; `docs/timeline-references.md`) will make backward
-  references legal.
+  references that only point backwards in time (below) cannot form one.
 - **Background jobs** carry the registry and read linked timelines while
   they run, so do not edit a linked timeline during a parent's job. If one
   changes between `beginRebuild` and `integrate`, the job is rejected like
@@ -523,11 +522,48 @@ The rules of the model:
   ids a timeline reads, and a container's header records them
   (`persistence.peekHeader`), so an app can open them first.
 
+### Pinned references
+
+A live link reads the other timeline at *its* marker, so that timeline's
+slider leaks into the parent. A pinned reference names a version instead:
+the op carries a `Mark` (`.{ .after = feature_id }`, anchored like a
+chapter; `null` means the tip), `apply` reads it with `viewAtMark`, and
+`links` declares it with `out.pin(id)`:
+
+```zig
+region_at: struct { region: u64, after: ?ft.FeatureId },
+// links:  .region_at => |o| out.pin(o.region),
+// apply:  var view = try region.viewAtMark(.{ .after = o.after });
+//         defer region.freeView(&view);
+//         merge `view` into the doc
+```
+
+`viewAt(pos)` computes the document at any position without moving the
+marker — from the nearest checkpoint, the live document or the seed,
+replaying the rest; the caller owns the result. A pinned link compares the
+other timeline's `structureVersion()`, which marker moves do not touch, so
+scrubbing the region leaves a pinned globe clean, while an edit in the
+region re-runs it. "Update the reference" is an ordinary `edit` of the op:
+it journals, undoes and syncs like any edit.
+
+A view far from the other timeline's marker replays from the seed.
+`pin(mark)` keeps a checkpoint at the mark's position: pinned checkpoints
+survive eviction and `trim`, do not count against `max_checkpoints`, are
+dropped by an edit before the position like any checkpoint, and come back
+with the next view there. `unpin(mark)` releases one; `stats().pins`
+counts them. Pins are runtime state, not saved: pin again after `load`.
+
+A cycle through pinned reads ends like a live one: the read that closes
+it fails softly, inside the view. A pin that points backwards in time
+(to features older than the pinning feature) cannot close a cycle; the
+library does not check that at commit yet.
+
 For a multiuser editor this shape doubles as the sync/merge unit: each
 sub-timeline (with its stable ids and flat journal) is an independent
 shard. `src/nested_demo.zig` (part of `zig build run`) walks the whole
 pattern: region edits, the globe following them, region-marker scrubbing,
-and globe rollback leaving the region untouched.
+globe rollback leaving the region untouched, and a pinned occurrence that
+ignores the region's marker.
 
 ## Testing
 
