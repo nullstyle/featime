@@ -286,6 +286,9 @@ iterate before the next edit.
   serializable.
 - **Feature ids are stable.** Assigned at commit, never reused; safe handles
   for UI selection, dependencies, and persistence.
+- **Allocators.** Document memory comes from `ctx.alloc`, temporaries from
+  `ctx.scratch` (freed for you after each feature), nothing else — see
+  Configuration → Allocators.
 - **Unknown ids are errors.** Every mutator that takes an id returns
   `error.UnknownFeature` / `UnknownChapter` / `UnknownGroup` / `UnknownParam`
   when the id is not on this timeline, so a stale handle (say, after a
@@ -314,12 +317,30 @@ iterate before the next edit.
    .max_checkpoints     = 4,    // document copies kept (memory knob)
    .checkpoint_on_scrub = true, // snapshot when the marker leaves a position
    .max_journal         = 1024, // undo depth; 0 disables
+   .doc_allocator       = null, // where document memory lives (default: the gpa)
    .id_seed             = null } // OS randomness for the id anchor (multi-replica apps)
 ```
 
 Globe-sized documents: raise the interval, lower `max_checkpoints`. The
 cache is an optimization — a checkpoint-free timeline still works (backward
 scrubs replay from the seed).
+
+### Allocators
+
+`apply` sees three allocators on its context:
+
+- `ctx.alloc` — the document allocator: `Config.doc_allocator`, or the gpa
+  when none is set. Memory the document keeps comes from here. `cloneDoc`
+  and `deinitDoc` receive the same allocator, and so must the seed you pass
+  to `init`.
+- `ctx.scratch` — an arena the timeline resets after every feature.
+  Temporaries need no `free`; never store a scratch pointer in the document.
+- `ctx.gpa` — the timeline's general allocator (failure messages,
+  bookkeeping).
+
+Point `doc_allocator` at a pool or a budgeted allocator and document memory
+becomes accountable on its own: everything the library allocates for
+itself (journal, status copies, failure messages) stays on the gpa.
 
 ## Memory pressure
 
@@ -468,7 +489,7 @@ tests/oracle.zig   differential tests vs a naive reference model
 
 ## Status & non-goals
 
-v0.8.0 — all four roadmap waves plus the deferred tail delivered (minus disk-backed checkpoints); see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
+v0.9.0 — all four roadmap waves plus the deferred tail delivered (minus disk-backed checkpoints); see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
 feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are

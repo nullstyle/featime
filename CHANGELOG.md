@@ -3,6 +3,24 @@
 All notable changes to featuretree-zig. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
+## 0.9.0 — 2026-10-09
+
+### Added
+- `ApplyContext.scratch`: an arena the timeline resets after every feature.
+  Temporaries in `apply` need no `free`.
+- `Config.doc_allocator`: where document memory lives — the seed, the live
+  document, checkpoints, job bases, and what `apply` allocates through
+  `ctx.alloc`. Defaults to the gpa; the library's own bookkeeping always
+  stays on the gpa. `Timeline.docAllocator()` reports it; `ApplyContext.gpa`
+  exposes the general allocator.
+
+### Changed (breaking for direct users of the replay core)
+- `rebuild.applyRange` takes `rebuild.Allocators { gpa, doc, scratch }`
+  instead of one allocator; `rebuild.Job` and the checkpoint cache carry the
+  document allocator.
+- `ApplyContext.alloc` is now the document allocator (identical to before
+  unless `doc_allocator` is set); `fail` messages are allocated from the gpa.
+
 ## 0.8.0 — 2026-10-09
 
 ### Added

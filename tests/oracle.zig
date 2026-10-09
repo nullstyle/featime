@@ -1016,7 +1016,10 @@ const Naive = struct {
         for (self.features.items) |*f| self.freeStatus(f);
         var doc: Domain.Doc = .{};
         var applied: u32 = 0;
-        try ft.rebuild.applyRange(Domain, self.features.items, 0, self.marker, &doc, self.gpa, null, self.param_mirror.items, &applied);
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const allocs: ft.rebuild.Allocators = .{ .gpa = self.gpa, .doc = self.gpa, .scratch = &scratch };
+        try ft.rebuild.applyRange(Domain, self.features.items, 0, self.marker, &doc, allocs, null, self.param_mirror.items, &applied);
         return .{ .value = doc.value, .trace = try doc.trace.toOwnedSlice(self.gpa) };
     }
 };

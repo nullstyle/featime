@@ -27,11 +27,14 @@ pub fn Checkpoints(comptime Domain: type) type {
         };
 
         gpa: std.mem.Allocator,
+        /// Where document copies live (`Config.doc_allocator` or `gpa`);
+        /// status copies stay on `gpa`.
+        doc_gpa: std.mem.Allocator,
         max: u8,
         entries: std.ArrayList(Entry) = .empty,
 
-        pub fn init(gpa: std.mem.Allocator, max: u8) Self {
-            return .{ .gpa = gpa, .max = max };
+        pub fn init(gpa: std.mem.Allocator, doc_gpa: std.mem.Allocator, max: u8) Self {
+            return .{ .gpa = gpa, .doc_gpa = doc_gpa, .max = max };
         }
 
         pub fn deinit(self: *Self) void {
@@ -109,12 +112,12 @@ pub fn Checkpoints(comptime Domain: type) type {
             }
             var entry: Entry = .{
                 .pos = pos,
-                .doc = ft.cloneDoc(Domain, doc, self.gpa) catch return,
+                .doc = ft.cloneDoc(Domain, doc, self.doc_gpa) catch return,
                 .statuses = &.{},
             };
             entry.statuses = self.cloneStatuses(features[0..pos]) catch {
                 var dead = entry.doc;
-                ft.deinitDoc(Domain, &dead, self.gpa);
+                ft.deinitDoc(Domain, &dead, self.doc_gpa);
                 return;
             };
             while (self.entries.items.len >= self.max) {
@@ -140,7 +143,7 @@ pub fn Checkpoints(comptime Domain: type) type {
                 else => {},
             };
             self.gpa.free(e.statuses);
-            ft.deinitDoc(Domain, &e.doc, self.gpa);
+            ft.deinitDoc(Domain, &e.doc, self.doc_gpa);
         }
 
         fn cloneStatuses(self: *Self, features: []const ft.Feature(Domain.Op)) ![]ft.Status {

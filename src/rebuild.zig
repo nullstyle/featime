@@ -6,6 +6,18 @@
 const std = @import("std");
 const ft = @import("root.zig");
 
+/// The allocators a replay works with. `gpa` is the timeline's general
+/// allocator (failure messages, bookkeeping); `doc` is where document
+/// memory lives (`Config.doc_allocator` or `gpa`); `scratch` is the arena
+/// handed to `apply` as `ctx.scratch` and reset after every feature — the
+/// caller owns it and frees it once the pass is over, so the retained
+/// buffer is reused across features.
+pub const Allocators = struct {
+    gpa: std.mem.Allocator,
+    doc: std.mem.Allocator,
+    scratch: *std.heap.ArenaAllocator,
+};
+
 /// Applies `features[from..to]` to `doc`, writing each feature's status.
 ///
 /// `env` is opaque to the library and reaches `Domain.apply` as
@@ -26,7 +38,7 @@ pub fn applyRange(
     from: u32,
     to: u32,
     doc: *Domain.Doc,
-    gpa: std.mem.Allocator,
+    allocs: Allocators,
     env: ?*anyopaque,
     param_values: []const ft.Param,
     applied: *u32,
@@ -41,11 +53,15 @@ pub fn applyRange(
             continue;
         }
         var ctx: ft.ApplyContext = .{
-            .alloc = gpa,
+            .alloc = allocs.doc,
+            .scratch = allocs.scratch.allocator(),
+            .gpa = allocs.gpa,
             .feature_id = feature.id,
             .env = env,
             .param_values = param_values,
         };
+        // Whatever `apply` left in the scratch arena dies with the feature.
+        defer _ = allocs.scratch.reset(.retain_capacity);
         Domain.apply(feature.op, doc, &ctx) catch |err| switch (err) {
             error.FeatureFailed => {
                 feature.status = .{ .failed = ctx.message orelse "feature failed" };
@@ -83,6 +99,8 @@ pub fn Job(comptime Domain: type) type {
         };
 
         gpa: std.mem.Allocator,
+        /// Where `base` lives (`Config.doc_allocator` or `gpa`).
+        doc_gpa: std.mem.Allocator,
         /// Timeline generation at begin time; a mismatch at integrate time
         /// means the plan changed and the result must be discarded.
         generation: u64,
@@ -110,13 +128,16 @@ pub fn Job(comptime Domain: type) type {
         /// `cancel`; touches nothing but this job.
         pub fn run(self: *Self) void {
             self.state = .running;
+            var scratch = std.heap.ArenaAllocator.init(self.gpa);
+            defer scratch.deinit();
+            const allocs: Allocators = .{ .gpa = self.gpa, .doc = self.doc_gpa, .scratch = &scratch };
             while (self.applied < self.target) {
                 if (self.cancel_requested.load(.acquire)) {
                     self.state = .cancelled;
                     return;
                 }
                 var applied: u32 = self.applied;
-                ft.rebuild.applyRange(Domain, self.features, self.applied, self.applied + 1, &self.base, self.gpa, self.env, self.param_values, &applied) catch |err| {
+                ft.rebuild.applyRange(Domain, self.features, self.applied, self.applied + 1, &self.base, allocs, self.env, self.param_values, &applied) catch |err| {
                     self.state = .failed;
                     self.err = err;
                     return;
@@ -144,7 +165,7 @@ pub fn Job(comptime Domain: type) type {
                 }
             }
             self.gpa.free(self.features);
-            ft.deinitDoc(Domain, &self.base, self.gpa);
+            ft.deinitDoc(Domain, &self.base, self.doc_gpa);
             self.state = .consumed;
         }
     };
@@ -174,7 +195,10 @@ test "applyRange records soft failures and continues" {
 
     var doc: Domain.Doc = .{};
     var applied: u32 = 0;
-    try applyRange(Domain, &features, 0, 4, &doc, std.testing.allocator, null, &.{}, &applied);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const allocs: Allocators = .{ .gpa = std.testing.allocator, .doc = std.testing.allocator, .scratch = &scratch };
+    try applyRange(Domain, &features, 0, 4, &doc, allocs, null, &.{}, &applied);
 
     try std.testing.expectEqual(@as(i64, 12), doc.value);
     try std.testing.expectEqual(@as(u32, 4), applied);

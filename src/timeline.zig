@@ -123,7 +123,8 @@ pub fn Timeline(comptime Domain: type) type {
         // ------------------------------------------------------------------
 
         pub fn init(gpa: std.mem.Allocator, seed_doc: Doc, config: ft.Config) !Self {
-            const live = try ft.cloneDoc(Domain, &seed_doc, gpa);
+            const doc_gpa = config.doc_allocator orelse gpa;
+            const live = try ft.cloneDoc(Domain, &seed_doc, doc_gpa);
             // Random id anchor: independently created timelines (other
             // peers, other processes) must allocate from disjoint id ranges,
             // and `allocId` only ever moves the counter forward from here.
@@ -137,7 +138,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .seed_doc = seed_doc,
                 .live_doc = live,
                 .next_id = prng.random().int(ft.FeatureId) | 1,
-                .cps = checkpoint.Checkpoints(Domain).init(gpa, config.max_checkpoints),
+                .cps = checkpoint.Checkpoints(Domain).init(gpa, doc_gpa, config.max_checkpoints),
                 .journal = journaling.Journal(Op).init(gpa, config.max_journal, config.now),
                 .ann = annotations.Annotations.init(gpa),
                 .ptab = params.ParamTable.init(gpa),
@@ -165,8 +166,13 @@ pub fn Timeline(comptime Domain: type) type {
             self.journal.deinit();
             self.ann.deinit();
             self.ptab.deinit();
-            ft.deinitDoc(Domain, &self.seed_doc, self.gpa);
-            ft.deinitDoc(Domain, &self.live_doc, self.gpa);
+            ft.deinitDoc(Domain, &self.seed_doc, self.docAllocator());
+            ft.deinitDoc(Domain, &self.live_doc, self.docAllocator());
+        }
+
+        /// Where document memory lives: `Config.doc_allocator` or the gpa.
+        pub fn docAllocator(self: *const Self) std.mem.Allocator {
+            return self.config.doc_allocator orelse self.gpa;
         }
 
         /// This timeline's stable identity (see `timeline_id`).
@@ -293,7 +299,9 @@ pub fn Timeline(comptime Domain: type) type {
 
             if (self.broken == null and !self.live_stale and self.built_pos == at) {
                 var applied: u32 = at;
-                ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.gpa, self.env, self.ptab.items(), &applied) catch |err| {
+                var scratch = std.heap.ArenaAllocator.init(self.gpa);
+                defer scratch.deinit();
+                ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.allocators(&scratch), self.env, self.ptab.items(), &applied) catch |err| {
                     // Hard failure: features before `at` are still good on the
                     // live doc, but this op may have partially mutated it.
                     // Flag broken so nothing touches it before a full rebuild.
@@ -1704,8 +1712,8 @@ pub fn Timeline(comptime Domain: type) type {
                     have_base = true;
                 }
             }
-            if (!have_base) base = try ft.cloneDoc(Domain, &self.seed_doc, self.gpa);
-            errdefer ft.deinitDoc(Domain, &base, self.gpa);
+            if (!have_base) base = try ft.cloneDoc(Domain, &self.seed_doc, self.docAllocator());
+            errdefer ft.deinitDoc(Domain, &base, self.docAllocator());
 
             const features_copy = try self.gpa.dupe(ft.Feature(Op), self.list.items);
             errdefer self.gpa.free(features_copy);
@@ -1717,6 +1725,7 @@ pub fn Timeline(comptime Domain: type) type {
 
             return .{
                 .gpa = self.gpa,
+                .doc_gpa = self.docAllocator(),
                 .generation = self.gen,
                 .target = self.marker_pos,
                 .start_pos = start_pos,
@@ -1749,7 +1758,7 @@ pub fn Timeline(comptime Domain: type) type {
                     return false;
                 },
             }
-            ft.deinitDoc(Domain, &self.live_doc, self.gpa);
+            ft.deinitDoc(Domain, &self.live_doc, self.docAllocator());
             self.live_doc = job.base;
             self.resetStatuses(job.start_pos);
             var i: u32 = job.start_pos;
@@ -1772,6 +1781,10 @@ pub fn Timeline(comptime Domain: type) type {
 
         fn touch(self: *Self) void {
             self.gen += 1;
+        }
+
+        fn allocators(self: *const Self, scratch: *std.heap.ArenaAllocator) ft.rebuild.Allocators {
+            return .{ .gpa = self.gpa, .doc = self.docAllocator(), .scratch = scratch };
         }
 
         /// Belt and braces for `integrate`: the job's private feature copy
@@ -1836,7 +1849,7 @@ pub fn Timeline(comptime Domain: type) type {
             // 1. Exact checkpoint restore — the slider fast path. Scrubbing
             //    back to a snapshotted position costs zero applies.
             if (self.cps.takeExact(self.marker_pos)) |taken| {
-                ft.deinitDoc(Domain, &self.live_doc, self.gpa);
+                ft.deinitDoc(Domain, &self.live_doc, self.docAllocator());
                 self.live_doc = taken.doc;
                 self.resetStatuses(0);
                 for (taken.statuses, 0..) |s, i| self.list.items[i].status = s;
@@ -1852,7 +1865,9 @@ pub fn Timeline(comptime Domain: type) type {
             if (self.broken == null and !self.live_stale and self.built_pos < self.marker_pos) {
                 self.resetStatuses(self.built_pos);
                 var applied: u32 = self.built_pos;
-                ft.rebuild.applyRange(Domain, self.list.items, self.built_pos, self.marker_pos, &self.live_doc, self.gpa, self.env, self.ptab.items(), &applied) catch |err| {
+                var scratch = std.heap.ArenaAllocator.init(self.gpa);
+                defer scratch.deinit();
+                ft.rebuild.applyRange(Domain, self.list.items, self.built_pos, self.marker_pos, &self.live_doc, self.allocators(&scratch), self.env, self.ptab.items(), &applied) catch |err| {
                     self.broken = err;
                     self.built_pos = applied;
                     return;
@@ -1873,11 +1888,13 @@ pub fn Timeline(comptime Domain: type) type {
                     base = &e.doc;
                 }
             }
-            var scratch = ft.cloneDoc(Domain, base, self.gpa) catch |err| {
+            var scratch = ft.cloneDoc(Domain, base, self.docAllocator()) catch |err| {
                 self.broken = err;
                 return;
             };
             self.resetStatuses(start);
+            var scratch_arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer scratch_arena.deinit();
             var pos: u32 = start;
             while (pos < self.marker_pos) {
                 const end = if (self.config.checkpoint_interval > 0)
@@ -1885,8 +1902,8 @@ pub fn Timeline(comptime Domain: type) type {
                 else
                     self.marker_pos;
                 var applied: u32 = pos;
-                ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.gpa, self.env, self.ptab.items(), &applied) catch |err| {
-                    ft.deinitDoc(Domain, &scratch, self.gpa);
+                ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.allocators(&scratch_arena), self.env, self.ptab.items(), &applied) catch |err| {
+                    ft.deinitDoc(Domain, &scratch, self.docAllocator());
                     self.broken = err;
                     return; // live_doc still holds the last good state
                 };
@@ -1895,7 +1912,7 @@ pub fn Timeline(comptime Domain: type) type {
                     self.cps.add(end, &scratch, self.list.items);
                 }
             }
-            ft.deinitDoc(Domain, &self.live_doc, self.gpa);
+            ft.deinitDoc(Domain, &self.live_doc, self.docAllocator());
             self.live_doc = scratch;
             self.built_pos = self.marker_pos;
             self.live_stale = false;
@@ -3902,4 +3919,127 @@ test "cherryPick copies a feature with its annotations as one undo unit" {
     try std.testing.expect(std.meta.eql(src.featureById(dup).?.op.*, TestDomain.Op{ .mul = 3 }));
     // Source untouched by the copy.
     try std.testing.expectEqualStrings("seven", src.featureName(a).?);
+}
+
+/// Counts allocations and live bytes going through it; delegates to `inner`.
+const CountingAllocator = struct {
+    inner: std.mem.Allocator,
+    allocs: usize = 0,
+    live: usize = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const out = self.inner.rawAlloc(len, alignment, ret_addr);
+        if (out != null) {
+            self.allocs += 1;
+            self.live += len;
+        }
+        return out;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ok = self.inner.rawResize(memory, alignment, new_len, ret_addr);
+        if (ok) self.live = self.live - memory.len + new_len;
+        return ok;
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const out = self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+        if (out != null) self.live = self.live - memory.len + new_len;
+        return out;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.live -= memory.len;
+        self.inner.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+/// Allocates temporaries from `ctx.scratch` without freeing them, and keeps
+/// document memory on `ctx.alloc`.
+const ScratchDomain = struct {
+    pub const Doc = struct { items: std.ArrayList(u32) = .empty };
+    pub const Op = union(enum) { push: u32, fail: void };
+
+    pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
+        switch (op) {
+            .push => |v| {
+                // A temporary that is never freed: the arena owns it.
+                const tmp = try ctx.scratch.alloc(u32, 1024);
+                tmp[0] = v;
+                try doc.items.append(ctx.alloc, tmp[0]);
+            },
+            .fail => return ctx.fail("nope", .{}),
+        }
+    }
+    pub fn cloneDoc(doc: *const Doc, gpa: std.mem.Allocator) anyerror!Doc {
+        return .{ .items = try doc.items.clone(gpa) };
+    }
+    pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void {
+        doc.items.deinit(gpa);
+    }
+};
+
+test "allocators: scratch temporaries need no free; document memory goes to doc_allocator" {
+    const gpa = std.testing.allocator;
+    var doc_mem = CountingAllocator{ .inner = gpa };
+    var seed: ScratchDomain.Doc = .{};
+    try seed.items.append(doc_mem.allocator(), 7); // the seed lives on the doc allocator too
+
+    var tl = try Timeline(ScratchDomain).init(gpa, seed, .{ .doc_allocator = doc_mem.allocator(), .checkpoint_on_scrub = true });
+    defer tl.deinit();
+
+    _ = try tl.commit(.{ .push = 1 });
+    _ = try tl.commit(.{ .push = 2 });
+    _ = try tl.commit(.{ .fail = {} });
+    _ = try tl.commit(.{ .push = 3 });
+    try std.testing.expectEqual(@as(usize, 4), tl.state().items.items.len);
+    try std.testing.expect(doc_mem.allocs > 0);
+
+    // Scrub, checkpoint, background job: every path uses the doc allocator
+    // for copies and a scratch arena for temporaries. testing.allocator
+    // reports leaks, so unfreed scratch would fail this test.
+    tl.setMarker(1);
+    _ = tl.state();
+    tl.setMarker(4);
+    _ = tl.state();
+    var it = tl.features();
+    const first = it.next().?.id;
+    try tl.edit(first, .{ .push = 10 });
+    var job = try tl.beginRebuild();
+    defer job.deinit();
+    job.run();
+    try std.testing.expect(tl.integrate(&job));
+    try std.testing.expectEqual(@as(u32, 10), tl.state().items.items[1]);
+
+    try std.testing.expect(doc_mem.live > 0);
+}
+
+test "allocators: failure messages never touch the document allocator" {
+    const gpa = std.testing.allocator;
+    var doc_mem = CountingAllocator{ .inner = gpa };
+    var tl = try Timeline(ScratchDomain).init(gpa, .{}, .{ .doc_allocator = doc_mem.allocator() });
+    defer tl.deinit();
+
+    // An empty document clones without allocating; the only allocation a
+    // failing feature causes is its message, which belongs to the gpa.
+    _ = try tl.commit(.{ .fail = {} });
+    _ = try tl.commit(.{ .fail = {} });
+    _ = tl.state();
+    var it = tl.features();
+    try std.testing.expectEqualStrings("nope", it.next().?.status.failed);
+    try std.testing.expectEqual(@as(usize, 0), doc_mem.allocs);
+}
+
+test "allocators: without doc_allocator everything stays on the gpa" {
+    const gpa = std.testing.allocator;
+    var tl = try Timeline(ScratchDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+    try std.testing.expectEqual(gpa.ptr, tl.docAllocator().ptr);
+    _ = try tl.commit(.{ .push = 1 });
+    try std.testing.expectEqual(@as(usize, 1), tl.state().items.items.len);
 }

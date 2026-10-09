@@ -129,12 +129,20 @@ pub fn FeatureView(comptime Op: type) type {
 
 /// Handed to `Domain.apply` for every feature application.
 pub const ApplyContext = struct {
-    /// The timeline's allocator (the `gpa` passed to `Timeline.init`). Use it
-    /// for memory the document keeps — the demos append to document lists
-    /// with it — and `fail` uses it for the recorded message. Scratch memory
-    /// you do not store in the document must be freed before `apply`
-    /// returns.
+    /// The document allocator: `Config.doc_allocator`, or the timeline's
+    /// `gpa` when none is set. Use it for memory the document keeps — the
+    /// demos append to document lists with it. `cloneDoc` and `deinitDoc`
+    /// receive the same allocator, and the seed passed to `Timeline.init`
+    /// must come from it.
     alloc: std.mem.Allocator,
+
+    /// Scratch memory for this `apply` call only: an arena the timeline
+    /// resets as soon as the feature returns. Allocate temporaries here and
+    /// never free them. Never store a scratch pointer in the document.
+    scratch: std.mem.Allocator,
+
+    /// The timeline's general allocator (`fail` messages, bookkeeping).
+    gpa: std.mem.Allocator,
 
     /// Id of the feature being applied. Ops that create named entities in
     /// the document (Fusion-style "the body this extrude produced") can
@@ -169,7 +177,7 @@ pub const ApplyContext = struct {
     ///
     /// `apply` must leave the document unmodified on this path.
     pub fn fail(self: *ApplyContext, comptime fmt: []const u8, args: anytype) error{FeatureFailed} {
-        self.message = std.fmt.allocPrint(self.alloc, fmt, args) catch "feature failed";
+        self.message = std.fmt.allocPrint(self.gpa, fmt, args) catch "feature failed";
         return error.FeatureFailed;
     }
 };
@@ -222,6 +230,14 @@ pub const Clock = *const fn () u64;
 pub const Config = struct {
     /// Wall clock used to stamp provenance on plain commits (see `Clock`).
     now: ?Clock = null,
+    /// Where document memory lives: the seed you pass to `init`, every copy
+    /// `cloneDoc` makes (live document, checkpoints, job bases), and what
+    /// `apply` allocates through `ctx.alloc`. Null means the timeline's
+    /// `gpa`. A dedicated pool or budgeted allocator here keeps document
+    /// memory accountable separately from the library's own bookkeeping
+    /// (journal, checkpoints' status copies, failure messages), which
+    /// always uses the `gpa`.
+    doc_allocator: ?std.mem.Allocator = null,
     /// Entropy for this timeline's random id anchor: the start of the shared
     /// feature/chapter/group/param id counter and the `timeline_id`.
     /// Replicas must allocate ids from disjoint ranges, so in multi-process
