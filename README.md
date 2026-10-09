@@ -330,10 +330,9 @@ iterate before the next edit.
   first), so `error.OutOfMemory` means nothing happened; call again later.
   The multi-step edits (`moveGroup`, `removeGroupContents`, `cherryPick`)
   unwind what they had done, and the unwinding needs no memory. `undo` and
-  `redo` never fail: the structure always comes back, a removed feature's
-  name and tags come back without allocating, and only the text of an
-  annotation edit (a name, a tag, a chapter or group name) may be missing
-  if memory is exhausted at that moment. Two limits: with `max_journal = 0`
+  `redo` never fail and never allocate: names, tags and the other strings
+  move between the journal and the live stores instead of being copied,
+  so exhausted memory cannot lose them. Two limits: with `max_journal = 0`
   there is no journal to unwind a multi-step edit, so it stays partially
   applied (the error still reports it); and if a record observer is
   attached, the steps already emitted stay on the feed, like an `undo` —
@@ -519,7 +518,7 @@ and globe rollback leaving the region untouched.
   remote entry kind, `load` and `save` run once per allocation index with
   that allocation failing (`std.testing.FailingAllocator`). After a failure
   the state must be unchanged, the retried call must match a clean run,
-  and undo and redo must still work.
+  and undo and redo must work with every allocation failing.
 - `tests/fuzz.zig` feeds arbitrary bytes to `persistence.load` and to
   `sync.decode` + `applyRemote`. `zig build test` runs the corpus once;
   `zig build test --fuzz` keeps generating inputs.

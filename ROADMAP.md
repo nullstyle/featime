@@ -170,9 +170,9 @@ documented with tests on its edges.
   either completes or returns `error.OutOfMemory` with nothing changed;
   the journal reserves its slot before any change; multi-step edits unwind
   without allocating; `applyRemote` leaves the sequence unacknowledged on
-  `.out_of_memory` so the envelope can be re-delivered. Undo/redo of a
-  removal move the name and tags between journal and annotations instead
-  of copying.
+  `.out_of_memory` so the envelope can be re-delivered. Undo/redo move
+  every string between the journal and the live stores instead of copying,
+  so they never allocate.
 - **Sweep and fuzz** — `tests/oom.zig` (every call × every allocation
   index, then retry, undo, redo) and `tests/fuzz.zig` (decoders on
   arbitrary bytes). The sweep found an inverted remote suppress check,
@@ -182,10 +182,10 @@ documented with tests on its edges.
 - **CI** — Windows added; the mise action pinned by commit; `zig build
   docs` generates the API reference.
 
-Still open under hardening: undo/redo of annotation *edits* (rename,
-tag add) still copy strings and so can drop the text when memory is
-exhausted at that moment; moving ownership for those too (the pattern
-removals now use) would make undo/redo allocation-free everywhere.
+Undo and redo are allocation-free everywhere: every string a journal
+entry carries lives either in the live store (edit applied) or in the
+entry (edit undone), and undo/redo swap them. `tests/oom.zig` runs undo
+and redo with every allocation failing.
 
 ## Checkpoint placement (partly done)
 

@@ -235,15 +235,37 @@ pub fn Timeline(comptime Domain: type) type {
         /// an envelope stamped with this replica's id, the next sequence
         /// number, and `lamport`.
         fn recordAt(self: *Self, entry: journaling.Journal(Op).Entry, lamport: u64) void {
-            // The observer sees the entry before the journal takes it: with
-            // `max_journal = 0` the journal frees the entry's memory at once.
+            // The observer sees the whole entry before the journal takes it
+            // (with `max_journal = 0` the journal frees the entry's memory
+            // at once). The journal then keeps only the strings that are
+            // not live in the annotations: see `stripLive`.
             if (!self.applying_remote) {
                 if (self.observer) |obs| {
                     self.seq += 1;
                     obs.func(obs.ctx, &.{ .origin = self.replica_id, .seq = self.seq, .lamport = lamport, .entry = entry });
                 }
             }
-            self.journal.record(entry);
+            var stored = entry;
+            stripLive(&stored);
+            self.journal.record(stored);
+        }
+
+        /// Strings that live in the annotations while an edit is applied
+        /// are not the journal's to keep: undo takes them from there and
+        /// redo puts them back, by position. The stored entry refers to
+        /// them as null.
+        fn stripLive(entry: *journaling.Journal(Op).Entry) void {
+            switch (entry.*) {
+                .name_set => |*e| e.new = null,
+                .tag_add => |*e| e.tag = null,
+                .chapter_add => |*e| e.name = null,
+                .chapter_rename => |*e| e.new = null,
+                .group_add => |*e| e.name = null,
+                .group_rename => |*e| e.new = null,
+                .param_add => |*e| e.name = null,
+                .param_rename => |*e| e.new = null,
+                else => {},
+            }
         }
 
         // ------------------------------------------------------------------
@@ -457,25 +479,22 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn setFeatureName(self: *Self, id: ft.FeatureId, new_name: []const u8) error{ OutOfMemory, UnknownFeature }!void {
             if (self.indexOf(id) == null) return error.UnknownFeature;
             try self.journal.reserve(1);
-            const old = self.ann.nameOf(id);
-            const old_snap: ?[]const u8 = if (old) |o| try self.gpa.dupe(u8, o) else null;
-            errdefer if (old_snap) |o| self.gpa.free(o);
-            const new_snap = try self.gpa.dupe(u8, new_name);
-            errdefer self.gpa.free(new_snap);
-            try self.ann.setName(id, new_name);
-            self.record(.{ .name_set = .{ .id = id, .old = old_snap, .new = new_snap } });
+            try self.ann.reserveName();
+            const owned = try self.gpa.dupe(u8, new_name);
+            // The store keeps the only copy of the new name; the old name
+            // moves into the journal entry.
+            const old = self.ann.swapName(id, owned);
+            self.record(.{ .name_set = .{ .id = id, .old = old, .new = owned } });
             self.annTouch();
         }
 
         /// Remove a feature's display name. No-op if it has none.
         pub fn clearFeatureName(self: *Self, id: ft.FeatureId) error{ OutOfMemory, UnknownFeature }!void {
             if (self.indexOf(id) == null) return error.UnknownFeature;
-            const old = self.ann.nameOf(id) orelse return;
+            if (self.ann.nameOf(id) == null) return;
             try self.journal.reserve(1);
-            const old_snap = try self.gpa.dupe(u8, old);
-            errdefer self.gpa.free(old_snap);
-            try self.ann.setName(id, null);
-            self.record(.{ .name_set = .{ .id = id, .old = old_snap, .new = null } });
+            const old = self.ann.swapName(id, null);
+            self.record(.{ .name_set = .{ .id = id, .old = old, .new = null } });
             self.annTouch();
         }
 
@@ -493,14 +512,10 @@ pub fn Timeline(comptime Domain: type) type {
             if (self.indexOf(id) == null) return error.UnknownFeature;
             if (self.ann.hasTag(id, tag)) return;
             try self.journal.reserve(1);
-            const entry_tag = try self.gpa.dupe(u8, tag);
-            errdefer self.gpa.free(entry_tag);
-            const added = try self.ann.addTag(id, tag);
-            if (!added) {
-                self.gpa.free(entry_tag);
-                return;
-            }
-            self.record(.{ .tag_add = .{ .id = id, .tag = entry_tag } });
+            try self.ann.reserveTag(id);
+            const owned = try self.gpa.dupe(u8, tag);
+            const at = self.ann.pushTag(id, owned);
+            self.record(.{ .tag_add = .{ .id = id, .tag = owned, .at = at } });
             self.annTouch();
         }
 
@@ -510,9 +525,8 @@ pub fn Timeline(comptime Domain: type) type {
             if (self.indexOf(id) == null) return error.UnknownFeature;
             if (!self.ann.hasTag(id, tag)) return;
             try self.journal.reserve(1);
-            const entry_tag = try self.gpa.dupe(u8, tag);
-            const at = self.ann.removeTag(id, tag).?; // present: checked above
-            self.record(.{ .tag_remove = .{ .id = id, .tag = entry_tag, .at = at } });
+            const taken = self.ann.takeTag(id, tag).?; // present: checked above
+            self.record(.{ .tag_remove = .{ .id = id, .tag = taken.text, .at = taken.at } });
             self.annTouch();
         }
 
@@ -549,41 +563,28 @@ pub fn Timeline(comptime Domain: type) type {
             const saved_next_id = self.next_id;
             errdefer self.next_id = saved_next_id;
             const cid: ft.ChapterId = self.allocId();
-            const entry_name = try self.gpa.dupe(u8, name);
-            errdefer self.gpa.free(entry_name);
             try self.ann.addChapter(cid, name, mark);
-            self.record(.{ .chapter_add = .{ .chapter = .{ .id = cid, .name = entry_name, .mark = mark } } });
+            const at: u32 = @intCast(self.ann.chapterList().len - 1);
+            self.record(.{ .chapter_add = .{ .id = cid, .mark = mark, .name = self.ann.chapterList()[at].name, .at = at } });
             self.annTouch();
             return cid;
         }
 
         /// Remove a chapter.
         pub fn removeChapter(self: *Self, id: ft.ChapterId) error{ OutOfMemory, UnknownChapter }!void {
-            const c = self.ann.chapterById(id) orelse return error.UnknownChapter;
-            // Copy out everything the entry needs before removal invalidates
-            // the pointer into the chapters array.
-            const cid = c.id;
-            const mark = c.mark;
+            if (self.ann.chapterById(id) == null) return error.UnknownChapter;
             try self.journal.reserve(1);
-            const entry_name = try self.gpa.dupe(u8, c.name);
-            const at = self.ann.removeChapter(id).?; // present: looked up above
-            self.record(.{ .chapter_remove = .{ .chapter = .{
-                .id = cid,
-                .name = entry_name,
-                .mark = mark,
-            }, .at = at } });
+            const taken = self.ann.takeChapter(id).?; // present: looked up above
+            self.record(.{ .chapter_remove = .{ .id = taken.chapter.id, .mark = taken.chapter.mark, .name = taken.chapter.name, .at = taken.at } });
             self.annTouch();
         }
 
         pub fn renameChapter(self: *Self, id: ft.ChapterId, new_name: []const u8) error{ OutOfMemory, UnknownChapter }!void {
-            const c = self.ann.chapterById(id) orelse return error.UnknownChapter;
+            if (self.ann.chapterById(id) == null) return error.UnknownChapter;
             try self.journal.reserve(1);
-            const old_snap = try self.gpa.dupe(u8, c.name);
-            errdefer self.gpa.free(old_snap);
-            const new_snap = try self.gpa.dupe(u8, new_name);
-            errdefer self.gpa.free(new_snap);
-            try self.ann.renameChapter(id, new_name);
-            self.record(.{ .chapter_rename = .{ .id = id, .old = old_snap, .new = new_snap } });
+            const owned = try self.gpa.dupe(u8, new_name);
+            const old = self.ann.swapChapterName(id, owned).?; // present: looked up above
+            self.record(.{ .chapter_rename = .{ .id = id, .old = old, .new = owned } });
             self.annTouch();
         }
 
@@ -621,52 +622,42 @@ pub fn Timeline(comptime Domain: type) type {
             const saved_next_id = self.next_id;
             errdefer self.next_id = saved_next_id;
             const gid: ft.annotations.GroupId = self.allocId();
-            const entry_name = try self.gpa.dupe(u8, name);
-            errdefer self.gpa.free(entry_name);
-            try self.ann.addGroup(gid, name, self.list.items[lo].id, self.list.items[hi].id);
-            self.record(.{ .group_add = .{ .group = .{
-                .id = gid,
-                .name = entry_name,
-                .first = self.list.items[lo].id,
-                .last = self.list.items[hi].id,
-            } } });
+            const first_id = self.list.items[lo].id;
+            const last_id = self.list.items[hi].id;
+            try self.ann.addGroup(gid, name, first_id, last_id);
+            const at: u32 = @intCast(self.ann.groupList().len - 1);
+            self.record(.{ .group_add = .{ .id = gid, .first = first_id, .last = last_id, .name = self.ann.groupList()[at].name, .at = at } });
             self.annTouch();
             return gid;
         }
 
         /// Ungroup: remove the group, keep the features.
         pub fn removeGroup(self: *Self, id: ft.annotations.GroupId) error{ OutOfMemory, UnknownGroup }!void {
-            const g = self.ann.groupById(id) orelse return error.UnknownGroup;
+            if (self.ann.groupById(id) == null) return error.UnknownGroup;
             try self.journal.reserve(1);
-            const entry_name = try self.gpa.dupe(u8, g.name);
-            self.removeGroupOwned(id, entry_name);
+            self.removeGroupKnown(id);
         }
 
-        /// Remove a known group; `entry_name` (owned) rides the journal entry.
-        fn removeGroupOwned(self: *Self, id: ft.annotations.GroupId, entry_name: []const u8) void {
-            const g = self.ann.groupById(id).?;
-            const gid = g.id;
-            const first = g.first;
-            const last = g.last;
-            const at = self.ann.removeGroup(id).?; // present: looked up above
-            self.record(.{ .group_remove = .{ .group = .{
-                .id = gid,
-                .name = entry_name,
-                .first = first,
-                .last = last,
-            }, .at = at } });
+        /// Remove a group that exists, with journal room reserved. Its name
+        /// moves into the journal entry.
+        fn removeGroupKnown(self: *Self, id: ft.annotations.GroupId) void {
+            const taken = self.ann.takeGroup(id).?;
+            self.record(.{ .group_remove = .{
+                .id = taken.group.id,
+                .first = taken.group.first,
+                .last = taken.group.last,
+                .name = taken.group.name,
+                .at = taken.at,
+            } });
             self.annTouch();
         }
 
         pub fn renameGroup(self: *Self, id: ft.annotations.GroupId, new_name: []const u8) error{ OutOfMemory, UnknownGroup }!void {
-            const g = self.ann.groupById(id) orelse return error.UnknownGroup;
+            if (self.ann.groupById(id) == null) return error.UnknownGroup;
             try self.journal.reserve(1);
-            const old_snap = try self.gpa.dupe(u8, g.name);
-            errdefer self.gpa.free(old_snap);
-            const new_snap = try self.gpa.dupe(u8, new_name);
-            errdefer self.gpa.free(new_snap);
-            try self.ann.renameGroup(id, new_name);
-            self.record(.{ .group_rename = .{ .id = id, .old = old_snap, .new = new_snap } });
+            const owned = try self.gpa.dupe(u8, new_name);
+            const old = self.ann.swapGroupName(id, owned).?; // present: looked up above
+            self.record(.{ .group_rename = .{ .id = id, .old = old, .new = owned } });
             self.annTouch();
         }
 
@@ -835,7 +826,6 @@ pub fn Timeline(comptime Domain: type) type {
             const span = self.groupSpan(g);
             const count: usize = if (span) |sp| sp.hi - sp.lo + 1 else 0;
             try self.journal.reserve(count + 1);
-            const entry_name = try self.gpa.dupe(u8, g.name);
             const mark = self.journal.undoEntryCount();
             self.beginTransaction();
             defer self.endTransaction();
@@ -846,12 +836,11 @@ pub fn Timeline(comptime Domain: type) type {
                 // mid-way: put back what was removed.
                 const sp = self.groupSpan(self.ann.groupById(gid).?) orelse break;
                 self.removeAt(sp.lo) catch {
-                    self.gpa.free(entry_name);
                     self.rollbackTo(mark);
                     return error.OutOfMemory;
                 };
             }
-            self.removeGroupOwned(gid, entry_name);
+            self.removeGroupKnown(gid);
         }
 
         /// Reorder a feature to `new_pos` (clamped to the list; interpreted
@@ -976,10 +965,9 @@ pub fn Timeline(comptime Domain: type) type {
             const saved_next_id = self.next_id;
             errdefer self.next_id = saved_next_id;
             const pid: ft.ParamId = self.allocId();
-            const entry_name = try self.gpa.dupe(u8, name);
-            errdefer self.gpa.free(entry_name);
             try self.ptab.add(pid, name, value);
-            self.record(.{ .param_add = .{ .id = pid, .name = entry_name, .value = value } });
+            const at: u32 = @intCast(self.ptab.items().len - 1);
+            self.record(.{ .param_add = .{ .id = pid, .name = self.ptab.items()[at].name, .value = value, .at = at } });
             return pid;
         }
 
@@ -1001,26 +989,21 @@ pub fn Timeline(comptime Domain: type) type {
         /// Remove a parameter. Referencing features see `ctx.param` return
         /// null on the next rebuild and typically soft-fail.
         pub fn removeParam(self: *Self, id: ft.ParamId) error{ OutOfMemory, UnknownParam }!void {
-            const p = self.ptab.byId(id) orelse return error.UnknownParam;
-            const value = p.value; // copied out before the table shifts
+            if (self.ptab.byId(id) == null) return error.UnknownParam;
             try self.journal.reserve(1);
-            const entry_name = try self.gpa.dupe(u8, p.name);
-            const at = self.ptab.remove(id).?; // present: looked up above
-            self.record(.{ .param_remove = .{ .id = id, .name = entry_name, .value = value, .at = at } });
+            const taken = self.ptab.take(id).?; // present: looked up above
+            self.record(.{ .param_remove = .{ .id = id, .name = taken.param.name, .value = taken.param.value, .at = taken.at } });
             self.touch();
             self.invalidateReferencing(id);
         }
 
         /// Rename a parameter (display only — ops reference ids, not names).
         pub fn renameParam(self: *Self, id: ft.ParamId, new_name: []const u8) error{ OutOfMemory, UnknownParam }!void {
-            const old = self.ptab.byId(id) orelse return error.UnknownParam;
+            if (self.ptab.byId(id) == null) return error.UnknownParam;
             try self.journal.reserve(1);
-            const old_snap = try self.gpa.dupe(u8, old.name);
-            errdefer self.gpa.free(old_snap);
-            const new_snap = try self.gpa.dupe(u8, new_name);
-            errdefer self.gpa.free(new_snap);
-            _ = try self.ptab.rename(id, new_name); // the id was just looked up
-            self.record(.{ .param_rename = .{ .id = id, .old = old_snap, .new = new_snap } });
+            const owned = try self.gpa.dupe(u8, new_name);
+            const old = self.ptab.swapName(id, owned).?; // present: looked up above
+            self.record(.{ .param_rename = .{ .id = id, .old = old, .new = owned } });
         }
 
         /// Parameters in creation order. Valid until the next mutation.
@@ -1300,138 +1283,95 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .name_set => |e| {
                     if (self.indexOf(e.id) == null) return .dropped;
-                    const old_snap: ?[]const u8 = if (self.ann.nameOf(e.id)) |o| (self.gpa.dupe(u8, o) catch return .out_of_memory) else null;
-                    const new_snap: ?[]const u8 = if (e.new) |n| (self.gpa.dupe(u8, n) catch {
-                        if (old_snap) |o| self.gpa.free(o);
-                        return .out_of_memory;
-                    }) else null;
-                    self.ann.setName(e.id, e.new) catch {
-                        if (old_snap) |o| self.gpa.free(o);
-                        if (new_snap) |n| self.gpa.free(n);
+                    if (e.new == null and self.ann.nameOf(e.id) == null) return .dropped;
+                    const owned: ?[]const u8 = if (e.new) |n| (self.gpa.dupe(u8, n) catch return .out_of_memory) else null;
+                    self.ann.reserveName() catch {
+                        if (owned) |o| self.gpa.free(o);
                         return .out_of_memory;
                     };
-                    self.journal.record(.{ .name_set = .{ .id = e.id, .old = old_snap, .new = new_snap } });
+                    const old = self.ann.swapName(e.id, owned);
+                    self.journal.record(.{ .name_set = .{ .id = e.id, .old = old, .new = null } });
                     self.annTouch();
                 },
                 .tag_add => |e| {
+                    const text = e.tag orelse return .dropped;
                     if (self.indexOf(e.id) == null) return .dropped;
-                    if (self.ann.hasTag(e.id, e.tag)) return .dropped;
-                    const tag_snap = self.gpa.dupe(u8, e.tag) catch return .out_of_memory;
-                    _ = self.ann.addTag(e.id, e.tag) catch {
-                        self.gpa.free(tag_snap);
-                        return .out_of_memory;
-                    };
-                    self.journal.record(.{ .tag_add = .{ .id = e.id, .tag = tag_snap } });
+                    if (self.ann.hasTag(e.id, text)) return .dropped;
+                    self.ann.reserveTag(e.id) catch return .out_of_memory;
+                    const owned = self.gpa.dupe(u8, text) catch return .out_of_memory;
+                    const at = self.ann.pushTag(e.id, owned);
+                    self.journal.record(.{ .tag_add = .{ .id = e.id, .tag = null, .at = at } });
                     self.annTouch();
                 },
                 .tag_remove => |e| {
-                    if (!self.ann.hasTag(e.id, e.tag)) return .dropped;
-                    const tag_snap = self.gpa.dupe(u8, e.tag) catch return .out_of_memory;
-                    const at = self.ann.removeTag(e.id, e.tag).?; // present: checked above
-                    self.journal.record(.{ .tag_remove = .{ .id = e.id, .tag = tag_snap, .at = at } });
+                    const text = e.tag orelse return .dropped;
+                    const taken = self.ann.takeTag(e.id, text) orelse return .dropped;
+                    self.journal.record(.{ .tag_remove = .{ .id = e.id, .tag = taken.text, .at = taken.at } });
                     self.annTouch();
                 },
                 .chapter_add => |e| {
-                    if (self.ann.chapterById(e.chapter.id) != null) return .dropped;
-                    const name_snap = self.gpa.dupe(u8, e.chapter.name) catch return .out_of_memory;
-                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch {
-                        self.gpa.free(name_snap);
-                        return .out_of_memory;
-                    };
-                    self.journal.record(.{ .chapter_add = .{ .chapter = .{
-                        .id = e.chapter.id,
-                        .name = name_snap,
-                        .mark = e.chapter.mark,
-                    } } });
+                    const text = e.name orelse return .dropped;
+                    if (self.ann.chapterById(e.id) != null) return .dropped;
+                    self.ann.addChapter(e.id, text, e.mark) catch return .out_of_memory;
+                    const at: u32 = @intCast(self.ann.chapterList().len - 1);
+                    self.journal.record(.{ .chapter_add = .{ .id = e.id, .mark = e.mark, .name = null, .at = at } });
                     self.annTouch();
                 },
                 .chapter_remove => |e| {
-                    if (self.ann.chapterById(e.chapter.id) == null) return .dropped;
-                    const name_snap = self.gpa.dupe(u8, e.chapter.name) catch return .out_of_memory;
-                    const at = self.ann.removeChapter(e.chapter.id).?;
-                    self.journal.record(.{ .chapter_remove = .{ .chapter = .{
-                        .id = e.chapter.id,
-                        .name = name_snap,
-                        .mark = e.chapter.mark,
-                    }, .at = at } });
+                    const taken = self.ann.takeChapter(e.id) orelse return .dropped;
+                    self.journal.record(.{ .chapter_remove = .{ .id = e.id, .mark = taken.chapter.mark, .name = taken.chapter.name, .at = taken.at } });
                     self.annTouch();
                 },
                 .chapter_rename => |e| {
-                    const c = self.ann.chapterById(e.id) orelse return .dropped;
-                    const old_snap = self.gpa.dupe(u8, c.name) catch return .out_of_memory;
-                    const new_snap = self.gpa.dupe(u8, e.new) catch {
-                        self.gpa.free(old_snap);
-                        return .out_of_memory;
-                    };
-                    self.ann.renameChapter(e.id, e.new) catch {
-                        self.gpa.free(old_snap);
-                        self.gpa.free(new_snap);
-                        return .out_of_memory;
-                    };
-                    self.journal.record(.{ .chapter_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
+                    const text = e.new orelse return .dropped;
+                    if (self.ann.chapterById(e.id) == null) return .dropped;
+                    const owned = self.gpa.dupe(u8, text) catch return .out_of_memory;
+                    const old = self.ann.swapChapterName(e.id, owned).?;
+                    self.journal.record(.{ .chapter_rename = .{ .id = e.id, .old = old, .new = null } });
                     self.annTouch();
                 },
                 .group_add => |e| {
-                    if (self.ann.groupById(e.group.id) != null) return .dropped;
+                    const text = e.name orelse return .dropped;
+                    if (self.ann.groupById(e.id) != null) return .dropped;
                     // Unknown anchors keep the folder empty (dead anchors)
                     // rather than dropping the group.
-                    const name_snap = self.gpa.dupe(u8, e.group.name) catch return .out_of_memory;
-                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch {
-                        self.gpa.free(name_snap);
-                        return .out_of_memory;
-                    };
-                    self.journal.record(.{ .group_add = .{ .group = .{
-                        .id = e.group.id,
-                        .name = name_snap,
-                        .first = e.group.first,
-                        .last = e.group.last,
-                    } } });
+                    self.ann.addGroup(e.id, text, e.first, e.last) catch return .out_of_memory;
+                    const at: u32 = @intCast(self.ann.groupList().len - 1);
+                    self.journal.record(.{ .group_add = .{ .id = e.id, .first = e.first, .last = e.last, .name = null, .at = at } });
                     self.annTouch();
                 },
                 .group_remove => |e| {
-                    if (self.ann.groupById(e.group.id) == null) return .dropped;
-                    const name_snap = self.gpa.dupe(u8, e.group.name) catch return .out_of_memory;
-                    const at = self.ann.removeGroup(e.group.id).?;
-                    self.journal.record(.{ .group_remove = .{ .group = .{
-                        .id = e.group.id,
-                        .name = name_snap,
-                        .first = e.group.first,
-                        .last = e.group.last,
-                    }, .at = at } });
+                    const taken = self.ann.takeGroup(e.id) orelse return .dropped;
+                    self.journal.record(.{ .group_remove = .{
+                        .id = e.id,
+                        .first = taken.group.first,
+                        .last = taken.group.last,
+                        .name = taken.group.name,
+                        .at = taken.at,
+                    } });
                     self.annTouch();
                 },
                 .group_rename => |e| {
-                    const g = self.ann.groupById(e.id) orelse return .dropped;
-                    const old_snap = self.gpa.dupe(u8, g.name) catch return .out_of_memory;
-                    const new_snap = self.gpa.dupe(u8, e.new) catch {
-                        self.gpa.free(old_snap);
-                        return .out_of_memory;
-                    };
-                    self.ann.renameGroup(e.id, e.new) catch {
-                        self.gpa.free(old_snap);
-                        self.gpa.free(new_snap);
-                        return .out_of_memory;
-                    };
-                    self.journal.record(.{ .group_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
+                    const text = e.new orelse return .dropped;
+                    if (self.ann.groupById(e.id) == null) return .dropped;
+                    const owned = self.gpa.dupe(u8, text) catch return .out_of_memory;
+                    const old = self.ann.swapGroupName(e.id, owned).?;
+                    self.journal.record(.{ .group_rename = .{ .id = e.id, .old = old, .new = null } });
                     self.annTouch();
                 },
                 .param_add => |e| {
+                    const text = e.name orelse return .dropped;
                     if (self.ptab.byId(e.id) != null) return .dropped;
-                    const name_snap = self.gpa.dupe(u8, e.name) catch return .out_of_memory;
-                    self.ptab.add(e.id, e.name, e.value) catch |err| {
-                        self.gpa.free(name_snap);
-                        return if (err == error.OutOfMemory) .out_of_memory else .dropped;
-                    };
-                    self.journal.record(.{ .param_add = .{ .id = e.id, .name = name_snap, .value = e.value } });
+                    self.ptab.add(e.id, text, e.value) catch |err| return if (err == error.OutOfMemory) .out_of_memory else .dropped;
+                    const at: u32 = @intCast(self.ptab.items().len - 1);
+                    self.journal.record(.{ .param_add = .{ .id = e.id, .name = null, .value = e.value, .at = at } });
                 },
                 .param_remove => |e| {
                     // Undo restores the local value, which a concurrent set
                     // may have changed since the sender looked.
-                    const local = self.ptab.byId(e.id) orelse return .dropped;
-                    const name_snap = self.gpa.dupe(u8, local.name) catch return .out_of_memory;
+                    const taken = self.ptab.take(e.id) orelse return .dropped;
                     self.touch();
-                    const at = self.ptab.remove(e.id).?;
-                    self.journal.record(.{ .param_remove = .{ .id = e.id, .name = name_snap, .value = local.value, .at = at } });
+                    self.journal.record(.{ .param_remove = .{ .id = e.id, .name = taken.param.name, .value = taken.param.value, .at = taken.at } });
                     self.invalidateReferencing(e.id);
                 },
                 .param_set => |e| {
@@ -1443,18 +1383,11 @@ pub fn Timeline(comptime Domain: type) type {
                     self.invalidateReferencing(e.id);
                 },
                 .param_rename => |e| {
-                    const current = self.ptab.byId(e.id) orelse return .dropped;
-                    const old_snap = self.gpa.dupe(u8, current.name) catch return .out_of_memory;
-                    const new_snap = self.gpa.dupe(u8, e.new) catch {
-                        self.gpa.free(old_snap);
-                        return .out_of_memory;
-                    };
-                    _ = self.ptab.rename(e.id, e.new) catch {
-                        self.gpa.free(old_snap);
-                        self.gpa.free(new_snap);
-                        return .out_of_memory;
-                    };
-                    self.journal.record(.{ .param_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
+                    const text = e.new orelse return .dropped;
+                    if (self.ptab.byId(e.id) == null) return .dropped;
+                    const owned = self.gpa.dupe(u8, text) catch return .out_of_memory;
+                    const old = self.ptab.swapName(e.id, owned).?;
+                    self.journal.record(.{ .param_rename = .{ .id = e.id, .old = old, .new = null } });
                 },
             }
             return .applied;
@@ -1705,54 +1638,97 @@ pub fn Timeline(comptime Domain: type) type {
                     self.marker_pos = e.marker_pre;
                     self.annTouch();
                 },
-                .name_set => |e| {
-                    self.ann.setName(e.id, e.old) catch {};
+                .name_set => |*e| {
+                    // Swap, no memory: the live name moves into the entry,
+                    // the entry's old name moves back into the store.
+                    const live = self.ann.swapName(e.id, e.old);
+                    e.old = null;
+                    e.new = live;
                     self.annTouch();
                 },
-                .tag_add => |e| {
-                    _ = self.ann.removeTag(e.id, e.tag);
+                .tag_add => |*e| {
+                    e.tag = self.ann.takeTagAt(e.id, e.at);
                     self.annTouch();
                 },
-                .tag_remove => |e| {
-                    _ = self.ann.insertTagAt(e.id, e.tag, e.at) catch {};
+                .tag_remove => |*e| {
+                    if (e.tag) |text| {
+                        e.tag = null;
+                        self.ann.giveTagAt(e.id, text, e.at) catch {};
+                    }
                     self.annTouch();
                 },
-                .group_add => |e| {
-                    _ = self.ann.removeGroup(e.group.id);
+                .group_add => |*e| {
+                    if (self.ann.takeGroup(e.id)) |taken| {
+                        e.name = taken.group.name;
+                        e.first = taken.group.first;
+                        e.last = taken.group.last;
+                        e.at = taken.at;
+                    }
                     self.annTouch();
                 },
-                .group_remove => |e| {
-                    self.ann.insertGroupAt(e.group.id, e.group.name, e.group.first, e.group.last, e.at) catch {};
+                .group_remove => |*e| {
+                    if (e.name) |n| {
+                        e.name = null;
+                        self.ann.giveGroupAt(.{ .id = e.id, .name = n, .first = e.first, .last = e.last }, e.at) catch {};
+                    }
                     self.annTouch();
                 },
-                .group_rename => |e| {
-                    self.ann.renameGroup(e.id, e.old) catch {};
+                .group_rename => |*e| {
+                    if (e.old) |o| {
+                        if (self.ann.swapGroupName(e.id, o)) |live| {
+                            e.old = null;
+                            e.new = live;
+                        }
+                    }
                     self.annTouch();
                 },
-                .param_add => |e| {
-                    _ = self.ptab.remove(e.id);
+                .param_add => |*e| {
+                    if (self.ptab.take(e.id)) |taken| {
+                        e.name = taken.param.name;
+                        e.at = taken.at;
+                    }
                 },
-                .param_remove => |e| {
-                    self.ptab.insertAt(e.id, e.name, e.value, e.at) catch {};
+                .param_remove => |*e| {
+                    if (e.name) |n| {
+                        e.name = null;
+                        self.ptab.giveAt(.{ .id = e.id, .name = n, .value = e.value }, e.at) catch {};
+                    }
                     self.invalidateReferencing(e.id);
                 },
                 .param_set => |e| {
                     _ = self.ptab.set(e.id, e.old);
                     self.invalidateReferencing(e.id);
                 },
-                .param_rename => |e| {
-                    _ = self.ptab.rename(e.id, e.old) catch false;
+                .param_rename => |*e| {
+                    if (e.old) |o| {
+                        if (self.ptab.swapName(e.id, o)) |live| {
+                            e.old = null;
+                            e.new = live;
+                        }
+                    }
                 },
-                .chapter_add => |e| {
-                    _ = self.ann.removeChapter(e.chapter.id);
+                .chapter_add => |*e| {
+                    if (self.ann.takeChapter(e.id)) |taken| {
+                        e.name = taken.chapter.name;
+                        e.mark = taken.chapter.mark;
+                        e.at = taken.at;
+                    }
                     self.annTouch();
                 },
-                .chapter_remove => |e| {
-                    self.ann.insertChapterAt(e.chapter.id, e.chapter.name, e.chapter.mark, e.at) catch {};
+                .chapter_remove => |*e| {
+                    if (e.name) |n| {
+                        e.name = null;
+                        self.ann.giveChapterAt(.{ .id = e.id, .name = n, .mark = e.mark }, e.at) catch {};
+                    }
                     self.annTouch();
                 },
-                .chapter_rename => |e| {
-                    self.ann.renameChapter(e.id, e.old) catch {};
+                .chapter_rename => |*e| {
+                    if (e.old) |o| {
+                        if (self.ann.swapChapterName(e.id, o)) |live| {
+                            e.old = null;
+                            e.new = live;
+                        }
+                    }
                     self.annTouch();
                 },
             }
@@ -1795,55 +1771,97 @@ pub fn Timeline(comptime Domain: type) type {
                     self.ann.applyGroupFixesForward(e.group_fixes);
                     self.annTouch();
                 },
-                .name_set => |e| {
-                    self.ann.setName(e.id, e.new) catch {};
+                .name_set => |*e| {
+                    const live = self.ann.swapName(e.id, e.new);
+                    e.new = null;
+                    e.old = live;
                     self.annTouch();
                 },
-                .tag_add => |e| {
-                    _ = self.ann.addTag(e.id, e.tag) catch {};
+                .tag_add => |*e| {
+                    if (e.tag) |text| {
+                        e.tag = null;
+                        self.ann.giveTagAt(e.id, text, e.at) catch {};
+                    }
                     self.annTouch();
                 },
-                .tag_remove => |e| {
-                    _ = self.ann.removeTag(e.id, e.tag);
+                .tag_remove => |*e| {
+                    e.tag = self.ann.takeTagAt(e.id, e.at);
                     self.annTouch();
                 },
-                .group_add => |e| {
-                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch {};
+                .group_add => |*e| {
+                    if (e.name) |n| {
+                        e.name = null;
+                        self.ann.giveGroupAt(.{ .id = e.id, .name = n, .first = e.first, .last = e.last }, e.at) catch {};
+                    }
                     self.annTouch();
                 },
-                .group_remove => |e| {
-                    _ = self.ann.removeGroup(e.group.id);
+                .group_remove => |*e| {
+                    if (self.ann.takeGroup(e.id)) |taken| {
+                        e.name = taken.group.name;
+                        e.first = taken.group.first;
+                        e.last = taken.group.last;
+                        e.at = taken.at;
+                    }
                     self.annTouch();
                 },
-                .group_rename => |e| {
-                    self.ann.renameGroup(e.id, e.new) catch {};
+                .group_rename => |*e| {
+                    if (e.new) |n| {
+                        if (self.ann.swapGroupName(e.id, n)) |live| {
+                            e.new = null;
+                            e.old = live;
+                        }
+                    }
                     self.annTouch();
                 },
-                .param_add => |e| {
-                    self.ptab.add(e.id, e.name, e.value) catch {};
+                .param_add => |*e| {
+                    if (e.name) |n| {
+                        e.name = null;
+                        self.ptab.giveAt(.{ .id = e.id, .name = n, .value = e.value }, e.at) catch {};
+                    }
                     self.invalidateReferencing(e.id);
                 },
-                .param_remove => |e| {
-                    _ = self.ptab.remove(e.id);
+                .param_remove => |*e| {
+                    if (self.ptab.take(e.id)) |taken| {
+                        e.name = taken.param.name;
+                        e.value = taken.param.value;
+                        e.at = taken.at;
+                    }
                     self.invalidateReferencing(e.id);
                 },
                 .param_set => |e| {
                     _ = self.ptab.set(e.id, e.new);
                     self.invalidateReferencing(e.id);
                 },
-                .param_rename => |e| {
-                    _ = self.ptab.rename(e.id, e.new) catch false;
+                .param_rename => |*e| {
+                    if (e.new) |n| {
+                        if (self.ptab.swapName(e.id, n)) |live| {
+                            e.new = null;
+                            e.old = live;
+                        }
+                    }
                 },
-                .chapter_add => |e| {
-                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch {};
+                .chapter_add => |*e| {
+                    if (e.name) |n| {
+                        e.name = null;
+                        self.ann.giveChapterAt(.{ .id = e.id, .name = n, .mark = e.mark }, e.at) catch {};
+                    }
                     self.annTouch();
                 },
-                .chapter_remove => |e| {
-                    _ = self.ann.removeChapter(e.chapter.id);
+                .chapter_remove => |*e| {
+                    if (self.ann.takeChapter(e.id)) |taken| {
+                        e.name = taken.chapter.name;
+                        e.mark = taken.chapter.mark;
+                        e.at = taken.at;
+                    }
                     self.annTouch();
                 },
-                .chapter_rename => |e| {
-                    self.ann.renameChapter(e.id, e.new) catch {};
+                .chapter_rename => |*e| {
+                    if (e.new) |n| {
+                        if (self.ann.swapChapterName(e.id, n)) |live| {
+                            e.new = null;
+                            e.old = live;
+                        }
+                    }
                     self.annTouch();
                 },
             }

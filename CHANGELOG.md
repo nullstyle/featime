@@ -16,11 +16,17 @@ All notable changes to featuretree-zig. The format follows
   done; the unwinding needs no memory. `applyRemote` answers a new
   `ApplyResult.out_of_memory` with nothing applied and the sequence left
   unacknowledged, so the same envelope can be delivered again.
-- Undo and redo of a feature removal move the feature's name and tags
-  between the journal entry and the annotations instead of copying them
-  (no memory needed); the journal's `remove` entry keeps the tags as a
-  list and the feature's order key. Chapter fixes carry the new mark on
-  the wire (wire version 4 is still unreleased).
+- Undo and redo never allocate. Every string a journal entry carries (a
+  feature's name and tags, chapter, group and parameter names, the old and
+  new names of a rename) lives in exactly one place: in the live store
+  while the edit is applied, in the entry while it is undone. Undo and
+  redo swap them; the removal entry keeps a feature's tags as a list and
+  its order key. Chapter and group entries are flat (`id`, `mark` or
+  `first`/`last`, `name`), live strings are null in the stored entry, and
+  the record observer still sees complete entries. `removeTag`,
+  `removeChapter`, `removeGroup` and `removeParam` no longer allocate at
+  all. Chapter fixes carry the new mark on the wire (wire version 4 is
+  still unreleased).
 
 - Sync envelopes. The record observer yields `Timeline.Envelope`
   `{ origin, seq, lamport, entry }` instead of a bare entry; `applyRemote`
@@ -56,7 +62,8 @@ All notable changes to featuretree-zig. The format follows
   remote entry kind, `load` and `save`. Each call is run once per
   allocation index with that allocation failing; afterwards the state must
   be unchanged, the retried call must match a clean run, and undo and redo
-  must still work. It found every bug listed under Fixed.
+  must work with every allocation failing. It found every bug listed under
+  Fixed.
 - `tests/fuzz.zig`: `persistence.load` and `sync.decode` + `applyRemote`
   on arbitrary bytes (`zig build test` runs the corpus; `zig build test
   --fuzz` keeps going).

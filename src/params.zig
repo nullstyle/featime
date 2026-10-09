@@ -79,42 +79,40 @@ pub const ParamTable = struct {
         return false;
     }
 
-    /// Remove a parameter; false when the id is unknown.
-    /// Remove a parameter. Returns the position it held, or null if unknown.
-    pub fn remove(self: *Self, id: ParamId) ?u32 {
+    pub const Taken = struct { param: Param, at: u32 };
+
+    /// Take a parameter out (its name's ownership moves to the caller) and
+    /// report the position it held. The list keeps its capacity.
+    pub fn take(self: *Self, id: ParamId) ?Taken {
         for (self.list.items, 0..) |p, i| {
-            if (p.id == id) {
-                const dead = self.list.orderedRemove(i);
-                self.gpa.free(dead.name);
-                return @intCast(i);
-            }
+            if (p.id == id) return .{ .param = self.list.orderedRemove(i), .at = @intCast(i) };
         }
         return null;
     }
 
-    /// Put a parameter back at position `at` (clamped), so undo restores
-    /// the creation order. Same uniqueness rules as `add`.
-    pub fn insertAt(self: *Self, id: ParamId, name: []const u8, value: f64, at: u32) error{ OutOfMemory, DuplicateParam }!void {
-        for (self.list.items) |p| {
-            if (p.id == id or std.mem.eql(u8, p.name, name)) return error.DuplicateParam;
-        }
-        const owned = try self.gpa.dupe(u8, name);
-        errdefer self.gpa.free(owned);
+    /// Put a parameter (owned name) back at `at` (clamped). Needs no memory
+    /// when the list kept the room a take freed; otherwise it may allocate.
+    pub fn giveAt(self: *Self, param: Param, at: u32) error{OutOfMemory}!void {
+        errdefer self.gpa.free(param.name);
         const pos: usize = @min(at, self.list.items.len);
-        try self.list.insert(self.gpa, pos, .{ .id = id, .name = owned, .value = value });
+        if (self.list.items.len < self.list.capacity) {
+            self.list.insertAssumeCapacity(pos, param);
+        } else {
+            try self.list.insert(self.gpa, pos, param);
+        }
     }
 
-    /// Rename in place; false when the id is unknown.
-    pub fn rename(self: *Self, id: ParamId, new_name: []const u8) error{OutOfMemory}!bool {
+    /// Move `incoming` in as the parameter's name and hand back the old
+    /// one. Null (and `incoming` still the caller's) when the id is unknown.
+    pub fn swapName(self: *Self, id: ParamId, incoming: []const u8) ?[]const u8 {
         for (self.list.items) |*p| {
             if (p.id == id) {
-                const duped = try self.gpa.dupe(u8, new_name);
-                self.gpa.free(p.name);
-                p.name = duped;
-                return true;
+                const prev = p.name;
+                p.name = incoming;
+                return prev;
             }
         }
-        return false;
+        return null;
     }
 };
 

@@ -75,23 +75,25 @@ pub fn Journal(comptime Op: type) type {
                 /// leaving its span); owned slice, exact undo/redo.
                 group_fixes: []annotations.GroupFix = &.{},
             },
+            // Every string below lives in exactly one place: in the live
+            // structure while the edit is applied, in the entry while the
+            // edit is undone (null here means "currently live"). Undo and
+            // redo swap them, so they never allocate. `at` is the list
+            // position a string goes back to; local bookkeeping, not on the
+            // wire. The record observer sees every string filled in.
             name_set: struct { id: ft.FeatureId, old: ?[]const u8, new: ?[]const u8 },
-            tag_add: struct { id: ft.FeatureId, tag: []const u8 },
-            /// `at`: the tag's position, so undo restores the order (local
-            /// bookkeeping; not on the wire).
-            tag_remove: struct { id: ft.FeatureId, tag: []const u8, at: u32 = 0 },
-            chapter_add: struct { chapter: annotations.Chapter },
-            /// `at`: list position, so undo restores creation order (local
-            /// bookkeeping; not on the wire). Same for groups and params.
-            chapter_remove: struct { chapter: annotations.Chapter, at: u32 = 0 },
-            chapter_rename: struct { id: annotations.ChapterId, old: []const u8, new: []const u8 },
-            group_add: struct { group: annotations.Group },
-            group_remove: struct { group: annotations.Group, at: u32 = 0 },
-            group_rename: struct { id: annotations.GroupId, old: []const u8, new: []const u8 },
-            param_add: struct { id: params.ParamId, name: []const u8, value: f64 },
-            param_remove: struct { id: params.ParamId, name: []const u8, value: f64, at: u32 = 0 },
+            tag_add: struct { id: ft.FeatureId, tag: ?[]const u8, at: u32 = 0 },
+            tag_remove: struct { id: ft.FeatureId, tag: ?[]const u8, at: u32 = 0 },
+            chapter_add: struct { id: annotations.ChapterId, mark: annotations.Mark, name: ?[]const u8, at: u32 = 0 },
+            chapter_remove: struct { id: annotations.ChapterId, mark: annotations.Mark, name: ?[]const u8, at: u32 = 0 },
+            chapter_rename: struct { id: annotations.ChapterId, old: ?[]const u8, new: ?[]const u8 },
+            group_add: struct { id: annotations.GroupId, first: ft.FeatureId, last: ft.FeatureId, name: ?[]const u8, at: u32 = 0 },
+            group_remove: struct { id: annotations.GroupId, first: ft.FeatureId, last: ft.FeatureId, name: ?[]const u8, at: u32 = 0 },
+            group_rename: struct { id: annotations.GroupId, old: ?[]const u8, new: ?[]const u8 },
+            param_add: struct { id: params.ParamId, name: ?[]const u8, value: f64, at: u32 = 0 },
+            param_remove: struct { id: params.ParamId, name: ?[]const u8, value: f64, at: u32 = 0 },
             param_set: struct { id: params.ParamId, old: f64, new: f64 },
-            param_rename: struct { id: params.ParamId, old: []const u8, new: []const u8 },
+            param_rename: struct { id: params.ParamId, old: ?[]const u8, new: ?[]const u8 },
         };
 
         pub const Record = struct {
@@ -237,31 +239,35 @@ pub fn Journal(comptime Op: type) type {
                 },
                 .move => |m| self.gpa.free(m.group_fixes),
                 .name_set => |n| {
-                    if (n.old) |o| self.gpa.free(o);
-                    if (n.new) |x| self.gpa.free(x);
+                    self.freeOpt(n.old);
+                    self.freeOpt(n.new);
                 },
-                .tag_add => |t| self.gpa.free(t.tag),
-                .tag_remove => |t| self.gpa.free(t.tag),
-                .chapter_add => |c| self.gpa.free(c.chapter.name),
-                .chapter_remove => |c| self.gpa.free(c.chapter.name),
+                .tag_add => |t| self.freeOpt(t.tag),
+                .tag_remove => |t| self.freeOpt(t.tag),
+                .chapter_add => |c| self.freeOpt(c.name),
+                .chapter_remove => |c| self.freeOpt(c.name),
                 .chapter_rename => |c| {
-                    self.gpa.free(c.old);
-                    self.gpa.free(c.new);
+                    self.freeOpt(c.old);
+                    self.freeOpt(c.new);
                 },
-                .group_add => |g| self.gpa.free(g.group.name),
-                .group_remove => |g| self.gpa.free(g.group.name),
+                .group_add => |g| self.freeOpt(g.name),
+                .group_remove => |g| self.freeOpt(g.name),
                 .group_rename => |g| {
-                    self.gpa.free(g.old);
-                    self.gpa.free(g.new);
+                    self.freeOpt(g.old);
+                    self.freeOpt(g.new);
                 },
-                .param_add => |p| self.gpa.free(p.name),
-                .param_remove => |p| self.gpa.free(p.name),
+                .param_add => |p| self.freeOpt(p.name),
+                .param_remove => |p| self.freeOpt(p.name),
                 .param_rename => |p| {
-                    self.gpa.free(p.old);
-                    self.gpa.free(p.new);
+                    self.freeOpt(p.old);
+                    self.freeOpt(p.new);
                 },
                 else => {},
             }
+        }
+
+        fn freeOpt(self: *Self, s: ?[]const u8) void {
+            if (s) |x| self.gpa.free(x);
         }
 
         // -- transactions ------------------------------------------------------

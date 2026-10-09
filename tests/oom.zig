@@ -131,10 +131,11 @@ fn sweepLocal(op: LocalOp, src: *const Timeline, src_ids: *const Ids) !void {
         failing.fail_index = failing.alloc_index + k;
         errdefer std.debug.print("local op {t}, allocation {d}\n", .{ op, k });
 
+        var done = false;
         if (runLocal(op, &fx.tl, &fx.ids, src, src_ids)) |_| {
             // Completed, with or without a failure absorbed by a cache path.
             try std.testing.expectEqual(clean_after, support.contentDigest(&fx.tl));
-            if (!failing.has_induced_failure) break; // nothing left to fail
+            done = !failing.has_induced_failure; // nothing left to fail
         } else |err| {
             if (err != error.OutOfMemory) return err;
             try std.testing.expect(failing.has_induced_failure);
@@ -150,11 +151,15 @@ fn sweepLocal(op: LocalOp, src: *const Timeline, src_ids: *const Ids) !void {
             failing.fail_index = std.math.maxInt(usize);
             try runLocal(op, &fx.tl, &fx.ids, src, src_ids);
             if (op.atomic()) try std.testing.expectEqual(clean_after, support.contentDigest(&fx.tl));
-            try std.testing.expect(fx.tl.undo());
-            try std.testing.expectEqual(before, support.contentDigest(&fx.tl));
-            try std.testing.expect(fx.tl.redo());
-            if (op.atomic()) try std.testing.expectEqual(clean_after, support.contentDigest(&fx.tl));
         }
+        // Undo and redo need no memory at all: every allocation fails here.
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expect(fx.tl.undo());
+        try std.testing.expectEqual(before, support.contentDigest(&fx.tl));
+        try std.testing.expect(fx.tl.redo());
+        if (op.atomic()) try std.testing.expectEqual(clean_after, support.contentDigest(&fx.tl));
+        failing.fail_index = std.math.maxInt(usize);
+        if (done) break;
     }
 }
 
@@ -216,12 +221,13 @@ fn sweepRemote(blobs: []const []u8, j: usize) !void {
             .applied => {
                 try std.testing.expectEqual(clean_after, support.contentDigest(&tl));
                 const done = !failing.has_induced_failure;
-                // Remote units undo and redo like local ones.
-                failing.fail_index = std.math.maxInt(usize);
+                // Remote units undo and redo like local ones, without memory.
+                failing.fail_index = failing.alloc_index;
                 try std.testing.expect(tl.undo());
                 try std.testing.expectEqual(before, support.contentDigest(&tl));
                 try std.testing.expect(tl.redo());
                 try std.testing.expectEqual(clean_after, support.contentDigest(&tl));
+                failing.fail_index = std.math.maxInt(usize);
                 if (done) break;
             },
             .out_of_memory => {

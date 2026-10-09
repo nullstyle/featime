@@ -270,61 +270,61 @@ pub fn encode(
         .tag_add => |e| {
             try w.writeAll(&[1]u8{7});
             try w.writeInt(u64, e.id, .little);
-            try writeFramed(w, e.tag);
+            try writeFramed(w, e.tag orelse return error.IncompleteEntry);
         },
         .tag_remove => |e| {
             try w.writeAll(&[1]u8{8});
             try w.writeInt(u64, e.id, .little);
-            try writeFramed(w, e.tag);
+            try writeFramed(w, e.tag orelse return error.IncompleteEntry);
         },
         .chapter_add => |e| {
             try w.writeAll(&[1]u8{9});
-            try w.writeInt(u64, e.chapter.id, .little);
-            try w.writeInt(u64, e.chapter.mark.after orelse 0, .little);
-            try writeFramed(w, e.chapter.name);
+            try w.writeInt(u64, e.id, .little);
+            try w.writeInt(u64, e.mark.after orelse 0, .little);
+            try writeFramed(w, e.name orelse return error.IncompleteEntry);
         },
         .chapter_remove => |e| {
             try w.writeAll(&[1]u8{10});
-            try w.writeInt(u64, e.chapter.id, .little);
-            try w.writeInt(u64, e.chapter.mark.after orelse 0, .little);
-            try writeFramed(w, e.chapter.name);
+            try w.writeInt(u64, e.id, .little);
+            try w.writeInt(u64, e.mark.after orelse 0, .little);
+            try writeFramed(w, e.name orelse return error.IncompleteEntry);
         },
         .chapter_rename => |e| {
             try w.writeAll(&[1]u8{11});
             try w.writeInt(u64, e.id, .little);
-            try writeFramed(w, e.old);
-            try writeFramed(w, e.new);
+            try writeFramed(w, e.old orelse return error.IncompleteEntry);
+            try writeFramed(w, e.new orelse return error.IncompleteEntry);
         },
         .group_add => |e| {
             try w.writeAll(&[1]u8{12});
-            try w.writeInt(u64, e.group.id, .little);
-            try w.writeInt(u64, e.group.first, .little);
-            try w.writeInt(u64, e.group.last, .little);
-            try writeFramed(w, e.group.name);
+            try w.writeInt(u64, e.id, .little);
+            try w.writeInt(u64, e.first, .little);
+            try w.writeInt(u64, e.last, .little);
+            try writeFramed(w, e.name orelse return error.IncompleteEntry);
         },
         .group_remove => |e| {
             try w.writeAll(&[1]u8{13});
-            try w.writeInt(u64, e.group.id, .little);
-            try w.writeInt(u64, e.group.first, .little);
-            try w.writeInt(u64, e.group.last, .little);
-            try writeFramed(w, e.group.name);
+            try w.writeInt(u64, e.id, .little);
+            try w.writeInt(u64, e.first, .little);
+            try w.writeInt(u64, e.last, .little);
+            try writeFramed(w, e.name orelse return error.IncompleteEntry);
         },
         .group_rename => |e| {
             try w.writeAll(&[1]u8{14});
             try w.writeInt(u64, e.id, .little);
-            try writeFramed(w, e.old);
-            try writeFramed(w, e.new);
+            try writeFramed(w, e.old orelse return error.IncompleteEntry);
+            try writeFramed(w, e.new orelse return error.IncompleteEntry);
         },
         .param_add => |e| {
             try w.writeAll(&[1]u8{15});
             try w.writeInt(u64, e.id, .little);
-            try writeFramed(w, e.name);
+            try writeFramed(w, e.name orelse return error.IncompleteEntry);
             try w.writeInt(u64, @bitCast(e.value), .little);
         },
         .param_remove => |e| {
             try w.writeAll(&[1]u8{16});
             try w.writeInt(u64, e.id, .little);
-            try writeFramed(w, e.name);
+            try writeFramed(w, e.name orelse return error.IncompleteEntry);
             try w.writeInt(u64, @bitCast(e.value), .little);
         },
         .param_set => |e| {
@@ -336,8 +336,8 @@ pub fn encode(
         .param_rename => |e| {
             try w.writeAll(&[1]u8{18});
             try w.writeInt(u64, e.id, .little);
-            try writeFramed(w, e.old);
-            try writeFramed(w, e.new);
+            try writeFramed(w, e.old orelse return error.IncompleteEntry);
+            try writeFramed(w, e.new orelse return error.IncompleteEntry);
         },
     }
 }
@@ -437,12 +437,14 @@ pub fn decode(
                 .at = 0, // local bookkeeping; the receiver finds its own position
             },
         },
-        9 => .{ .chapter_add = .{
-            .chapter = try readChapter(gpa, r),
-        } },
-        10 => .{ .chapter_remove = .{
-            .chapter = try readChapter(gpa, r),
-        } },
+        9 => blk: {
+            const c = try readChapter(gpa, r);
+            break :blk .{ .chapter_add = .{ .id = c.id, .mark = c.mark, .name = c.name } };
+        },
+        10 => blk: {
+            const c = try readChapter(gpa, r);
+            break :blk .{ .chapter_remove = .{ .id = c.id, .mark = c.mark, .name = c.name } };
+        },
         11 => blk: {
             const id = try r.takeInt(u64, .little);
             const old = try readString(gpa, r);
@@ -450,12 +452,14 @@ pub fn decode(
             const new = try readString(gpa, r);
             break :blk .{ .chapter_rename = .{ .id = id, .old = old, .new = new } };
         },
-        12 => .{ .group_add = .{
-            .group = try readGroup(gpa, r),
-        } },
-        13 => .{ .group_remove = .{
-            .group = try readGroup(gpa, r),
-        } },
+        12 => blk: {
+            const g = try readGroup(gpa, r);
+            break :blk .{ .group_add = .{ .id = g.id, .first = g.first, .last = g.last, .name = g.name } };
+        },
+        13 => blk: {
+            const g = try readGroup(gpa, r);
+            break :blk .{ .group_remove = .{ .id = g.id, .first = g.first, .last = g.last, .name = g.name } };
+        },
         14 => blk: {
             const id = try r.takeInt(u64, .little);
             const old = try readString(gpa, r);
@@ -525,29 +529,33 @@ pub fn deinit(comptime Op: type, gpa: std.mem.Allocator, env: *Envelope(Op)) voi
         },
         .move => |*e| gpa.free(e.group_fixes),
         .name_set => |*e| {
-            if (e.old) |o| gpa.free(o);
-            if (e.new) |n| gpa.free(n);
+            freeOpt(gpa, e.old);
+            freeOpt(gpa, e.new);
         },
-        .tag_add => |*e| gpa.free(e.tag),
-        .tag_remove => |*e| gpa.free(e.tag),
-        .chapter_add => |*e| gpa.free(e.chapter.name),
-        .chapter_remove => |*e| gpa.free(e.chapter.name),
+        .tag_add => |*e| freeOpt(gpa, e.tag),
+        .tag_remove => |*e| freeOpt(gpa, e.tag),
+        .chapter_add => |*e| freeOpt(gpa, e.name),
+        .chapter_remove => |*e| freeOpt(gpa, e.name),
         .chapter_rename => |*e| {
-            gpa.free(e.old);
-            gpa.free(e.new);
+            freeOpt(gpa, e.old);
+            freeOpt(gpa, e.new);
         },
-        .group_add => |*e| gpa.free(e.group.name),
-        .group_remove => |*e| gpa.free(e.group.name),
+        .group_add => |*e| freeOpt(gpa, e.name),
+        .group_remove => |*e| freeOpt(gpa, e.name),
         .group_rename => |*e| {
-            gpa.free(e.old);
-            gpa.free(e.new);
+            freeOpt(gpa, e.old);
+            freeOpt(gpa, e.new);
         },
-        .param_add => |*e| gpa.free(e.name),
-        .param_remove => |*e| gpa.free(e.name),
+        .param_add => |*e| freeOpt(gpa, e.name),
+        .param_remove => |*e| freeOpt(gpa, e.name),
         .param_rename => |*e| {
-            gpa.free(e.old);
-            gpa.free(e.new);
+            freeOpt(gpa, e.old);
+            freeOpt(gpa, e.new);
         },
         else => {},
     }
+}
+
+fn freeOpt(gpa: std.mem.Allocator, s: ?[]const u8) void {
+    if (s) |x| gpa.free(@constCast(x));
 }
