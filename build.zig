@@ -1,16 +1,16 @@
-//! Build graph for featuretree-zig.
+//! Build graph for featime.
 //!
-//!   zig build                 build the terrain-editor demo (zig-out/bin/featuretree-demo)
+//!   zig build                 build the terrain-editor demo (zig-out/bin/featime-demo)
 //!   zig build run             run the demo
 //!   zig build test            unit + differential tests (honors -Doptimize)
 //!   zig build examples        run every usage example; `zig build <name>` runs one
 //!   zig build bench           benchmark suite (always ReleaseFast; -Dbench-max=N caps the size)
 //!   zig build docs            API reference into zig-out/docs
 //!
-//! Consumers import the `featuretree_zig` module:
+//! Consumers import the `featime` module:
 //!
-//!   const dep = b.dependency("featuretree_zig", .{ .target = target, .optimize = optimize });
-//!   exe.root_module.addImport("featuretree_zig", dep.module("featuretree_zig"));
+//!   const dep = b.dependency("featime", .{ .target = target, .optimize = optimize });
+//!   exe.root_module.addImport("featime", dep.module("featime"));
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
 
     // The library. `optimize` is set here so `-Doptimize=...` reaches the
     // library's own tests (below) and not just the demo.
-    const mod = b.addModule("featuretree_zig", .{
+    const mod = b.addModule("featime", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -27,12 +27,12 @@ pub fn build(b: *std.Build) void {
 
     // Terrain-editor demo exercising every capability end-to-end.
     const demo = b.addExecutable(.{
-        .name = "featuretree-demo",
+        .name = "featime-demo",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "featuretree_zig", .module = mod }},
+            .imports = &.{.{ .name = "featime", .module = mod }},
         }),
     });
     b.installArtifact(demo);
@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/oracle.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "featuretree_zig", .module = mod }},
+            .imports = &.{.{ .name = "featime", .module = mod }},
         }),
     });
 
@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/oom.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "featuretree_zig", .module = mod }},
+            .imports = &.{.{ .name = "featime", .module = mod }},
         }),
     });
     const fuzz_tests = b.addTest(.{
@@ -71,7 +71,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/fuzz.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "featuretree_zig", .module = mod }},
+            .imports = &.{.{ .name = "featime", .module = mod }},
         }),
     });
 
@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
     // API reference: `zig build docs`, then open zig-out/docs/index.html.
-    const docs_obj = b.addObject(.{ .name = "featuretree_zig", .root_module = mod });
+    const docs_obj = b.addObject(.{ .name = "featime", .root_module = mod });
     const docs_install = b.addInstallDirectory(.{
         .source_dir = docs_obj.getEmittedDocs(),
         .install_dir = .prefix,
@@ -112,7 +112,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "featuretree_zig", .module = mod }},
+                .imports = &.{.{ .name = "featime", .module = mod }},
             }),
         });
         const run_example = b.addRunArtifact(example);
@@ -131,13 +131,13 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     const bench = b.addExecutable(.{
-        .name = "featuretree-bench",
+        .name = "featime-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/bench.zig"),
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "featuretree_zig", .module = bench_lib },
+                .{ .name = "featime", .module = bench_lib },
                 .{ .name = "build_options", .module = bench_options.createModule() },
             },
         }),

@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 const hamt = @import("hamt");
 
 const Entity = struct { kind: u8, cell: u32 };

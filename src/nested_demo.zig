@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 
 const side: u8 = 4;
 const cells: usize = @as(usize, side) * side;

@@ -1,4 +1,4 @@
-//! featuretree-zig: design feature history for Zig applications.
+//! featime: design feature history for Zig applications.
 //!
 //! This library gives applications an Autodesk Fusion-style feature timeline:
 //! an ordered list of parametric operations ("features") that transform an

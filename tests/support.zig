@@ -4,7 +4,7 @@
 //! state.
 
 const std = @import("std");
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 
 pub const Domain = struct {
     pub const Doc = struct { value: i64 = 0 };

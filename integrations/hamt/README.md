@@ -1,7 +1,7 @@
-# featuretree-zig + hamt-zig
+# featime + hamt-zig
 
 A persistent hash array mapped trie as the timeline's document. This is a
-standalone project (its own `build.zig.zon`) that depends on featuretree-zig
+standalone project (its own `build.zig.zon`) that depends on featime
 by path and on [hamt-zig](https://github.com/nullstyle/hamt-zig) checked out
 next to it (`../../../hamt-zig`, on Zig 0.17.0).
 

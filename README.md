@@ -1,6 +1,7 @@
-# featuretree-zig
+# featime
 
-Design feature history for Zig applications: an Autodesk Fusion-style
+*featime* (fee-tim-EH): design feature history for Zig applications — an
+Autodesk Fusion-style
 feature timeline — an ordered list of parametric operations that transform an
 application-defined document, with the machinery Fusion users know: the
 history slider, mid-history editing, cached incremental rebuilds, per-feature
@@ -49,7 +50,7 @@ Write a Domain: name your document type, your feature types (one tagged
 union), and how features apply.
 
 ```zig
-const featuretree = @import("featuretree_zig");
+const featime = @import("featime");
 
 const MyApp = struct {
     pub const Doc = struct { heights: []f32, entities: std.ArrayList(Entity) };
@@ -60,7 +61,7 @@ const MyApp = struct {
     };
 
     // Required: apply one feature. Validate first, mutate second.
-    pub fn apply(op: Op, doc: *Doc, ctx: *featuretree.ApplyContext) anyerror!void {
+    pub fn apply(op: Op, doc: *Doc, ctx: *featime.ApplyContext) anyerror!void {
         switch (op) {
             .raise => |r| {
                 if (r.cell >= doc.heights.len)
@@ -78,7 +79,7 @@ const MyApp = struct {
     pub fn deinitDoc(doc: *Doc, gpa: std.mem.Allocator) void { ... }
 
     // Optional: enables reorder validation.
-    pub fn dependencies(op: Op, out: *featuretree.DepCollector) void { ... }
+    pub fn dependencies(op: Op, out: *featime.DepCollector) void { ... }
 
     // Optional: enables persistence.
     pub fn encodeOp(op: Op, w: *std.Io.Writer) anyerror!void { ... }
@@ -91,7 +92,7 @@ const MyApp = struct {
 Then drive the timeline:
 
 ```zig
-var tl = try featuretree.Timeline(MyApp).init(gpa, seed_doc, .{});
+var tl = try featime.Timeline(MyApp).init(gpa, seed_doc, .{});
 defer tl.deinit();
 
 const hill = try tl.commit(.{ .raise = .{ .cell = 42, .amount = 9 } });
@@ -418,7 +419,9 @@ a small versioned binary container framing app-encoded op and seed payloads
 (length-framed, so future readers can skip unknown op kinds). Ids, order,
 suppression, and the marker round-trip; statuses, checkpoints, and the undo
 journal intentionally do not — they recompute, like a Fusion document
-reopening. The header carries the timeline's id, the app format, and the
+reopening. The container magic reads `FTZ` (plus a format digit): it
+predates the name and stays, so files from the featuretree-zig days load.
+The header carries the timeline's id, the app format, and the
 ids of the timelines its features link to: `persistence.peekHeader(gpa,
 reader)` reads just that, so an app can open or fetch linked timelines
 before loading the container itself.

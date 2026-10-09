@@ -1,4 +1,4 @@
-//! featuretree-zig + hamt-zig: a persistent map as the timeline's document.
+//! featime + hamt-zig: a persistent map as the timeline's document.
 //!
 //!   zig build run -Doptimize=ReleaseFast   demo with timings and arena sizes
 //!   zig build test                          the demo's own tests
@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const ft_dep = b.dependency("featuretree_zig", .{ .target = target, .optimize = optimize });
+    const ft_dep = b.dependency("featime", .{ .target = target, .optimize = optimize });
     const hamt_dep = b.dependency("hamt", .{ .target = target, .optimize = optimize });
 
     const root = b.createModule(.{
@@ -16,12 +16,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "featuretree_zig", .module = ft_dep.module("featuretree_zig") },
+            .{ .name = "featime", .module = ft_dep.module("featime") },
             .{ .name = "hamt", .module = hamt_dep.module("hamt") },
         },
     });
 
-    const exe = b.addExecutable(.{ .name = "featuretree-hamt", .root_module = root });
+    const exe = b.addExecutable(.{ .name = "featime-hamt", .root_module = root });
     b.installArtifact(exe);
     b.step("run", "Run the HAMT-backed document demo").dependOn(&b.addRunArtifact(exe).step);
 

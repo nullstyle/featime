@@ -14,7 +14,7 @@
 //! replay from the seed for every document read.
 
 const std = @import("std");
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 
 const Domain = struct {
     pub const Doc = struct {

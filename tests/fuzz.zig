@@ -3,7 +3,7 @@
 //! (the smoke run); `zig build test --fuzz` keeps generating inputs.
 
 const std = @import("std");
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 const support = @import("support.zig");
 
 const Domain = support.Domain;

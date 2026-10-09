@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 const common = @import("common.zig");
 
 var clock_now: u64 = 1_000;

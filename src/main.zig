@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 
 // ---------------------------------------------------------------------------
 // The application's Domain: document, feature types, and the hooks.

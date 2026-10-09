@@ -1,11 +1,11 @@
 .{
-    .name = .featuretree_hamt_integration,
+    .name = .featime_hamt_integration,
     .version = "0.0.0",
-    .fingerprint = 0xab070104a68324d1,
+    .fingerprint = 0x14fc64425a3a352a,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        .featuretree_zig = .{ .path = "../.." },
-        // Expects hamt-zig checked out next to featuretree-zig.
+        .featime = .{ .path = "../.." },
+        // Expects hamt-zig checked out next to featime.
         .hamt = .{ .path = "../../../hamt-zig" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },

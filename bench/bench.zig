@@ -8,7 +8,7 @@
 //! Peak live bytes come from a counting allocator wrapped around the gpa.
 
 const std = @import("std");
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 const build_options = @import("build_options");
 
 const cells: u32 = 64 * 64;
@@ -341,7 +341,7 @@ pub fn main(init: std.process.Init) !void {
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const out = &file_writer.interface;
 
-    try out.print("featuretree-zig benchmarks (ReleaseFast, single thread)\n", .{});
+    try out.print("featime benchmarks (ReleaseFast, single thread)\n", .{});
     try out.print("part 1: plain-data document (64x64 f32 heightmap, 16 KiB)\n", .{});
     const sizes = [_]u32{ 1_000, 10_000, 100_000 };
     for (sizes) |n| {

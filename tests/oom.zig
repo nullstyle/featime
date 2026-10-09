@@ -9,7 +9,7 @@
 //! produces, and `undo` must bring the earlier state back.
 
 const std = @import("std");
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 const support = @import("support.zig");
 
 const Domain = support.Domain;

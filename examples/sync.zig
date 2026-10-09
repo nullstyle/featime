@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 const common = @import("common.zig");
 
 const Ledger = struct {

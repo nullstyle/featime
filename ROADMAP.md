@@ -1,4 +1,4 @@
-# featuretree-zig development roadmap
+# featime development roadmap
 
 Consolidated plan for the library's next four waves plus a deferred tail.
 Background on the library's design (Domain contract, seams, threading model)

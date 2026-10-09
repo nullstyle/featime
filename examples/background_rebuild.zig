@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const ft = @import("featuretree_zig");
+const ft = @import("featime");
 const common = @import("common.zig");
 
 /// Simulates an expensive feature: each apply does real (if pointless) work,

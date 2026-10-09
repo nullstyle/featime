@@ -1,11 +1,15 @@
 # Changelog
 
-All notable changes to featuretree-zig. The format follows
+All notable changes to featime (featuretree-zig until 0.10.0). The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
 ## 0.10.0 — 2026-10-09
 
 ### Changed (breaking)
+- Renamed to **featime** (pronounced fee-tim-EH). The package and module
+  are `featime` (was `featuretree_zig`); the executables are `featime-demo`
+  and `featime-bench`. The container magic keeps its `FTZ` bytes, so
+  existing files load.
 - Containers are FTZ6: the header lists the ids of the timelines the
   features link to (FTZ1–FTZ5 still load). `rebuild.applyRange` takes a
   `registry` argument after `env`. The nested demo names its region by
