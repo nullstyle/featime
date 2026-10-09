@@ -216,3 +216,10 @@ load-bearing), and anything UI-shaped — the library stays headless.
   member carries it along, `moveGroup` relocates the folder as a block; the
   fixups ride the move's journal entry so undo and redo are exact.
 - Unknown ids are errors, never silent no-ops (0.7.0).
+- Sync order model (0.10): a commit carries its predecessor and an order key
+  (Lamport clock, origin id); remote placement is RGA-style — after the
+  predecessor, past greater keys — so concurrent commits converge. Moves and
+  removes stay positional and application-reconciled; `structureDigest`
+  detects divergence. Each `Timeline.init` is a new replica (`replicaId`);
+  envelopes carry per-replica sequence numbers; a loaded file is a new
+  replica with the file's per-origin bookkeeping.

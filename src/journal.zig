@@ -42,6 +42,10 @@ pub fn Journal(comptime Op: type) type {
                 at: u32,
                 /// Provenance recorded at commit time; restored on redo.
                 meta: ?annotations.Meta = null,
+                /// Predecessor at the origin (null: inserted first) and the
+                /// replicated order key — what `applyRemote` places by.
+                after: ?ft.FeatureId = null,
+                order: ft.OrderKey = .{},
             },
             edit: struct { id: ft.FeatureId, old_op: Op, new_op: Op },
             remove: struct {

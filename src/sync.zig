@@ -28,8 +28,23 @@ const params = @import("params.zig");
 /// History: 1 — 0.6.x (implicit, no byte); 2 — 0.7.0 (version byte, move
 /// entries carry group fixes, group fixes carry old and new anchors);
 /// 3 — 0.8.0 (the app's `format_version` follows the version byte, so a
-/// newer peer migrates older ops through `Domain.migrateOp`).
-pub const wire_version: u8 = 3;
+/// newer peer migrates older ops through `Domain.migrateOp`); 4 — 0.10
+/// (envelopes: origin, per-origin sequence number and Lamport clock in
+/// front of every entry; commit entries carry predecessor and order key).
+pub const wire_version: u8 = 4;
+
+/// One journal entry as it crosses the wire: the replica that emitted it,
+/// its per-origin sequence number (1-based; 0 = unsequenced), and that
+/// replica's Lamport clock at the time. The record observer yields these;
+/// `applyRemote` consumes them.
+pub fn Envelope(comptime Op: type) type {
+    return struct {
+        origin: u64,
+        seq: u64 = 0,
+        lamport: u64 = 0,
+        entry: journaling.Journal(Op).Entry,
+    };
+}
 
 /// True when the remote edit's provenance wins over the local one by
 /// timestamp (ties favor the remote — the caller chose to deliver it).
@@ -198,22 +213,28 @@ fn readTags(gpa: std.mem.Allocator, r: *std.Io.Reader) ![][]const u8 {
     return out;
 }
 
-/// Serialize one journal entry. Requires the Domain persistence codecs.
+/// Serialize one envelope. Requires the Domain persistence codecs.
 pub fn encode(
     comptime Domain: type,
-    entry: *const journaling.Journal(Domain.Op).Entry,
+    env: *const Envelope(Domain.Op),
     gpa: std.mem.Allocator,
     w: *std.Io.Writer,
 ) !void {
     try w.writeAll(&[1]u8{wire_version});
     try w.writeInt(u32, persistence.formatVersion(Domain), .little);
-    switch (entry.*) {
+    try w.writeInt(u64, env.origin, .little);
+    try w.writeInt(u64, env.seq, .little);
+    try w.writeInt(u64, env.lamport, .little);
+    switch (env.entry) {
         .commit => |e| {
             try w.writeAll(&[1]u8{1});
             try w.writeInt(u64, e.id, .little);
             try writeFramedOp(Domain, e.op, gpa, w);
             try w.writeInt(u32, e.at, .little);
             try writeMeta(w, e.meta);
+            try w.writeInt(u64, e.after orelse 0, .little);
+            try w.writeInt(u64, e.order.lamport, .little);
+            try w.writeInt(u64, e.order.origin, .little);
         },
         .edit => |e| {
             try w.writeAll(&[1]u8{2});
@@ -328,31 +349,42 @@ pub fn encode(
     }
 }
 
-/// Deserialize an owned entry (strings and slices allocated from `gpa`);
-/// free it with `deinit` after use. Entries written by another
+/// Deserialize an owned envelope (strings and slices allocated from `gpa`);
+/// free it with `deinit` after use. Envelopes written by another
 /// `wire_version` are rejected with `error.UnsupportedWireVersion`.
 pub fn decode(
     comptime Domain: type,
     gpa: std.mem.Allocator,
     r: *std.Io.Reader,
-) !journaling.Journal(Domain.Op).Entry {
+) !Envelope(Domain.Op) {
     const version = (try r.take(1))[0];
     if (version != wire_version) return error.UnsupportedWireVersion;
     const stored_format = try r.takeInt(u32, .little);
+    const origin = try r.takeInt(u64, .little);
+    const seq = try r.takeInt(u64, .little);
+    const lamport = try r.takeInt(u64, .little);
     const tag = (try r.take(1))[0];
-    switch (tag) {
-        1 => return .{ .commit = .{
+    const entry: journaling.Journal(Domain.Op).Entry = switch (tag) {
+        1 => .{ .commit = .{
             .id = try r.takeInt(u64, .little),
             .op = try readOp(Domain, gpa, r, stored_format),
             .at = try r.takeInt(u32, .little),
             .meta = try readMeta(r),
+            .after = blk: {
+                const a = try r.takeInt(u64, .little);
+                break :blk if (a == 0) null else a;
+            },
+            .order = .{
+                .lamport = try r.takeInt(u64, .little),
+                .origin = try r.takeInt(u64, .little),
+            },
         } },
-        2 => return .{ .edit = .{
+        2 => .{ .edit = .{
             .id = try r.takeInt(u64, .little),
             .old_op = try readOp(Domain, gpa, r, stored_format),
             .new_op = try readOp(Domain, gpa, r, stored_format),
         } },
-        3 => return .{ .remove = .{
+        3 => .{ .remove = .{
             .id = try r.takeInt(u64, .little),
             .op = try readOp(Domain, gpa, r, stored_format),
             .at = try r.takeInt(u32, .little),
@@ -364,74 +396,75 @@ pub fn decode(
             .tags = try readTags(gpa, r),
             .group_fixes = try readGroupFixes(gpa, r),
         } },
-        4 => return .{ .suppress = .{
+        4 => .{ .suppress = .{
             .id = try r.takeInt(u64, .little),
             .prev = (try r.take(1))[0] != 0,
         } },
-        5 => return .{ .move = .{
+        5 => .{ .move = .{
             .id = try r.takeInt(u64, .little),
             .from = try r.takeInt(u32, .little),
             .to = try r.takeInt(u32, .little),
             .marker_pre = try r.takeInt(u32, .little),
             .group_fixes = try readGroupFixes(gpa, r),
         } },
-        6 => return .{ .name_set = .{
+        6 => .{ .name_set = .{
             .id = try r.takeInt(u64, .little),
             .old = try readOptString(gpa, r),
             .new = try readOptString(gpa, r),
         } },
-        7 => return .{ .tag_add = .{
+        7 => .{ .tag_add = .{
             .id = try r.takeInt(u64, .little),
             .tag = try readString(gpa, r),
         } },
-        8 => return .{ .tag_remove = .{
+        8 => .{ .tag_remove = .{
             .id = try r.takeInt(u64, .little),
             .tag = try readString(gpa, r),
         } },
-        9 => return .{ .chapter_add = .{
+        9 => .{ .chapter_add = .{
             .chapter = try readChapter(gpa, r),
         } },
-        10 => return .{ .chapter_remove = .{
+        10 => .{ .chapter_remove = .{
             .chapter = try readChapter(gpa, r),
         } },
-        11 => return .{ .chapter_rename = .{
+        11 => .{ .chapter_rename = .{
             .id = try r.takeInt(u64, .little),
             .old = try readString(gpa, r),
             .new = try readString(gpa, r),
         } },
-        12 => return .{ .group_add = .{
+        12 => .{ .group_add = .{
             .group = try readGroup(gpa, r),
         } },
-        13 => return .{ .group_remove = .{
+        13 => .{ .group_remove = .{
             .group = try readGroup(gpa, r),
         } },
-        14 => return .{ .group_rename = .{
+        14 => .{ .group_rename = .{
             .id = try r.takeInt(u64, .little),
             .old = try readString(gpa, r),
             .new = try readString(gpa, r),
         } },
-        15 => return .{ .param_add = .{
+        15 => .{ .param_add = .{
             .id = try r.takeInt(u64, .little),
             .name = try readString(gpa, r),
             .value = @bitCast(try r.takeInt(u64, .little)),
         } },
-        16 => return .{ .param_remove = .{
+        16 => .{ .param_remove = .{
             .id = try r.takeInt(u64, .little),
             .name = try readString(gpa, r),
             .value = @bitCast(try r.takeInt(u64, .little)),
         } },
-        17 => return .{ .param_set = .{
+        17 => .{ .param_set = .{
             .id = try r.takeInt(u64, .little),
             .old = @bitCast(try r.takeInt(u64, .little)),
             .new = @bitCast(try r.takeInt(u64, .little)),
         } },
-        18 => return .{ .param_rename = .{
+        18 => .{ .param_rename = .{
             .id = try r.takeInt(u64, .little),
             .old = try readString(gpa, r),
             .new = try readString(gpa, r),
         } },
         else => return error.BadEntryTag,
-    }
+    };
+    return .{ .origin = origin, .seq = seq, .lamport = lamport, .entry = entry };
 }
 
 fn readChapter(gpa: std.mem.Allocator, r: *std.Io.Reader) !annotations.Chapter {
@@ -453,9 +486,9 @@ fn readGroup(gpa: std.mem.Allocator, r: *std.Io.Reader) !annotations.Group {
     return .{ .id = gid, .first = first, .last = last, .name = name };
 }
 
-/// Free an entry produced by `decode` (and any owned memory inside).
-pub fn deinit(comptime Op: type, gpa: std.mem.Allocator, entry: *journaling.Journal(Op).Entry) void {
-    switch (entry.*) {
+/// Free an envelope produced by `decode` (and any owned memory inside).
+pub fn deinit(comptime Op: type, gpa: std.mem.Allocator, env: *Envelope(Op)) void {
+    switch (env.entry) {
         .remove => |*e| {
             if (e.name) |n| gpa.free(n);
             gpa.free(e.chapter_fixes);

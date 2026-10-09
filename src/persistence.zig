@@ -1,15 +1,17 @@
 //! Save/load timelines: a small versioned binary container framing
 //! application-encoded payloads.
 //!
-//! FTZ4 layout (all integers little-endian; "framed" = u32 length + bytes):
+//! FTZ5 layout (all integers little-endian; "framed" = u32 length + bytes):
 //!
-//!   magic "FTZ4"
+//!   magic "FTZ5"
 //!   u64 timeline_id
 //!   u32 format_version                (the app's `Domain.format_version`)
 //!   framed seed document              (bytes from `Domain.encodeDoc`)
-//!   u32 feature_count × { u64 id, u8 suppressed, framed op (`Domain.encodeOp`) }
+//!   u32 feature_count × { u64 id, u8 suppressed, u64 order.lamport,
+//!                         u64 order.origin, framed op (`Domain.encodeOp`) }
 //!   u32 marker
 //!   u32 param_count   × { u64 id, u64 value (f64 bit pattern), framed name }
+//!   u32 seen_count    × { u64 origin, u64 seq }   (sync sequence bookkeeping)
 //!   --- annotation sections ---
 //!   u32 name_count    × { u64 feature_id, framed name }
 //!   u32 chapter_count × { u64 chapter_id, u64 after (0 = end-pinned), framed name }
@@ -17,7 +19,8 @@
 //!   u32 tag_count     × { u64 feature_id, framed tag }
 //!   u32 provenance_ct × { u64 feature_id, u64 author, u64 ts }
 //!
-//! Older containers still load: FTZ3 has no format_version (0 is assumed);
+//! Older containers still load: FTZ4 has no order keys or seen table (keys
+//! are zero, nothing seen); FTZ3 has no format_version either (0 is assumed);
 //! FTZ2 has no parameter section either; FTZ1 has no parameters, no
 //! annotations, and no timeline_id (a fresh one is generated).
 //!
@@ -46,7 +49,8 @@
 const std = @import("std");
 const ft = @import("root.zig");
 
-pub const magic = "FTZ4";
+pub const magic = "FTZ5";
+pub const magic_v4 = "FTZ4";
 pub const magic_v3 = "FTZ3";
 pub const magic_v2 = "FTZ2";
 pub const magic_v1 = "FTZ1";
@@ -186,6 +190,8 @@ fn saveUpTo(
     for (kept_list) |*f| {
         try writer.writeInt(u64, f.id, .little);
         try writer.writeAll(&[1]u8{@intFromBool(f.suppressed)});
+        try writer.writeInt(u64, f.order.lamport, .little);
+        try writer.writeInt(u64, f.order.origin, .little);
         var aw: std.Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
         try Domain.encodeOp(f.op, &aw.writer);
@@ -201,6 +207,14 @@ fn saveUpTo(
         try writer.writeInt(u64, pm.id, .little);
         try writer.writeInt(u64, @bitCast(pm.value), .little);
         try writeFramed(writer, pm.name);
+    }
+
+    // Sync bookkeeping: what this document has absorbed from each origin.
+    try writer.writeInt(u32, @intCast(tl.seen.count()), .little);
+    var seen_it = tl.seen.iterator();
+    while (seen_it.next()) |e| {
+        try writer.writeInt(u64, e.key_ptr.*, .little);
+        try writer.writeInt(u64, e.value_ptr.*, .little);
     }
 
     // Annotation sections, filtered to kept features.
@@ -289,18 +303,21 @@ pub fn load(
 ) anyerror!ft.Timeline(Domain) {
     validateCodecs(Domain);
     const head = try reader.take(4);
-    const v4 = std.mem.eql(u8, head, magic);
+    const v5 = std.mem.eql(u8, head, magic);
+    const v4 = std.mem.eql(u8, head, magic_v4);
     const v3 = std.mem.eql(u8, head, magic_v3);
     const v2 = std.mem.eql(u8, head, magic_v2);
-    if (!v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
+    if (!v5 and !v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
         return error.BadMagic;
-    const has_id = v4 or v3 or v2;
-    const has_params = v4 or v3;
-    const has_annotations = v4 or v3 or v2;
+    const has_id = v5 or v4 or v3 or v2;
+    const has_format = v5 or v4;
+    const has_params = v5 or v4 or v3;
+    const has_annotations = v5 or v4 or v3 or v2;
+    const has_order = v5;
 
     var timeline_id: u64 = 0;
     if (has_id) timeline_id = try reader.takeInt(u64, .little);
-    const stored_format: u32 = if (v4) try reader.takeInt(u32, .little) else 0;
+    const stored_format: u32 = if (has_format) try reader.takeInt(u32, .little) else 0;
 
     var doc_reader = try framedReader(gpa, reader);
     defer gpa.free(doc_reader.bytes);
@@ -315,15 +332,23 @@ pub fn load(
     // loads the same file (two replicas must never share a counter).
     const count = try reader.takeInt(u32, .little);
     var i: u32 = 0;
+    var max_lamport: u64 = 0;
     while (i < count) : (i += 1) {
         const id = try reader.takeInt(u64, .little);
         const suppressed = (try reader.take(1))[0] != 0;
+        var order: ft.OrderKey = .{};
+        if (has_order) {
+            order.lamport = try reader.takeInt(u64, .little);
+            order.origin = try reader.takeInt(u64, .little);
+            if (order.lamport > max_lamport) max_lamport = order.lamport;
+        }
         var op_reader = try framedReader(gpa, reader);
         defer gpa.free(op_reader.bytes);
         const op = try decodeOpVersioned(Domain, stored_format, &op_reader.reader, gpa);
-        try tl.list.append(gpa, .{ .id = id, .op = op, .suppressed = suppressed });
+        try tl.list.append(gpa, .{ .id = id, .op = op, .suppressed = suppressed, .order = order });
     }
     try tl.rebuildIndex();
+    tl.lamport = max_lamport;
     tl.marker_pos = @min(try reader.takeInt(u32, .little), tl.len());
     if (has_params) {
         const param_count = try reader.takeInt(u32, .little);
@@ -334,6 +359,15 @@ pub fn load(
             const fr = try framedReader(gpa, reader);
             defer gpa.free(fr.bytes);
             tl.ptab.add(pid, fr.bytes, value) catch {};
+        }
+    }
+    if (has_order) {
+        const seen_count = try reader.takeInt(u32, .little);
+        var sc: u32 = 0;
+        while (sc < seen_count) : (sc += 1) {
+            const origin = try reader.takeInt(u64, .little);
+            const seq = try reader.takeInt(u64, .little);
+            try tl.seen.put(gpa, origin, seq);
         }
     }
 
@@ -825,16 +859,77 @@ test "format version: a Domain without migration hooks rejects foreign versions"
 test "sync entries carry the format version and migrate on decode" {
     const gpa = std.testing.allocator;
     const syncing = @import("sync.zig");
-    const entry: ft.Timeline(PersistDomain).Entry = .{ .commit = .{ .id = 9, .op = .{ .add = 5 }, .at = 0 } };
+    const env: ft.Timeline(PersistDomain).Envelope = .{ .origin = 1, .seq = 1, .lamport = 1, .entry = .{ .commit = .{ .id = 9, .op = .{ .add = 5 }, .at = 0 } } };
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
-    try syncing.encode(PersistDomain, &entry, gpa, &aw.writer);
+    try syncing.encode(PersistDomain, &env, gpa, &aw.writer);
 
     var reader = std.Io.Reader.fixed(aw.written());
     var got = try syncing.decode(MigratingDomain, gpa, &reader);
     defer syncing.deinit(MigratingDomain.Op, gpa, &got);
-    try std.testing.expectEqual(@as(i64, 5), got.commit.op.add);
+    try std.testing.expectEqual(@as(i64, 5), got.entry.commit.op.add);
 
     var reader2 = std.Io.Reader.fixed(aw.written());
     try std.testing.expectError(error.UnsupportedFormatVersion, syncing.decode(StrictV1Domain, gpa, &reader2));
+}
+
+test "FTZ5 round-trips order keys and the seen table; FTZ4 files load with zero keys" {
+    const gpa = std.testing.allocator;
+    var tl = try PersistTimeline.init(gpa, .{}, .{});
+    defer tl.deinit();
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    const foreign: ft.Timeline(PersistDomain).Envelope = .{
+        .origin = 77,
+        .seq = 1,
+        .lamport = 500,
+        .entry = .{ .commit = .{ .id = 9000, .op = .{ .add = 3 }, .at = 2, .after = null, .order = .{ .lamport = 500, .origin = 77 } } },
+    };
+    try std.testing.expectEqual(ft.Timeline(PersistDomain).ApplyResult.applied, tl.applyRemote(&foreign));
+    try std.testing.expectEqual(@as(u64, 2), tl.expectedSeq(77));
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try save(PersistDomain, &tl, gpa, &aw.writer);
+    var reader = std.Io.Reader.fixed(aw.written());
+    var loaded = try load(PersistDomain, gpa, .{}, &reader);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 2), loaded.expectedSeq(77));
+    try std.testing.expectEqual(@as(u64, 500), loaded.lamport);
+    for (tl.list.items, loaded.list.items) |want, got| {
+        try std.testing.expectEqual(want.id, got.id);
+        try std.testing.expectEqual(want.order.lamport, got.order.lamport);
+        try std.testing.expectEqual(want.order.origin, got.order.origin);
+    }
+    try std.testing.expect(loaded.replicaId() != tl.replicaId()); // a loaded timeline is a new replica
+
+    // A hand-crafted FTZ4 file: no order keys, no seen table.
+    var aw4: std.Io.Writer.Allocating = .init(gpa);
+    defer aw4.deinit();
+    const w = &aw4.writer;
+    try w.writeAll(magic_v4);
+    try w.writeInt(u64, 42, .little); // timeline_id
+    try w.writeInt(u32, 0, .little); // format_version
+    try w.writeInt(u32, 8, .little); // seed frame
+    try w.writeInt(i64, 0, .little);
+    try w.writeInt(u32, 1, .little); // one feature
+    try w.writeInt(u64, 5, .little); // id
+    try w.writeAll(&[1]u8{0}); // not suppressed
+    try w.writeInt(u32, 9, .little); // op frame: tag + i64
+    try w.writeAll(&[1]u8{0});
+    try w.writeInt(i64, 7, .little);
+    try w.writeInt(u32, 1, .little); // marker
+    try w.writeInt(u32, 0, .little); // params
+    try w.writeInt(u32, 0, .little); // names
+    try w.writeInt(u32, 0, .little); // chapters
+    try w.writeInt(u32, 0, .little); // groups
+    try w.writeInt(u32, 0, .little); // tags
+    try w.writeInt(u32, 0, .little); // provenance
+    var reader4 = std.Io.Reader.fixed(aw4.written());
+    var old = try load(PersistDomain, gpa, .{}, &reader4);
+    defer old.deinit();
+    try std.testing.expectEqual(@as(i64, 7), old.state().value);
+    try std.testing.expectEqual(@as(u64, 0), old.list.items[0].order.lamport);
+    try std.testing.expectEqual(@as(u64, 1), old.expectedSeq(77));
 }

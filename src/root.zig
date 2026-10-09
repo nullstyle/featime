@@ -103,6 +103,21 @@ pub const Status = union(enum) {
     failed: []const u8,
 };
 
+/// A feature's key in the replicated order: the Lamport clock value of the
+/// replica that committed it, with that replica's id as the tie-breaker.
+/// `Timeline.applyRemote` places a remote commit right after its predecessor
+/// and then past every following feature whose key is greater, so
+/// concurrent commits land in the same order on every replica.
+pub const OrderKey = struct {
+    lamport: u64 = 0,
+    origin: u64 = 0,
+
+    pub fn greaterThan(a: OrderKey, b: OrderKey) bool {
+        if (a.lamport != b.lamport) return a.lamport > b.lamport;
+        return a.origin > b.origin;
+    }
+};
+
 /// Stored representation of one feature on the timeline.
 pub fn Feature(comptime Op: type) type {
     return struct {
@@ -110,6 +125,9 @@ pub fn Feature(comptime Op: type) type {
         op: Op,
         suppressed: bool = false,
         status: Status = .pending,
+        /// Replicated order key (see `OrderKey`); zero on features that
+        /// predate 0.10 files.
+        order: OrderKey = .{},
     };
 }
 

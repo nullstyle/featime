@@ -31,6 +31,8 @@ pub fn Timeline(comptime Domain: type) type {
         /// Journal entry shape, re-exported for record observers and
         /// `applyRemote`.
         pub const Entry = journaling.Journal(Op).Entry;
+        /// What the record observer yields and `applyRemote` consumes.
+        pub const Envelope = syncing.Envelope(Op);
         /// One undo/redo unit as reported by `history()`.
         pub const HistoryUnit = journaling.Journal(Op).Unit;
         pub const HistoryKind = journaling.Journal(Op).UnitKind;
@@ -124,6 +126,18 @@ pub fn Timeline(comptime Domain: type) type {
         /// integrations and must not fire the observer.
         applying_remote: bool = false,
 
+        /// This replica's identity in the sync feed: random per `init`, so a
+        /// loaded timeline is a new replica. Stamped as `origin` into every
+        /// envelope and into commit order keys.
+        replica_id: u64,
+        /// Lamport clock: advanced by every local edit, raised to any remote
+        /// envelope's clock. Commit order keys carry it.
+        lamport: u64 = 0,
+        /// Sequence number of the last envelope this replica emitted.
+        seq: u64 = 0,
+        /// Highest sequence number integrated per remote origin.
+        seen: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+
         // ------------------------------------------------------------------
         // Lifecycle
         // ------------------------------------------------------------------
@@ -149,6 +163,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .ann = annotations.Annotations.init(gpa),
                 .ptab = params.ParamTable.init(gpa),
                 .timeline_id = prng.random().int(u64) | 1,
+                .replica_id = prng.random().int(u64) | 1,
             };
         }
 
@@ -169,6 +184,7 @@ pub fn Timeline(comptime Domain: type) type {
             self.resetStatuses(0);
             self.list.deinit(self.gpa);
             self.index.deinit(self.gpa);
+            self.seen.deinit(self.gpa);
             self.cps.deinit();
             self.journal.deinit();
             self.ann.deinit();
@@ -207,9 +223,24 @@ pub fn Timeline(comptime Domain: type) type {
         /// Structural entries that delete features (remove) snapshot what
         /// they need at record time.
         fn record(self: *Self, entry: journaling.Journal(Op).Entry) void {
+            self.recordAt(entry, self.nextLamport());
+        }
+
+        fn nextLamport(self: *Self) u64 {
+            self.lamport += 1;
+            return self.lamport;
+        }
+
+        /// Journal `entry` and, for a local edit, hand it to the observer in
+        /// an envelope stamped with this replica's id, the next sequence
+        /// number, and `lamport`.
+        fn recordAt(self: *Self, entry: journaling.Journal(Op).Entry, lamport: u64) void {
             self.journal.record(entry);
             if (!self.applying_remote) {
-                if (self.observer) |obs| obs.func(obs.ctx, &entry);
+                if (self.observer) |obs| {
+                    self.seq += 1;
+                    obs.func(obs.ctx, &.{ .origin = self.replica_id, .seq = self.seq, .lamport = lamport, .entry = entry });
+                }
             }
         }
 
@@ -284,9 +315,12 @@ pub fn Timeline(comptime Domain: type) type {
             self.touch();
             const id = self.allocId();
             const at = self.marker_pos;
+            const after: ?ft.FeatureId = if (at > 0) self.list.items[at - 1].id else null;
+            const lamport = self.nextLamport();
+            const order: ft.OrderKey = .{ .lamport = lamport, .origin = self.replica_id };
 
-            try self.listInsert(at, .{ .id = id, .op = op });
-            self.record(.{ .commit = .{ .id = id, .op = op, .at = at, .meta = meta } });
+            try self.listInsert(at, .{ .id = id, .op = op, .order = order });
+            self.recordAt(.{ .commit = .{ .id = id, .op = op, .at = at, .meta = meta, .after = after, .order = order } }, lamport);
             if (meta) |m| self.ann.setProvenance(id, m) catch {};
             if (meta != null) self.annTouch();
             self.afterInsert(at);
@@ -1005,49 +1039,124 @@ pub fn Timeline(comptime Domain: type) type {
 
         pub const RecordObserver = struct {
             ctx: ?*anyopaque = null,
-            func: *const fn (ctx: ?*anyopaque, entry: *const Entry) void,
+            func: *const fn (ctx: ?*anyopaque, env: *const Envelope) void,
         };
 
         /// Install the sync-feed observer: called for each locally journaled
         /// edit, in record order (including each entry inside a
-        /// transaction). Remote integrations via `applyRemote` do not fire
-        /// it. The entry pointer is borrowed — copy what you need inside
-        /// the callback.
+        /// transaction), with an envelope carrying this replica's id, a
+        /// per-replica sequence number (1, 2, 3, ...) and the Lamport clock.
+        /// Remote integrations via `applyRemote` do not fire it. The
+        /// envelope is borrowed — copy (or encode) what you need inside the
+        /// callback.
         pub fn setRecordObserver(self: *Self, observer: RecordObserver) void {
             self.observer = observer;
         }
 
-        /// Integrate an edit that originated on another replica. Identity is
-        /// exact — feature/chapter/group/param ids are preserved — while
-        /// positions are hints: indices are clamped and entries referencing
-        /// unknown ids are silently dropped. Remote ids never move the local
-        /// id counter (see `allocId`): each replica keeps allocating from its
-        /// own random-anchored range, so concurrent commits on two replicas
-        /// get distinct ids. The effect is journaled locally (undo works
-        /// uniformly) but does not fire the record observer, so feeding
-        /// replicas' entries to each other cannot loop. Structural remote
-        /// entries bump the rebuild generation exactly like local edits, so
-        /// a background job that was in flight is rejected at `integrate`.
+        /// This replica's id, as stamped into envelopes and order keys.
+        pub fn replicaId(self: *const Self) u64 {
+            return self.replica_id;
+        }
+
+        /// The sequence number this replica expects next from `origin`.
+        pub fn expectedSeq(self: *const Self, origin: u64) u64 {
+            return (self.seen.get(origin) orelse 0) + 1;
+        }
+
+        /// Declare that everything `origin` emitted up to and including
+        /// `seq` is already reflected here — after a resync through a file,
+        /// say — so the next envelope expected is `seq + 1`.
+        pub fn acknowledge(self: *Self, origin: u64, seq: u64) error{OutOfMemory}!void {
+            try self.seen.put(self.gpa, origin, seq);
+        }
+
+        pub const ApplyResult = enum {
+            /// Integrated and journaled.
+            applied,
+            /// Nothing changed: the entry referenced ids this replica does
+            /// not have, a commit already present, or a no-op.
+            dropped,
+            /// Sequence number at or below one already integrated from this
+            /// origin: ignored (re-delivery is safe).
+            duplicate,
+            /// Sequence number beyond the next expected one: not applied.
+            /// Fetch from `expectedSeq(origin)` first.
+            gap,
+            /// Emitted by this replica itself (an echo): ignored.
+            own,
+        };
+
+        /// Integrate an edit that originated on another replica.
         ///
-        /// Two replicas that exchange every entry in a consistent order
-        /// converge; concurrent positional edits are the application
-        /// layer's concern (`sync.lastWriterWins` is the provided
-        /// tie-breaker when provenance timestamps exist).
-        pub fn applyRemote(self: *Self, entry: *const Entry) void {
+        /// Sequencing: an envelope with `seq != 0` must be the next one from
+        /// its origin — earlier ones are `.duplicate`, later ones `.gap`
+        /// (not applied); `seq == 0` skips the check. Echoes of this
+        /// replica's own envelopes are `.own`.
+        ///
+        /// Placement: a remote commit lands right after its predecessor
+        /// (`after`), then past every following feature whose order key is
+        /// greater — the same rule on every replica, so concurrent commits
+        /// end up in the same order everywhere, whatever the delivery order.
+        /// An unknown predecessor (removed, or not received yet) falls back
+        /// to the positional hint. Other entries reference features by id;
+        /// unknown ids are `.dropped`.
+        ///
+        /// Identity is exact: feature/chapter/group/param ids are preserved
+        /// and never move the local id counter. The effect is journaled
+        /// locally (undo is uniform) but never re-broadcast, so replicas
+        /// feeding each other cannot loop. Structural entries bump the
+        /// rebuild generation like local edits.
+        ///
+        /// Concurrent *moves* and *removes* are not reconciled: compare
+        /// `structureDigest` after a sync round and resync through a file
+        /// when they disagree.
+        pub fn applyRemote(self: *Self, env: *const Envelope) ApplyResult {
+            if (env.origin == self.replica_id) return .own;
+            if (env.seq != 0) {
+                const expected = self.expectedSeq(env.origin);
+                if (env.seq < expected) return .duplicate;
+                if (env.seq > expected) return .gap;
+                self.seen.put(self.gpa, env.origin, env.seq) catch return .dropped;
+            }
+            if (env.lamport > self.lamport) self.lamport = env.lamport;
             const prev = self.applying_remote;
             self.applying_remote = true;
             defer self.applying_remote = prev;
-            self.applyRemoteInner(entry);
+            return self.applyRemoteInner(&env.entry);
         }
 
-        fn applyRemoteInner(self: *Self, entry: *const Entry) void {
+        /// A hash of the feature order and suppression flags. Replicas that
+        /// agree on it have the same structure; compare after a sync round
+        /// to detect divergence.
+        pub fn structureDigest(self: *const Self) u64 {
+            var h = std.hash.Wyhash.init(0x5EED);
+            for (self.list.items) |f| {
+                h.update(std.mem.asBytes(&f.id));
+                h.update(&[1]u8{@intFromBool(f.suppressed)});
+            }
+            return h.final();
+        }
+
+        /// Where a remote commit lands: right after its predecessor, then
+        /// past every following feature whose order key is greater (a
+        /// concurrent or later insert at the same spot that sorts first).
+        /// Unknown predecessor: the positional hint, clamped.
+        fn remotePosition(self: *const Self, after: ?ft.FeatureId, hint: u32, order: ft.OrderKey) u32 {
+            const n: u32 = @intCast(self.list.items.len);
+            var pos: u32 = 0;
+            if (after) |a| pos = if (self.indexOf(a)) |i| i + 1 else @min(hint, n);
+            while (pos < n and self.list.items[pos].order.greaterThan(order)) pos += 1;
+            return pos;
+        }
+
+        fn applyRemoteInner(self: *Self, entry: *const Entry) ApplyResult {
             switch (entry.*) {
                 .commit => |e| {
                     // Re-delivery is possible in any feed protocol: a
                     // commit whose id already exists here was integrated.
-                    if (self.indexOf(e.id) != null) return;
-                    const at = @min(e.at, @as(u32, @intCast(self.list.items.len)));
-                    self.listInsert(at, .{ .id = e.id, .op = e.op }) catch return;
+                    if (self.indexOf(e.id) != null) return .dropped;
+                    const at = self.remotePosition(e.after, e.at, e.order);
+                    self.listInsert(at, .{ .id = e.id, .op = e.op, .order = e.order }) catch return .dropped;
                     self.touch();
                     if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     self.journal.record(.{ .commit = .{
@@ -1055,11 +1164,13 @@ pub fn Timeline(comptime Domain: type) type {
                         .op = e.op,
                         .at = at,
                         .meta = e.meta,
+                        .after = e.after,
+                        .order = e.order,
                     } });
                     self.afterRemoteInsert(at);
                 },
                 .edit => |e| {
-                    const idx = self.indexOf(e.id) orelse return;
+                    const idx = self.indexOf(e.id) orelse return .dropped;
                     self.touch();
                     const old_op = self.list.items[idx].op;
                     self.journal.record(.{ .edit = .{
@@ -1071,25 +1182,25 @@ pub fn Timeline(comptime Domain: type) type {
                     self.invalidate(idx);
                 },
                 .remove => |e| {
-                    const idx = self.indexOf(e.id) orelse return;
+                    const idx = self.indexOf(e.id) orelse return .dropped;
                     self.touch();
                     self.removeAt(idx);
                 },
                 .suppress => |e| {
-                    const idx = self.indexOf(e.id) orelse return;
+                    const idx = self.indexOf(e.id) orelse return .dropped;
                     const prev_flag = self.list.items[idx].suppressed;
-                    if (prev_flag == e.prev) return;
+                    if (prev_flag == e.prev) return .dropped;
                     self.touch();
                     self.journal.record(.{ .suppress = .{ .id = e.id, .prev = prev_flag } });
                     self.list.items[idx].suppressed = !e.prev;
                     self.invalidate(idx);
                 },
                 .move => |e| {
-                    if (self.indexOf(e.id) == null) return;
-                    if (self.list.items.len == 0) return;
+                    if (self.indexOf(e.id) == null) return .dropped;
+                    if (self.list.items.len == 0) return .dropped;
                     const from = self.indexOf(e.id).?;
                     const to = @min(e.to, @as(u32, @intCast(self.list.items.len - 1)));
-                    if (from == to) return;
+                    if (from == to) return .dropped;
                     self.touch();
                     // Boundary fixups are computed from the local state, not
                     // taken from the remote entry.
@@ -1104,128 +1215,129 @@ pub fn Timeline(comptime Domain: type) type {
                     self.rawMove(e.id, to);
                 },
                 .name_set => |e| {
-                    if (self.indexOf(e.id) == null) return;
+                    if (self.indexOf(e.id) == null) return .dropped;
                     const old = self.ann.nameOf(e.id);
                     const old_snap: ?[]const u8 = if (old) |o| self.gpa.dupe(u8, o) catch null else null;
-                    self.ann.setName(e.id, e.new) catch return;
+                    self.ann.setName(e.id, e.new) catch return .dropped;
                     const new_snap: ?[]const u8 = if (e.new) |n| self.gpa.dupe(u8, n) catch null else null;
                     self.journal.record(.{ .name_set = .{ .id = e.id, .old = old_snap, .new = new_snap } });
                     self.annTouch();
                 },
                 .tag_add => |e| {
-                    if (self.indexOf(e.id) == null) return;
-                    const added = self.ann.addTag(e.id, e.tag) catch return;
+                    if (self.indexOf(e.id) == null) return .dropped;
+                    const added = self.ann.addTag(e.id, e.tag) catch return .dropped;
                     if (added) {
-                        const tag_snap = self.gpa.dupe(u8, e.tag) catch return;
+                        const tag_snap = self.gpa.dupe(u8, e.tag) catch return .dropped;
                         self.journal.record(.{ .tag_add = .{ .id = e.id, .tag = tag_snap } });
                     }
                     self.annTouch();
                 },
                 .tag_remove => |e| {
-                    if (!self.ann.hasTag(e.id, e.tag)) return;
+                    if (!self.ann.hasTag(e.id, e.tag)) return .dropped;
                     _ = self.ann.removeTag(e.id, e.tag);
-                    const tag_snap = self.gpa.dupe(u8, e.tag) catch return;
+                    const tag_snap = self.gpa.dupe(u8, e.tag) catch return .dropped;
                     self.journal.record(.{ .tag_remove = .{ .id = e.id, .tag = tag_snap } });
                     self.annTouch();
                 },
                 .chapter_add => |e| {
-                    if (self.ann.chapterById(e.chapter.id) != null) return;
-                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch return;
+                    if (self.ann.chapterById(e.chapter.id) != null) return .dropped;
+                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch return .dropped;
                     self.journal.record(.{ .chapter_add = .{ .chapter = .{
                         .id = e.chapter.id,
-                        .name = self.gpa.dupe(u8, e.chapter.name) catch return,
+                        .name = self.gpa.dupe(u8, e.chapter.name) catch return .dropped,
                         .mark = e.chapter.mark,
                     } } });
                     self.annTouch();
                 },
                 .chapter_remove => |e| {
-                    if (self.ann.chapterById(e.chapter.id) == null) return;
+                    if (self.ann.chapterById(e.chapter.id) == null) return .dropped;
                     self.ann.removeChapter(e.chapter.id);
                     self.journal.record(.{ .chapter_remove = .{ .chapter = .{
                         .id = e.chapter.id,
-                        .name = self.gpa.dupe(u8, e.chapter.name) catch return,
+                        .name = self.gpa.dupe(u8, e.chapter.name) catch return .dropped,
                         .mark = e.chapter.mark,
                     } } });
                     self.annTouch();
                 },
                 .chapter_rename => |e| {
-                    const c = self.ann.chapterById(e.id) orelse return;
-                    const old_snap = self.gpa.dupe(u8, c.name) catch return;
-                    self.ann.renameChapter(e.id, e.new) catch return;
-                    const new_snap = self.gpa.dupe(u8, e.new) catch return;
+                    const c = self.ann.chapterById(e.id) orelse return .dropped;
+                    const old_snap = self.gpa.dupe(u8, c.name) catch return .dropped;
+                    self.ann.renameChapter(e.id, e.new) catch return .dropped;
+                    const new_snap = self.gpa.dupe(u8, e.new) catch return .dropped;
                     self.journal.record(.{ .chapter_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
                     self.annTouch();
                 },
                 .group_add => |e| {
-                    if (self.ann.groupById(e.group.id) != null) return;
+                    if (self.ann.groupById(e.group.id) != null) return .dropped;
                     if (self.indexOf(e.group.first) == null and self.indexOf(e.group.last) == null and e.group.first != e.group.last) {
                         // Span anchors unknown here: keep the folder empty
                         // (dead anchors) rather than dropping the group.
                     }
-                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch return;
+                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch return .dropped;
                     self.journal.record(.{ .group_add = .{ .group = .{
                         .id = e.group.id,
-                        .name = self.gpa.dupe(u8, e.group.name) catch return,
+                        .name = self.gpa.dupe(u8, e.group.name) catch return .dropped,
                         .first = e.group.first,
                         .last = e.group.last,
                     } } });
                     self.annTouch();
                 },
                 .group_remove => |e| {
-                    if (self.ann.groupById(e.group.id) == null) return;
+                    if (self.ann.groupById(e.group.id) == null) return .dropped;
                     self.ann.removeGroup(e.group.id);
                     self.journal.record(.{ .group_remove = .{ .group = .{
                         .id = e.group.id,
-                        .name = self.gpa.dupe(u8, e.group.name) catch return,
+                        .name = self.gpa.dupe(u8, e.group.name) catch return .dropped,
                         .first = e.group.first,
                         .last = e.group.last,
                     } } });
                     self.annTouch();
                 },
                 .group_rename => |e| {
-                    const g = self.ann.groupById(e.id) orelse return;
-                    const old_snap = self.gpa.dupe(u8, g.name) catch return;
-                    self.ann.renameGroup(e.id, e.new) catch return;
-                    const new_snap = self.gpa.dupe(u8, e.new) catch return;
+                    const g = self.ann.groupById(e.id) orelse return .dropped;
+                    const old_snap = self.gpa.dupe(u8, g.name) catch return .dropped;
+                    self.ann.renameGroup(e.id, e.new) catch return .dropped;
+                    const new_snap = self.gpa.dupe(u8, e.new) catch return .dropped;
                     self.journal.record(.{ .group_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
                     self.annTouch();
                 },
                 .param_add => |e| {
-                    if (self.ptab.byId(e.id) != null) return;
-                    self.ptab.add(e.id, e.name, e.value) catch return;
+                    if (self.ptab.byId(e.id) != null) return .dropped;
+                    self.ptab.add(e.id, e.name, e.value) catch return .dropped;
                     self.journal.record(.{ .param_add = .{
                         .id = e.id,
-                        .name = self.gpa.dupe(u8, e.name) catch return,
+                        .name = self.gpa.dupe(u8, e.name) catch return .dropped,
                         .value = e.value,
                     } });
                 },
                 .param_remove => |e| {
-                    if (self.ptab.byId(e.id) == null) return;
+                    if (self.ptab.byId(e.id) == null) return .dropped;
                     self.touch();
                     _ = self.ptab.remove(e.id);
                     self.journal.record(.{ .param_remove = .{
                         .id = e.id,
-                        .name = self.gpa.dupe(u8, e.name) catch return,
+                        .name = self.gpa.dupe(u8, e.name) catch return .dropped,
                         .value = e.value,
                     } });
                     self.invalidateReferencing(e.id);
                 },
                 .param_set => |e| {
-                    const old = self.ptab.valueOf(e.id) orelse return;
-                    if (old == e.new) return;
+                    const old = self.ptab.valueOf(e.id) orelse return .dropped;
+                    if (old == e.new) return .dropped;
                     self.touch();
                     _ = self.ptab.set(e.id, e.new);
                     self.journal.record(.{ .param_set = .{ .id = e.id, .old = old, .new = e.new } });
                     self.invalidateReferencing(e.id);
                 },
                 .param_rename => |e| {
-                    const current = self.ptab.byId(e.id) orelse return;
-                    const old_snap = self.gpa.dupe(u8, current.name) catch return;
+                    const current = self.ptab.byId(e.id) orelse return .dropped;
+                    const old_snap = self.gpa.dupe(u8, current.name) catch return .dropped;
                     _ = self.ptab.rename(e.id, e.new) catch false;
-                    const new_snap = self.gpa.dupe(u8, e.new) catch return;
+                    const new_snap = self.gpa.dupe(u8, e.new) catch return .dropped;
                     self.journal.record(.{ .param_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
                 },
             }
+            return .applied;
         }
 
         /// Bookkeeping after a *remote* feature lands at `at`. Unlike a local
@@ -1524,7 +1636,7 @@ pub fn Timeline(comptime Domain: type) type {
         fn forward(self: *Self, entry: journaling.Journal(Op).Entry) void {
             switch (entry) {
                 .commit => |e| {
-                    self.listInsert(e.at, .{ .id = e.id, .op = e.op }) catch return;
+                    self.listInsert(e.at, .{ .id = e.id, .op = e.op, .order = e.order }) catch return;
                     self.afterInsert(e.at);
                     if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     if (e.meta != null) self.annTouch();
@@ -3404,10 +3516,10 @@ const Outbox = struct {
         self.blobs.deinit(self.gpa);
     }
 
-    fn observe(ctx: ?*anyopaque, entry: *const SyncTl.Entry) void {
+    fn observe(ctx: ?*anyopaque, env: *const SyncTl.Envelope) void {
         const self: *Outbox = @ptrCast(@alignCast(ctx.?));
         var aw: std.Io.Writer.Allocating = .init(self.gpa);
-        syncing.encode(ParamDomain, entry, self.gpa, &aw.writer) catch {
+        syncing.encode(ParamDomain, env, self.gpa, &aw.writer) catch {
             aw.deinit();
             return;
         };
@@ -3421,14 +3533,42 @@ const Outbox = struct {
     fn feed(self: *Outbox, tl: *SyncTl) !void {
         for (self.blobs.items) |blob| {
             var reader = std.Io.Reader.fixed(blob);
-            var entry = try syncing.decode(ParamDomain, self.gpa, &reader);
-            tl.applyRemote(&entry);
-            syncing.deinit(ParamDomain.Op, self.gpa, &entry);
+            var env = try syncing.decode(ParamDomain, self.gpa, &reader);
+            _ = tl.applyRemote(&env);
+            syncing.deinit(ParamDomain.Op, self.gpa, &env);
         }
         for (self.blobs.items) |b| self.gpa.free(b);
         self.blobs.clearRetainingCapacity();
     }
 };
+
+/// Envelopes from a fixed foreign replica. Its clock sits far above any
+/// local Lamport value, so a commit with `after = null` lands first and
+/// `after = X` lands right after X.
+const foreign_origin: u64 = 0xA11CE;
+var foreign_clock: u64 = 1 << 40;
+
+fn remote(entry: SyncTl.Entry) SyncTl.Envelope {
+    foreign_clock += 1;
+    return .{ .origin = foreign_origin, .seq = 0, .lamport = foreign_clock, .entry = entry };
+}
+
+fn remoteCommit(id: ft.FeatureId, op: ParamDomain.Op, at: u32, after: ?ft.FeatureId) SyncTl.Envelope {
+    foreign_clock += 1;
+    return .{
+        .origin = foreign_origin,
+        .seq = 0,
+        .lamport = foreign_clock,
+        .entry = .{ .commit = .{
+            .id = id,
+            .op = op,
+            .at = at,
+            .meta = null,
+            .after = after,
+            .order = .{ .lamport = foreign_clock, .origin = foreign_origin },
+        } },
+    };
+}
 
 fn expectConverged(a: *SyncTl, b: *SyncTl) !void {
     try std.testing.expectEqual(a.len(), b.len());
@@ -3465,13 +3605,13 @@ test "sync: wire codec round-trips a remove entry with annotations" {
 
     // Decode it back and check the payload survived the wire.
     var reader = std.Io.Reader.fixed(out.blobs.items[0]);
-    var entry = try syncing.decode(ParamDomain, gpa, &reader);
-    defer syncing.deinit(ParamDomain.Op, gpa, &entry);
-    try std.testing.expectEqual(a, entry.remove.id);
-    try std.testing.expectEqualStrings("gone", entry.remove.name.?);
-    try std.testing.expectEqual(@as(usize, 1), entry.remove.tags.len);
-    try std.testing.expectEqualStrings("core", entry.remove.tags[0]);
-    try std.testing.expectEqual(@as(usize, 1), entry.remove.chapter_fixes.len);
+    var env = try syncing.decode(ParamDomain, gpa, &reader);
+    defer syncing.deinit(ParamDomain.Op, gpa, &env);
+    try std.testing.expectEqual(a, env.entry.remove.id);
+    try std.testing.expectEqualStrings("gone", env.entry.remove.name.?);
+    try std.testing.expectEqual(@as(usize, 1), env.entry.remove.tags.len);
+    try std.testing.expectEqualStrings("core", env.entry.remove.tags[0]);
+    try std.testing.expectEqual(@as(usize, 1), env.entry.remove.chapter_fixes.len);
 }
 
 test "sync: replicas converge when fed each other's entries" {
@@ -3548,9 +3688,9 @@ test "sync: remote entries referencing unknown ids are dropped" {
     _ = try tl.commit(.{ .add = 1 });
 
     const bogus: ft.FeatureId = 0xDEADBEEF;
-    tl.applyRemote(&.{ .edit = .{ .id = bogus, .old_op = .{ .add = 0 }, .new_op = .{ .add = 9 } } });
+    try std.testing.expectEqual(SyncTl.ApplyResult.dropped, tl.applyRemote(&remote(.{ .edit = .{ .id = bogus, .old_op = .{ .add = 0 }, .new_op = .{ .add = 9 } } })));
     try std.testing.expectEqual(@as(u32, 1), tl.len());
-    tl.applyRemote(&.{ .suppress = .{ .id = bogus, .prev = false } });
+    try std.testing.expectEqual(SyncTl.ApplyResult.dropped, tl.applyRemote(&remote(.{ .suppress = .{ .id = bogus, .prev = false } })));
     var it2 = tl.features();
     try std.testing.expectEqual(false, it2.next().?.suppressed);
 }
@@ -3559,9 +3699,9 @@ test "sync: remote edits undo locally as normal units" {
     const gpa = std.testing.allocator;
     var tl = try SyncTl.init(gpa, .{}, .{});
     defer tl.deinit();
-    _ = try tl.commit(.{ .add = 1 });
+    const first = try tl.commit(.{ .add = 1 });
 
-    tl.applyRemote(&.{ .commit = .{ .id = 4242, .op = .{ .add = 10 }, .at = 1, .meta = null } });
+    try std.testing.expectEqual(SyncTl.ApplyResult.applied, tl.applyRemote(&remoteCommit(4242, .{ .add = 10 }, 1, first)));
     try std.testing.expectEqual(@as(i64, 11), tl.state().value);
     try std.testing.expect(tl.undo()); // remote commit undoes like a local one
     try std.testing.expectEqual(@as(i64, 1), tl.state().value);
@@ -3586,7 +3726,7 @@ test "ids: local allocation skips ids already present and never re-issues a fore
 
     // Park the local counter just below a foreign id, then integrate it.
     tl.next_id = 999;
-    tl.applyRemote(&.{ .commit = .{ .id = 1000, .op = .{ .add = 1 }, .at = 0, .meta = null } });
+    _ = tl.applyRemote(&remoteCommit(1000, .{ .add = 1 }, 0, null));
     try std.testing.expectEqual(@as(u64, 999), tl.next_id); // foreign ids do not move the counter
 
     const x = try tl.commit(.{ .add = 2 });
@@ -3652,7 +3792,7 @@ test "sync: a remote commit landing during a background job makes the job stale"
     var job = try tl.beginRebuild();
     defer job.deinit();
 
-    tl.applyRemote(&.{ .commit = .{ .id = 4242, .op = .{ .add = 100 }, .at = 0, .meta = null } });
+    _ = tl.applyRemote(&remoteCommit(4242, .{ .add = 100 }, 0, null));
     job.run();
     try std.testing.expect(!tl.integrate(&job)); // the plan changed under the job
     try std.testing.expect(tl.dirty());
@@ -3673,7 +3813,7 @@ test "sync: a remote remove landing during a background job is rejected, not a c
     var job = try tl.beginRebuild(); // plan: 2 features
     defer job.deinit();
 
-    tl.applyRemote(&.{ .remove = .{ .id = b, .op = .{ .add = 2 }, .at = 1, .suppressed = false, .marker_pre = 2 } });
+    _ = tl.applyRemote(&remote(.{ .remove = .{ .id = b, .op = .{ .add = 2 }, .at = 1, .suppressed = false, .marker_pre = 2 } }));
     try std.testing.expectEqual(@as(u32, 1), tl.len());
     job.run();
     try std.testing.expect(!tl.integrate(&job)); // used to index past the end of the list
@@ -3690,7 +3830,7 @@ test "integrate: the feature-list guard rejects a mismatched job even if the gen
     var job = try tl.beginRebuild();
     defer job.deinit();
 
-    tl.applyRemote(&.{ .commit = .{ .id = 4242, .op = .{ .add = 100 }, .at = 0, .meta = null } });
+    _ = tl.applyRemote(&remoteCommit(4242, .{ .add = 100 }, 0, null));
     tl.gen = job.generation; // simulate a mutation path that forgot to bump the generation
     job.run();
     try std.testing.expect(!tl.integrate(&job));
@@ -3704,25 +3844,25 @@ test "sync: a remote insert moves the local marker only when it lands at or befo
     defer tl.deinit();
     _ = try tl.commit(.{ .add = 1 });
     _ = try tl.commit(.{ .add = 2 });
-    _ = try tl.commit(.{ .add = 3 });
+    const third = try tl.commit(.{ .add = 3 });
 
     // Scrubbed back to the empty document: an insert in the grey future
     // must not yank the slider.
     tl.setMarker(0);
-    tl.applyRemote(&.{ .commit = .{ .id = 7001, .op = .{ .add = 10 }, .at = 3, .meta = null } });
+    _ = tl.applyRemote(&remoteCommit(7001, .{ .add = 10 }, 3, third));
     try std.testing.expectEqual(@as(u32, 0), tl.marker());
     try std.testing.expectEqual(@as(i64, 0), tl.state().value);
 
     // Looking at [1]: an insert before the marker keeps those features in
     // view, so the marker shifts by one and the new feature is visible.
     tl.setMarker(1);
-    tl.applyRemote(&.{ .commit = .{ .id = 7002, .op = .{ .add = 100 }, .at = 0, .meta = null } });
+    _ = tl.applyRemote(&remoteCommit(7002, .{ .add = 100 }, 0, null));
     try std.testing.expectEqual(@as(u32, 2), tl.marker());
     try std.testing.expectEqual(@as(i64, 101), tl.state().value);
 
     // At the tip: the tip follows.
     tl.setMarker(tl.len());
-    tl.applyRemote(&.{ .commit = .{ .id = 7003, .op = .{ .add = 1000 }, .at = 5, .meta = null } });
+    _ = tl.applyRemote(&remoteCommit(7003, .{ .add = 1000 }, 5, 7001));
     try std.testing.expectEqual(tl.len(), tl.marker());
     try std.testing.expectEqual(@as(i64, 1116), tl.state().value);
 }
@@ -3825,14 +3965,14 @@ test "sync: wire codec round-trips a move entry with group fixes" {
     try std.testing.expectEqual(@as(usize, 1), out.blobs.items.len);
 
     var reader = std.Io.Reader.fixed(out.blobs.items[0]);
-    var entry = try syncing.decode(ParamDomain, gpa, &reader);
-    defer syncing.deinit(ParamDomain.Op, gpa, &entry);
-    try std.testing.expectEqual(a, entry.move.id);
-    try std.testing.expectEqual(@as(usize, 1), entry.move.group_fixes.len);
-    try std.testing.expectEqual(g, entry.move.group_fixes[0].group_id);
-    try std.testing.expectEqual(a, entry.move.group_fixes[0].old_first);
-    try std.testing.expectEqual(b, entry.move.group_fixes[0].new_first);
-    try std.testing.expectEqual(c, entry.move.group_fixes[0].new_last);
+    var env = try syncing.decode(ParamDomain, gpa, &reader);
+    defer syncing.deinit(ParamDomain.Op, gpa, &env);
+    try std.testing.expectEqual(a, env.entry.move.id);
+    try std.testing.expectEqual(@as(usize, 1), env.entry.move.group_fixes.len);
+    try std.testing.expectEqual(g, env.entry.move.group_fixes[0].group_id);
+    try std.testing.expectEqual(a, env.entry.move.group_fixes[0].old_first);
+    try std.testing.expectEqual(b, env.entry.move.group_fixes[0].new_first);
+    try std.testing.expectEqual(c, env.entry.move.group_fixes[0].new_last);
 }
 
 test "sync: entries from another wire version are rejected" {
@@ -4142,7 +4282,7 @@ test "index: id lookups stay exact across inserts, removes, moves, undo/redo and
     try checkIndex(&tl);
     try tl.removeGroupContents(g);
     try checkIndex(&tl);
-    tl.applyRemote(&.{ .commit = .{ .id = 7777, .op = .{ .add = 1 }, .at = 3, .meta = null } });
+    _ = tl.applyRemote(&remoteCommit(7777, .{ .add = 1 }, 3, idAtSync(&tl, 2)));
     try checkIndex(&tl);
     try std.testing.expectEqual(@as(u32, 3), tl.indexOf(7777).?);
 
@@ -4190,4 +4330,175 @@ test "forEachDoc visits the seed, the live document, and every checkpoint" {
     try std.testing.expectEqual(@as(i64, 1003), tl.state().value); // restored from the shifted snapshot
     try tl.edit(idAtIdx(&tl, 0), .{ .add = 5 }); // full replay from the shifted seed
     try std.testing.expectEqual(@as(i64, 1007), tl.state().value);
+}
+
+fn digestsAgree(replicas: []const *SyncTl) bool {
+    const first = replicas[0].structureDigest();
+    for (replicas[1..]) |r| {
+        if (r.structureDigest() != first) return false;
+    }
+    return true;
+}
+
+test "sync: concurrent commits after the same predecessor converge in the same order, either delivery order" {
+    const gpa = std.testing.allocator;
+    var round: u8 = 0;
+    while (round < 2) : (round += 1) {
+        var alice = try SyncTl.init(gpa, .{}, .{});
+        defer alice.deinit();
+        var bob = try SyncTl.init(gpa, .{}, .{});
+        defer bob.deinit();
+        var out_a = Outbox{ .gpa = gpa };
+        defer out_a.deinit();
+        var out_b = Outbox{ .gpa = gpa };
+        defer out_b.deinit();
+        alice.setRecordObserver(.{ .ctx = &out_a, .func = Outbox.observe });
+        bob.setRecordObserver(.{ .ctx = &out_b, .func = Outbox.observe });
+
+        // Shared predecessor X.
+        _ = try alice.commit(.{ .add = 1 });
+        try out_a.feed(&bob);
+
+        // Both commit after X without syncing (different ops, so the order
+        // is observable through `mul`).
+        _ = try alice.commit(.{ .add = 10 });
+        _ = try bob.commit(.{ .add = 20 });
+
+        if (round == 0) {
+            try out_a.feed(&bob);
+            try out_b.feed(&alice);
+        } else {
+            try out_b.feed(&alice);
+            try out_a.feed(&bob);
+        }
+        try std.testing.expectEqual(@as(u32, 3), alice.len());
+        try std.testing.expect(digestsAgree(&.{ &alice, &bob }));
+        try expectConverged(&alice, &bob);
+    }
+}
+
+test "sync: three replicas, three concurrent commits, every delivery order converges" {
+    const gpa = std.testing.allocator;
+    const perms = [_][3][2]u8{
+        .{ .{ 1, 2 }, .{ 2, 0 }, .{ 0, 1 } },
+        .{ .{ 2, 1 }, .{ 0, 2 }, .{ 1, 0 } },
+        .{ .{ 1, 2 }, .{ 0, 2 }, .{ 0, 1 } },
+    };
+    for (perms) |perm| {
+        var replicas: [3]SyncTl = undefined;
+        var outboxes: [3]Outbox = undefined;
+        for (&replicas, 0..) |*r, i| {
+            r.* = try SyncTl.init(gpa, .{}, .{});
+            outboxes[i] = .{ .gpa = gpa };
+            r.setRecordObserver(.{ .ctx = &outboxes[i], .func = Outbox.observe });
+        }
+        defer for (&replicas, 0..) |*r, i| {
+            r.deinit();
+            outboxes[i].deinit();
+        };
+
+        // Replica 0 seeds a shared predecessor; everyone receives it.
+        _ = try replicas[0].commit(.{ .add = 1 });
+        var it = outboxes[0].blobs.items;
+        for (&replicas, 0..) |*r, i| {
+            if (i == 0) continue;
+            for (it) |blob| {
+                var reader = std.Io.Reader.fixed(blob);
+                var env = try syncing.decode(ParamDomain, gpa, &reader);
+                _ = r.applyRemote(&env);
+                syncing.deinit(ParamDomain.Op, gpa, &env);
+            }
+        }
+        for (outboxes[0].blobs.items) |b| gpa.free(b);
+        outboxes[0].blobs.clearRetainingCapacity();
+        it = &.{};
+
+        // Three concurrent commits after it.
+        _ = try replicas[0].commit(.{ .add = 10 });
+        _ = try replicas[1].commit(.{ .add = 20 });
+        _ = try replicas[2].commit(.{ .add = 100 });
+
+        // Deliver the two foreign envelopes to each replica in its own order.
+        for (perm, 0..) |order, i| {
+            for (order) |from| {
+                for (outboxes[from].blobs.items) |blob| {
+                    var reader = std.Io.Reader.fixed(blob);
+                    var env = try syncing.decode(ParamDomain, gpa, &reader);
+                    _ = replicas[i].applyRemote(&env);
+                    syncing.deinit(ParamDomain.Op, gpa, &env);
+                }
+            }
+        }
+        try std.testing.expect(digestsAgree(&.{ &replicas[0], &replicas[1], &replicas[2] }));
+        try expectConverged(&replicas[0], &replicas[1]);
+        try expectConverged(&replicas[1], &replicas[2]);
+    }
+}
+
+test "sync: sequence numbers detect duplicates, gaps, and own echoes" {
+    const gpa = std.testing.allocator;
+    var alice = try SyncTl.init(gpa, .{}, .{});
+    defer alice.deinit();
+    var bob = try SyncTl.init(gpa, .{}, .{});
+    defer bob.deinit();
+    var out_a = Outbox{ .gpa = gpa };
+    defer out_a.deinit();
+    alice.setRecordObserver(.{ .ctx = &out_a, .func = Outbox.observe });
+
+    _ = try alice.commit(.{ .add = 1 });
+    _ = try alice.commit(.{ .add = 2 });
+    _ = try alice.commit(.{ .add = 3 });
+    try std.testing.expectEqual(@as(usize, 3), out_a.blobs.items.len);
+
+    var envs: [3]SyncTl.Envelope = undefined;
+    for (out_a.blobs.items, 0..) |blob, i| {
+        var reader = std.Io.Reader.fixed(blob);
+        envs[i] = try syncing.decode(ParamDomain, gpa, &reader);
+    }
+    defer for (&envs) |*e| syncing.deinit(ParamDomain.Op, gpa, e);
+    try std.testing.expectEqual(alice.replicaId(), envs[0].origin);
+    try std.testing.expectEqual(@as(u64, 1), envs[0].seq);
+    try std.testing.expectEqual(@as(u64, 3), envs[2].seq);
+
+    try std.testing.expectEqual(@as(u64, 1), bob.expectedSeq(alice.replicaId()));
+    try std.testing.expectEqual(SyncTl.ApplyResult.applied, bob.applyRemote(&envs[0]));
+    try std.testing.expectEqual(SyncTl.ApplyResult.duplicate, bob.applyRemote(&envs[0]));
+    try std.testing.expectEqual(SyncTl.ApplyResult.gap, bob.applyRemote(&envs[2])); // 3 before 2
+    try std.testing.expectEqual(@as(u64, 2), bob.expectedSeq(alice.replicaId()));
+    try std.testing.expectEqual(@as(u32, 1), bob.len()); // the gap was not applied
+    try std.testing.expectEqual(SyncTl.ApplyResult.applied, bob.applyRemote(&envs[1]));
+    try std.testing.expectEqual(SyncTl.ApplyResult.applied, bob.applyRemote(&envs[2]));
+    try std.testing.expectEqual(@as(u32, 3), bob.len());
+    try std.testing.expectEqual(@as(i64, 6), bob.state().value);
+
+    // Echoes of one's own envelopes are ignored.
+    try std.testing.expectEqual(SyncTl.ApplyResult.own, alice.applyRemote(&envs[0]));
+    try std.testing.expectEqual(@as(u32, 3), alice.len());
+
+    // After a resync by other means, acknowledge what is already reflected.
+    try bob.acknowledge(alice.replicaId(), 10);
+    try std.testing.expectEqual(@as(u64, 11), bob.expectedSeq(alice.replicaId()));
+}
+
+test "sync: envelope round-trips origin, sequence, clock, predecessor and order key" {
+    const gpa = std.testing.allocator;
+    const env: SyncTl.Envelope = .{
+        .origin = 77,
+        .seq = 9,
+        .lamport = 123,
+        .entry = .{ .commit = .{ .id = 5, .op = .{ .add = 2 }, .at = 1, .meta = .{ .author = 3, .ts = 4 }, .after = 4, .order = .{ .lamport = 123, .origin = 77 } } },
+    };
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try syncing.encode(ParamDomain, &env, gpa, &aw.writer);
+    var reader = std.Io.Reader.fixed(aw.written());
+    var got = try syncing.decode(ParamDomain, gpa, &reader);
+    defer syncing.deinit(ParamDomain.Op, gpa, &got);
+    try std.testing.expectEqual(@as(u64, 77), got.origin);
+    try std.testing.expectEqual(@as(u64, 9), got.seq);
+    try std.testing.expectEqual(@as(u64, 123), got.lamport);
+    try std.testing.expectEqual(@as(?ft.FeatureId, 4), got.entry.commit.after);
+    try std.testing.expectEqual(@as(u64, 123), got.entry.commit.order.lamport);
+    try std.testing.expectEqual(@as(u64, 77), got.entry.commit.order.origin);
+    try std.testing.expectEqual(ft.Meta{ .author = 3, .ts = 4 }, got.entry.commit.meta.?);
 }

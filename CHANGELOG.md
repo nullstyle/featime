@@ -5,7 +5,22 @@ All notable changes to featuretree-zig. The format follows
 
 ## Unreleased
 
+### Changed (breaking)
+- Sync envelopes. The record observer yields `Timeline.Envelope`
+  `{ origin, seq, lamport, entry }` instead of a bare entry; `applyRemote`
+  takes an envelope and returns `ApplyResult` (`.applied`, `.dropped`,
+  `.duplicate`, `.gap`, `.own`); `sync.encode` / `decode` / `deinit` work
+  on envelopes. Wire version 4. Containers are FTZ5 (order keys and the
+  per-origin sequence table); FTZ1–FTZ4 still load.
+
 ### Added
+- Deterministic order for concurrent commits: each commit carries its
+  predecessor and an order key (Lamport clock + origin). Remote commits are
+  placed after their predecessor and past any sibling with a greater key,
+  so every replica ends up with the same order whatever the delivery order.
+- Per-replica sequence numbers with duplicate and gap detection;
+  `expectedSeq(origin)`, `acknowledge(origin, seq)`, `replicaId()`;
+  `structureDigest()` to compare replicas after a sync round.
 - `Timeline.forEachDoc(ctx, visit)`: visit the seed, the live document and
   every checkpoint for in-place transformations (arena rolls, compaction,
   accounting).

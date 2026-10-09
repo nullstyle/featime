@@ -1,5 +1,8 @@
-//! The sync feed: two replicas of one timeline converging by exchanging
-//! journal entries — the library's multiuser stopping point.
+//! The sync feed: replicas of one timeline converging by exchanging
+//! envelopes — the library's multiuser stopping point. Shows the record
+//! observer, the wire codec, `applyRemote` results, concurrent commits
+//! landing in the same order everywhere, duplicate and gap detection, and
+//! undo of a remote unit.
 //!
 //! Run: zig build sync
 
@@ -50,14 +53,16 @@ const Ledger = struct {
 
 const Tl = ft.Timeline(Ledger);
 
+/// A minimal wire: the observer encodes every envelope; `deliver` decodes
+/// them into another replica and reports what `applyRemote` said.
 const Outbox = struct {
     gpa: std.mem.Allocator,
     blobs: std.ArrayList([]u8) = .empty,
 
-    fn observe(ctx: ?*anyopaque, entry: *const Tl.Entry) void {
+    fn observe(ctx: ?*anyopaque, env: *const Tl.Envelope) void {
         const self: *Outbox = @ptrCast(@alignCast(ctx.?));
         var aw: Io.Writer.Allocating = .init(self.gpa);
-        ft.sync.encode(Ledger, entry, self.gpa, &aw.writer) catch {
+        ft.sync.encode(Ledger, env, self.gpa, &aw.writer) catch {
             aw.deinit();
             return;
         };
@@ -65,24 +70,34 @@ const Outbox = struct {
         self.blobs.append(self.gpa, owned) catch self.gpa.free(owned);
     }
 
-    fn deliver(self: *Outbox, to: *Tl) !void {
+    const Tally = struct { applied: u32 = 0, duplicate: u32 = 0, gap: u32 = 0, other: u32 = 0 };
+
+    /// Deliver every pending envelope (then forget it unless `keep`).
+    fn deliver(self: *Outbox, to: *Tl, keep: bool) !Tally {
+        var tally: Tally = .{};
         for (self.blobs.items) |blob| {
             var reader = Io.Reader.fixed(blob);
-            var entry = try ft.sync.decode(Ledger, self.gpa, &reader);
-            to.applyRemote(&entry);
-            ft.sync.deinit(Ledger.Op, self.gpa, &entry);
+            var env = try ft.sync.decode(Ledger, self.gpa, &reader);
+            defer ft.sync.deinit(Ledger.Op, self.gpa, &env);
+            switch (to.applyRemote(&env)) {
+                .applied => tally.applied += 1,
+                .duplicate => tally.duplicate += 1,
+                .gap => tally.gap += 1,
+                else => tally.other += 1,
+            }
         }
-        for (self.blobs.items) |b| self.gpa.free(b);
-        self.blobs.clearRetainingCapacity();
+        if (!keep) {
+            for (self.blobs.items) |b| self.gpa.free(b);
+            self.blobs.clearRetainingCapacity();
+        }
+        return tally;
     }
 };
 
 fn report(out: *Io.Writer, label: []const u8, a: *Tl, b: *Tl) !void {
-    _ = a.state();
-    _ = b.state();
-    const converged = a.len() == b.len() and a.state().total == b.state().total;
-    try out.print("{s:<34} alice: {d} features, total {d:<6} bob: {d} features, total {d:<6} converged = {}\n", .{
-        label, a.len(), a.state().total, b.len(), b.state().total, converged,
+    const same = a.structureDigest() == b.structureDigest() and a.state().total == b.state().total;
+    try out.print("{s:<40} alice {d} features total {d:<5} bob {d} features total {d:<5} same order+state = {}\n", .{
+        label, a.len(), a.state().total, b.len(), b.state().total, same,
     });
 }
 
@@ -92,45 +107,55 @@ fn demo(out: *Io.Writer, arena: std.mem.Allocator) !void {
     var out_a = Outbox{ .gpa = arena };
     alice.setRecordObserver(.{ .ctx = &out_a, .func = Outbox.observe });
 
-    // Bob is a replica of Alice's document (same timeline identity).
+    // Bob is a replica of Alice's document (same timeline identity, his own
+    // replica id).
     var saved: Io.Writer.Allocating = .init(arena);
     try ft.persistence.save(Ledger, &alice, arena, &saved.writer);
     var reader = Io.Reader.fixed(saved.written());
     var bob = try ft.persistence.load(Ledger, arena, .{}, &reader);
     defer bob.deinit();
-    try out.print("replicas share timeline id: {}\n", .{alice.timelineId() == bob.timelineId()});
     var out_b = Outbox{ .gpa = arena };
     bob.setRecordObserver(.{ .ctx = &out_b, .func = Outbox.observe });
+    try out.print("replicas share the timeline id: {}, have different replica ids: {}\n", .{
+        alice.timelineId() == bob.timelineId(), alice.replicaId() != bob.replicaId(),
+    });
 
-    // Alice works; her entries ship to Bob through the wire codec.
+    // 1. Alice works; her envelopes ship to Bob.
     _ = try alice.commit(.{ .add = 10 });
     _ = try alice.commit(.{ .multiply = 3 });
     var first_it = alice.features();
-    const first_id = first_it.next().?.id;
-    try alice.setFeatureName(first_id, "base");
-    try out_a.deliver(&bob);
+    try alice.setFeatureName(first_it.next().?.id, "base");
+    _ = try out_a.deliver(&bob, false);
     try report(out, "alice's session delivered to bob", &alice, &bob);
 
-    // Bob works; his entries ship back. Remote integration is journaled
-    // (undo works) but never re-broadcast — no echo loop.
-    _ = try bob.commit(.{ .add = 5 });
-    var bob_it = bob.features();
-    try bob.setFeatureName(bob_it.next().?.id, "bob's edit");
-    try out_b.deliver(&alice);
-    try report(out, "bob's session delivered to alice", &alice, &bob);
+    // 2. Both commit at the same time, before syncing. Each commit carries
+    //    its predecessor and an order key, so both replicas place the two
+    //    new features in the same order whichever envelope arrives first.
+    _ = try alice.commit(.{ .add = 100 });
+    _ = try bob.commit(.{ .add = 200 });
+    _ = try out_b.deliver(&alice, true); // bob's first, on alice
+    _ = try out_a.deliver(&bob, false); // alice's first, on bob
+    try report(out, "concurrent commits exchanged", &alice, &bob);
 
-    // Alice undoes a *remote* unit she received — undo is uniform. Each
-    // remotely applied entry is its own undo unit (wrap feeds in
-    // transactions if you want whole sessions per undo).
+    // 3. Sequence numbers: re-delivering bob's envelope is a duplicate; an
+    //    envelope that skips ahead is a gap and is not applied.
+    const again = try out_b.deliver(&alice, false);
+    _ = try bob.commit(.{ .add = 1 });
+    _ = try bob.commit(.{ .add = 2 });
+    // Drop the first of the two pending envelopes to simulate a lost message.
+    arena.free(out_b.blobs.orderedRemove(0));
+    const skipped = try out_b.deliver(&alice, false);
+    try out.print("re-delivery: {d} duplicate; after a lost message: {d} gap, alice expects seq {d} from bob\n", .{
+        again.duplicate, skipped.gap, alice.expectedSeq(bob.replicaId()),
+    });
+
+    // 4. Undo is uniform: alice undoes the remote unit she received from bob.
     _ = alice.undo();
-    try report(out, "alice undoes one remote unit (the rename)", &alice, &bob);
-
-    // Re-delivery is tolerated (at-most-once is the app's job, not a
-    // requirement): duplicate commits are dropped by id.
-    try out_b.deliver(&alice);
-    try report(out, "bob's entries re-delivered (idempotent)", &alice, &alice);
+    try out.print("alice undoes one remote unit: total {d} (bob still {d}); digests differ = {}\n", .{
+        alice.state().total, bob.state().total, alice.structureDigest() != bob.structureDigest(),
+    });
 }
 
 pub fn main(init: std.process.Init) !void {
-    return common.run(init, "sync: replicas converging on journal entries", demo);
+    return common.run(init, "sync: replicas converging on envelopes", demo);
 }

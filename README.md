@@ -199,43 +199,63 @@ have.
 
 ## Sync
 
-The multiuser stopping point: journal entries as a wire vocabulary. Merge,
-OT, and CRDT semantics belong to the application; the library ships the
-feed and the integration semantics.
+The multiuser stopping point: journal entries as a wire vocabulary. The
+library ships the feed, deterministic placement of concurrent commits, and
+per-replica sequence bookkeeping; merge semantics beyond that (concurrent
+moves and removes, conflict policy) belong to the application.
 
 ```zig
-// Producer side: every local edit, in record order.
+// Producer side: every local edit, in record order, as an envelope
+// { origin: replica id, seq: 1, 2, 3, ..., lamport, entry }.
 tl.setRecordObserver(.{ .ctx = &outbox, .func = Outbox.observe });
 
-// Consumer side: entries cross the wire via the Domain codecs...
-var entry = try ft.sync.decode(MyApp, gpa, &reader);
-tl.applyRemote(&entry);          // journaled locally; observer NOT fired
-ft.sync.deinit(MyApp.Op, gpa, &entry);
+// Consumer side: envelopes cross the wire via the Domain codecs...
+var env = try ft.sync.decode(MyApp, gpa, &reader);
+switch (tl.applyRemote(&env)) {      // journaled locally; observer NOT fired
+    .applied, .dropped, .duplicate, .own => {},
+    .gap => request(env.origin, tl.expectedSeq(env.origin)),
+}
+ft.sync.deinit(MyApp.Op, gpa, &env);
 ```
 
-Every encoded entry starts with `sync.wire_version` (2 as of 0.7.0);
-`decode` rejects other versions with `error.UnsupportedWireVersion` instead
-of misparsing them.
+Every encoded envelope starts with `sync.wire_version` (4) and the app's
+`format_version`; `decode` rejects other wire versions with
+`error.UnsupportedWireVersion` instead of misparsing them.
 
-`applyRemote` preserves identity exactly — feature/chapter/group/param ids
-are random-anchored per timeline (seed the anchor from OS randomness with
-`Config.id_seed` when replicas live in different processes), replicas share
-a `timelineId`, and remote ids never move the local id counter (each
-replica keeps allocating from its own range, so two users committing
-concurrently get distinct ids) — while positions are hints: indices are
-clamped, unknown ids are dropped, duplicate commits are ignored
-(re-delivery is safe). A remote insert at or before your marker shifts it
-by one so the features you were looking at stay in view (a marker at the
-tip follows the tip); a remote insert in the grey future leaves your slider
+**Identity.** Feature/chapter/group/param ids are random-anchored per
+timeline (seed the anchor from OS randomness with `Config.id_seed` when
+replicas live in different processes). Replicas share a `timelineId`; each
+has its own `replicaId` (a loaded file is a new replica). Remote ids never
+move the local id counter, so two users committing concurrently get
+distinct ids.
+
+**Order.** Every commit carries its predecessor and an order key (the
+origin's Lamport clock, origin id as tie-breaker). `applyRemote` places a
+remote commit right after its predecessor and then past every following
+feature whose key is greater — the same rule on every replica — so
+concurrent commits land in the same order everywhere, whatever the
+delivery order. An unknown predecessor (removed, or not received yet)
+falls back to the positional hint. Concurrent *moves* and *removes* are
+not reconciled: compare `structureDigest()` after a sync round and resync
+through a file when replicas disagree.
+
+**Sequencing.** `applyRemote` answers `.applied`, `.dropped` (unknown ids,
+a no-op, or a commit already present), `.duplicate`, `.gap` (not applied:
+fetch from `expectedSeq(origin)` first) or `.own` (an echo of this
+replica's envelope). `seq == 0` skips the check; `acknowledge(origin, seq)`
+resets expectations after a resync by other means. Containers persist the
+per-origin bookkeeping and the order keys.
+
+**Marker and jobs.** A remote insert at or before your marker shifts it by
+one so the features you were looking at stay in view (a marker at the tip
+follows the tip); a remote insert in the grey future leaves your slider
 alone. Remote integrations are journaled like local edits so undo is
 uniform, but never re-broadcast: replicas feeding each other cannot loop.
 Structural remote entries bump the rebuild generation like local edits, so
 a background job that was in flight is rejected at `integrate` instead of
-being installed over a changed plan. Two replicas exchanging every entry in
-a consistent order converge;
-concurrent positional edits are the app's layer
-(`sync.lastWriterWins(local_meta, remote_meta)` is the provided
-tie-breaker when provenance timestamps exist).
+being installed over a changed plan. `sync.lastWriterWins(local_meta,
+remote_meta)` remains the provided tie-breaker for application-level
+conflicts when provenance timestamps exist.
 
 ## Transactions
 
