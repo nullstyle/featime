@@ -1360,6 +1360,21 @@ pub fn Timeline(comptime Domain: type) type {
             };
         }
 
+        /// Visit every document copy the timeline holds — the seed, the live
+        /// document, and each checkpoint — for in-place transformations that
+        /// keep the document's meaning: re-homing arena-backed documents into
+        /// a fresh arena, compacting storage, accounting. Structure,
+        /// statuses and the rebuild generation are untouched, so the visitor
+        /// must not change what a document *represents*. Not valid while a
+        /// background job is in flight (its base is not visited). An error
+        /// from the visitor is returned as is; documents visited before it
+        /// stay transformed.
+        pub fn forEachDoc(self: *Self, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Doc) anyerror!void) anyerror!void {
+            try visit(ctx, &self.seed_doc);
+            try visit(ctx, &self.live_doc);
+            for (self.cps.entries.items) |*e| try visit(ctx, &e.doc);
+        }
+
         /// What `trim` may release. Null fields are left alone.
         pub const TrimBudget = struct {
             /// Keep at most this many checkpoints; the ones nearest the
@@ -4150,4 +4165,29 @@ test "index: id lookups stay exact across inserts, removes, moves, undo/redo and
     defer loaded.deinit();
     try checkIndex(&loaded);
     try std.testing.expectEqual(tl.len(), loaded.len());
+}
+
+fn shiftValue(delta: *const i64, doc: *TestDomain.Doc) anyerror!void {
+    doc.value += delta.*;
+}
+
+test "forEachDoc visits the seed, the live document, and every checkpoint" {
+    const gpa = std.testing.allocator;
+    var tl = try TestTimeline.init(gpa, .{}, .{ .checkpoint_on_scrub = true });
+    defer tl.deinit();
+    _ = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    _ = tl.state();
+    tl.setMarker(1); // snapshots position 2
+    _ = tl.state();
+    try std.testing.expectEqual(@as(u32, 1), tl.stats().checkpoints);
+
+    const delta: i64 = 1000;
+    try tl.forEachDoc(&delta, shiftValue);
+    // Live (position 1), the checkpoint (position 2) and the seed all moved.
+    try std.testing.expectEqual(@as(i64, 1001), tl.state().value);
+    tl.setMarker(2);
+    try std.testing.expectEqual(@as(i64, 1003), tl.state().value); // restored from the shifted snapshot
+    try tl.edit(idAtIdx(&tl, 0), .{ .add = 5 }); // full replay from the shifted seed
+    try std.testing.expectEqual(@as(i64, 1007), tl.state().value);
 }

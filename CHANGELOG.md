@@ -3,6 +3,16 @@
 All notable changes to featuretree-zig. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
+## Unreleased
+
+### Added
+- `Timeline.forEachDoc(ctx, visit)`: visit the seed, the live document and
+  every checkpoint for in-place transformations (arena rolls, compaction,
+  accounting).
+- `integrations/hamt/`: a standalone project with hamt-zig's persistent map
+  as the document — free checkpoints, an explicit arena roll, measured
+  numbers and the finding that replays grow the arena as much as edits do.
+
 ## 0.9.1 — 2026-10-09
 
 ### Changed

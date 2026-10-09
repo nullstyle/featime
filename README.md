@@ -129,6 +129,11 @@ zig build examples              # all of the above
 `zig build run` remains the full terrain-editor demo (including the
 hierarchical globe/region walkthrough from the previous section).
 
+`integrations/hamt/` is a standalone project showing a persistent map
+([hamt-zig](https://github.com/nullstyle/hamt-zig)) as the document: free
+checkpoints, an explicit arena roll through `forEachDoc`, and measured
+numbers. It expects hamt-zig checked out next to this repository.
+
 ## Annotations: names, tags, chapters, groups, provenance
 
 User-authored metadata that never affects document computation (no
@@ -361,6 +366,12 @@ Dropping checkpoints only makes scrubbing slower; dropping journal units
 shrinks undo depth. The configured `max_checkpoints` / `max_journal` are
 unchanged — `trim` is a one-off release, called from your memory-pressure
 handler.
+
+`forEachDoc(ctx, visit)` visits every document copy the timeline holds —
+seed, live, each checkpoint — for in-place transformations that keep the
+document's meaning: re-homing arena-backed documents into a fresh arena,
+compacting storage, accounting. Not while a background job is in flight.
+`integrations/hamt/` uses it to roll a persistent map's arena.
 
 ## Persistence
 

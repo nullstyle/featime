@@ -183,12 +183,14 @@ documented with tests on its edges.
    (defaults to the gpa) reaches `apply` as `ctx.alloc` and is what
    `cloneDoc` / `deinitDoc` receive; the library's bookkeeping stays on
    the gpa, so document memory is accountable on its own.
-3. **Arena-owned documents** — PARKED until benchmarks exist: the timeline
-   would own one arena per document copy (seed, live, checkpoints, job
-   bases); `apply` and `cloneDoc` allocate into it and `deinitDoc`
-   disappears. Biggest simplification for integrators, but a live document
-   that churns grows until it is cloned into a fresh arena, so it needs a
-   compaction policy (clone-on-threshold or clone at every checkpoint).
+3. **Arena-owned documents** — PARKED, now with data: `integrations/hamt/`
+   is option 3 done by the application with a persistent map (hamt-zig):
+   copies are free and `deinitDoc` is a no-op; the only library hook it
+   needed is `forEachDoc` (delivered). Measured: replays grow the arena as
+   much as edits do (20k entities: 14 MiB after the commits, 47 MiB after
+   two scrubs and an edit, 2.7 MiB after a roll), so the roll policy is the
+   whole question — and it belongs where document size and churn are known,
+   in the application. Building the arena into the library stays parked.
 
 ## Standing non-goals
 
