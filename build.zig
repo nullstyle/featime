@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
         "background_rebuild",
         "annotations",
         "sync",
+        "history",
     };
     for (example_names) |name| {
         const example = b.addExecutable(.{

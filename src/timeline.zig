@@ -31,6 +31,10 @@ pub fn Timeline(comptime Domain: type) type {
         /// Journal entry shape, re-exported for record observers and
         /// `applyRemote`.
         pub const Entry = journaling.Journal(Op).Entry;
+        /// One undo/redo unit as reported by `history()`.
+        pub const HistoryUnit = journaling.Journal(Op).Unit;
+        pub const HistoryKind = journaling.Journal(Op).UnitKind;
+        pub const HistoryIter = journaling.Journal(Op).UnitIter;
 
         gpa: std.mem.Allocator,
         config: ft.Config,
@@ -134,7 +138,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .live_doc = live,
                 .next_id = prng.random().int(ft.FeatureId) | 1,
                 .cps = checkpoint.Checkpoints(Domain).init(gpa, config.max_checkpoints),
-                .journal = journaling.Journal(Op).init(gpa, config.max_journal),
+                .journal = journaling.Journal(Op).init(gpa, config.max_journal, config.now),
                 .ann = annotations.Annotations.init(gpa),
                 .ptab = params.ParamTable.init(gpa),
                 .timeline_id = prng.random().int(u64) | 1,
@@ -1230,8 +1234,103 @@ pub fn Timeline(comptime Domain: type) type {
             self.journal.beginTxn();
         }
 
+        /// `beginTransaction` with a label for history panels ("Smooth
+        /// terrain"). Nested begins flatten; only the outermost label is
+        /// kept. An empty transaction records nothing and drops the label.
+        pub fn beginLabeledTransaction(self: *Self, label: []const u8) error{OutOfMemory}!void {
+            try self.journal.beginTxnLabeled(label);
+        }
+
         pub fn endTransaction(self: *Self) void {
             self.journal.endTxn();
+        }
+
+        // ------------------------------------------------------------------
+        // History introspection
+        // ------------------------------------------------------------------
+
+        /// Iterate the journal's undo/redo units oldest-first: what each
+        /// did (`kind`), how many entries it holds, its label and timestamp,
+        /// and whether it is currently undone. Units are borrowed views;
+        /// iterate before the next edit. Marker moves are not journaled and
+        /// never appear here.
+        pub fn history(self: *const Self) HistoryIter {
+            return self.journal.units();
+        }
+
+        /// Units `undo` can unwind right now.
+        pub fn undoDepth(self: *const Self) u32 {
+            return self.journal.undoDepth();
+        }
+
+        /// Units `redo` can replay right now.
+        pub fn redoDepth(self: *const Self) u32 {
+            return self.journal.redoDepth();
+        }
+
+        // ------------------------------------------------------------------
+        // Memory pressure
+        // ------------------------------------------------------------------
+
+        /// Counts of everything the timeline keeps alive. Documents are
+        /// opaque to the library, so memory is reported as counts of document
+        /// copies (seed + live + checkpoints) and journal entries.
+        pub const Stats = struct {
+            features: u32,
+            marker: u32,
+            dirty: bool,
+            /// Document copies held by the checkpoint cache (plus seed and live).
+            checkpoints: u32,
+            journal_entries: u32,
+            undo_units: u32,
+            redo_units: u32,
+            params: u32,
+            chapters: u32,
+            groups: u32,
+        };
+
+        pub fn stats(self: *const Self) Stats {
+            return .{
+                .features = self.len(),
+                .marker = self.marker_pos,
+                .dirty = self.dirty(),
+                .checkpoints = self.cps.count(),
+                .journal_entries = self.journal.entryCount(),
+                .undo_units = self.journal.undoDepth(),
+                .redo_units = self.journal.redoDepth(),
+                .params = @intCast(self.ptab.items().len),
+                .chapters = @intCast(self.ann.chapterList().len),
+                .groups = @intCast(self.ann.groupList().len),
+            };
+        }
+
+        /// What `trim` may release. Null fields are left alone.
+        pub const TrimBudget = struct {
+            /// Keep at most this many checkpoints; the ones nearest the
+            /// marker survive. The configured `max_checkpoints` is unchanged.
+            checkpoints: ?u8 = null,
+            /// Keep at most this many undo units; the oldest go first.
+            undo_units: ?u32 = null,
+            /// Drop everything redo could replay.
+            drop_redo: bool = false,
+        };
+
+        pub const Trimmed = struct {
+            checkpoints: u32 = 0,
+            journal_entries: u32 = 0,
+        };
+
+        /// Release memory under pressure without changing the document or
+        /// the structure: drop checkpoints (an optimization — scrubbing just
+        /// gets slower) and old or redoable journal units (undo depth
+        /// shrinks). Never touches the rebuild generation, so in-flight
+        /// background jobs stay valid.
+        pub fn trim(self: *Self, budget: TrimBudget) Trimmed {
+            var out: Trimmed = .{};
+            if (budget.checkpoints) |keep| out.checkpoints = self.cps.trimTo(keep, self.marker_pos);
+            if (budget.drop_redo) out.journal_entries += self.journal.dropRedo();
+            if (budget.undo_units) |keep| out.journal_entries += self.journal.trimUndo(keep);
+            return out;
         }
 
         fn reverse(self: *Self, entry: journaling.Journal(Op).Entry) void {
@@ -3626,4 +3725,98 @@ test "sync: entries from another wire version are rejected" {
     const bytes = [_]u8{ syncing.wire_version + 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     var reader = std.Io.Reader.fixed(&bytes);
     try std.testing.expectError(error.UnsupportedWireVersion, syncing.decode(ParamDomain, gpa, &reader));
+}
+
+var history_clock: u64 = 100;
+fn historyNow() u64 {
+    history_clock += 1;
+    return history_clock;
+}
+
+test "history: units report kind, size, label, timestamp, and undone state" {
+    const gpa = std.testing.allocator;
+    var tl = try TestTimeline.init(gpa, .{}, .{ .now = historyNow });
+    defer tl.deinit();
+
+    const a = try tl.commit(.{ .add = 1 });
+    try tl.beginLabeledTransaction("tune");
+    try tl.edit(a, .{ .add = 5 });
+    try tl.setFeatureName(a, "base");
+    tl.endTransaction();
+    try tl.setSuppressed(a, true);
+    try std.testing.expectEqual(@as(u32, 3), tl.undoDepth());
+    try std.testing.expectEqual(@as(u32, 0), tl.redoDepth());
+
+    var it = tl.history();
+    const unit_a = it.next().?;
+    try std.testing.expectEqual(TestTimeline.HistoryKind.commit, unit_a.kind);
+    try std.testing.expectEqual(@as(u32, 1), unit_a.entries);
+    try std.testing.expect(unit_a.label == null);
+    try std.testing.expect(unit_a.ts > 100);
+    try std.testing.expect(!unit_a.undone);
+    const unit_b = it.next().?;
+    try std.testing.expectEqual(TestTimeline.HistoryKind.batch, unit_b.kind);
+    try std.testing.expectEqual(@as(u32, 2), unit_b.entries);
+    try std.testing.expectEqualStrings("tune", unit_b.label.?);
+    try std.testing.expect(unit_b.ts > unit_a.ts);
+    const unit_c = it.next().?;
+    try std.testing.expectEqual(TestTimeline.HistoryKind.suppress, unit_c.kind);
+    try std.testing.expect(it.next() == null);
+
+    // Undo marks units as undone without dropping them.
+    try std.testing.expect(tl.undo());
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(u32, 1), tl.undoDepth());
+    try std.testing.expectEqual(@as(u32, 2), tl.redoDepth());
+    var it2 = tl.history();
+    try std.testing.expect(!it2.next().?.undone);
+    try std.testing.expect(it2.next().?.undone);
+    try std.testing.expect(it2.next().?.undone);
+
+    // An empty labeled transaction leaves no trace and leaks nothing.
+    try tl.beginLabeledTransaction("nothing");
+    tl.endTransaction();
+    try std.testing.expectEqual(@as(u32, 1), tl.undoDepth());
+}
+
+test "trim: keeps checkpoints nearest the marker and the newest undo units" {
+    const gpa = std.testing.allocator;
+    var tl = try TestTimeline.init(gpa, .{}, .{ .checkpoint_interval = 0, .max_checkpoints = 8, .checkpoint_on_scrub = true });
+    defer tl.deinit();
+
+    var i: u32 = 0;
+    while (i < 6) : (i += 1) _ = try tl.commit(.{ .add = 1 });
+    // Scrub snapshots at 6, 5, 4 and 3; scrubbing back to 6 consumes the
+    // exact snapshot at 6, leaving {5, 4, 3} in the cache.
+    _ = tl.state();
+    tl.setMarker(5);
+    _ = tl.state();
+    tl.setMarker(4);
+    _ = tl.state();
+    tl.setMarker(3);
+    _ = tl.state();
+    tl.setMarker(6);
+    _ = tl.state();
+    try std.testing.expectEqual(@as(u32, 3), tl.stats().checkpoints);
+    try std.testing.expectEqual(@as(u32, 6), tl.stats().undo_units);
+
+    const t = tl.trim(.{ .checkpoints = 2, .undo_units = 2 });
+    try std.testing.expectEqual(@as(u32, 1), t.checkpoints);
+    try std.testing.expectEqual(@as(u32, 4), t.journal_entries);
+    const s = tl.stats();
+    try std.testing.expectEqual(@as(u32, 2), s.checkpoints);
+    try std.testing.expectEqual(@as(u32, 2), s.undo_units);
+    // The marker is at 6: the nearest snapshots (5 and 4) survive, 3 goes.
+    try std.testing.expectEqual(@as(u32, 5), tl.cps.bestBefore(6).?.pos);
+    try std.testing.expectEqual(@as(u32, 4), tl.cps.bestBefore(4).?.pos);
+    try std.testing.expect(tl.cps.bestBefore(3) == null);
+    try std.testing.expectEqual(@as(i64, 6), tl.state().value); // document untouched
+
+    // Undo still works for the kept units; redo can be dropped.
+    try std.testing.expect(tl.undo());
+    try std.testing.expectEqual(@as(u32, 1), tl.redoDepth());
+    const t2 = tl.trim(.{ .drop_redo = true });
+    try std.testing.expectEqual(@as(u32, 1), t2.journal_entries);
+    try std.testing.expect(!tl.canRedo());
+    try std.testing.expectEqual(@as(u32, 1), tl.undoDepth());
 }

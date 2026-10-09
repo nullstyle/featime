@@ -81,7 +81,75 @@ pub fn Journal(comptime Op: type) type {
             e: Entry,
             /// True when this record opens a transaction (undo unit).
             txn_start: bool = false,
+            /// Wall-clock stamp from the timeline's `Config.now` at record
+            /// time; 0 without a clock.
+            ts: u64 = 0,
+            /// User label of the unit (`beginLabeledTransaction`); owned,
+            /// carried by the unit's first record only.
+            label: ?[]const u8 = null,
         };
+
+        /// What a history unit did, for history panels. Multi-entry units
+        /// (explicit transactions, group operations) report `.batch`.
+        pub const UnitKind = enum { commit, edit, remove, suppress, move, name, tag, chapter, group, parameter, batch };
+
+        /// One undo/redo unit as seen by `units()`.
+        pub const Unit = struct {
+            /// Position in the journal, oldest first.
+            index: u32,
+            /// Number of journal entries in the unit.
+            entries: u32,
+            kind: UnitKind,
+            /// Label given at `beginLabeledTransaction`, if any. Borrowed:
+            /// valid until the next journal mutation.
+            label: ?[]const u8,
+            /// Timestamp of the unit's first entry (0 without a clock).
+            ts: u64,
+            /// True when the unit has been undone (it sits in the redo region).
+            undone: bool,
+        };
+
+        pub const UnitIter = struct {
+            j: *const Self,
+            i: usize = 0,
+            n: u32 = 0,
+
+            pub fn next(it: *UnitIter) ?Unit {
+                const items = it.j.entries.items;
+                if (it.i >= items.len) return null;
+                const start = it.i;
+                var end = start + 1;
+                while (end < items.len and !items[end].txn_start) end += 1;
+                const first = items[start];
+                const count: u32 = @intCast(end - start);
+                const unit: Unit = .{
+                    .index = it.n,
+                    .entries = count,
+                    .kind = if (count == 1) kindOf(first.e) else .batch,
+                    .label = first.label,
+                    .ts = first.ts,
+                    .undone = start >= it.j.head,
+                };
+                it.i = end;
+                it.n += 1;
+                return unit;
+            }
+        };
+
+        fn kindOf(e: Entry) UnitKind {
+            return switch (e) {
+                .commit => .commit,
+                .edit => .edit,
+                .remove => .remove,
+                .suppress => .suppress,
+                .move => .move,
+                .name_set => .name,
+                .tag_add, .tag_remove => .tag,
+                .chapter_add, .chapter_remove, .chapter_rename => .chapter,
+                .group_add, .group_remove, .group_rename => .group,
+                .param_add, .param_remove, .param_set, .param_rename => .parameter,
+            };
+        }
 
         /// One yielded entry of an undo or redo unit; `unit_done` marks the
         /// last entry of the unit.
@@ -90,6 +158,8 @@ pub fn Journal(comptime Op: type) type {
 
         gpa: std.mem.Allocator,
         max: u32,
+        /// Stamps records; null leaves `ts` at 0.
+        clock: ?ft.Clock = null,
         entries: std.ArrayList(Record) = .empty,
         head: usize = 0,
 
@@ -97,14 +167,22 @@ pub fn Journal(comptime Op: type) type {
         /// outermost `beginTxn` carries the boundary flag.
         txn_depth: u32 = 0,
         txn_pending: bool = false,
+        /// Owned label waiting for the unit's first record.
+        txn_label: ?[]const u8 = null,
 
-        pub fn init(gpa: std.mem.Allocator, max: u32) Self {
-            return .{ .gpa = gpa, .max = max };
+        pub fn init(gpa: std.mem.Allocator, max: u32, clock: ?ft.Clock) Self {
+            return .{ .gpa = gpa, .max = max, .clock = clock };
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.entries.items) |*r| self.deinitEntry(&r.e);
+            for (self.entries.items) |*r| self.deinitRecord(r);
             self.entries.deinit(self.gpa);
+            if (self.txn_label) |l| self.gpa.free(l);
+        }
+
+        fn deinitRecord(self: *Self, r: *const Record) void {
+            self.deinitEntry(&r.e);
+            if (r.label) |l| self.gpa.free(l);
         }
 
         fn deinitEntry(self: *Self, e: *const Entry) void {
@@ -156,10 +234,26 @@ pub fn Journal(comptime Op: type) type {
             self.txn_depth += 1;
         }
 
+        /// `beginTxn` with a user label for history panels. Only the
+        /// outermost begin's label is kept (nested begins flatten).
+        pub fn beginTxnLabeled(self: *Self, label: []const u8) error{OutOfMemory}!void {
+            if (self.txn_depth == 0) {
+                const owned = try self.gpa.dupe(u8, label);
+                if (self.txn_label) |l| self.gpa.free(l);
+                self.txn_label = owned;
+            }
+            self.beginTxn();
+        }
+
         pub fn endTxn(self: *Self) void {
             if (self.txn_depth == 0) return;
             self.txn_depth -= 1;
-            if (self.txn_depth == 0) self.txn_pending = false;
+            if (self.txn_depth == 0) {
+                self.txn_pending = false;
+                // An empty labeled transaction recorded nothing: drop the label.
+                if (self.txn_label) |l| self.gpa.free(l);
+                self.txn_label = null;
+            }
         }
 
         pub fn inTxn(self: *const Self) bool {
@@ -173,22 +267,28 @@ pub fn Journal(comptime Op: type) type {
             // inside one, only the first record after begin carries the
             // boundary.
             const starts_unit = if (self.txn_depth > 0) self.txn_pending else true;
+            // The label rides on the unit's first record (ownership moves).
+            const label: ?[]const u8 = if (starts_unit and self.txn_depth > 0) self.txn_label else null;
+            if (starts_unit and self.txn_depth > 0) self.txn_label = null;
             if (self.max == 0) {
                 // The entry was never stored: its owned memory must die here.
                 var dead = entry;
                 self.deinitEntry(&dead);
+                if (label) |l| self.gpa.free(l);
                 return;
             }
             self.txn_pending = false; // the boundary rides on the first record
 
-            for (self.entries.items[self.head..]) |*r| self.deinitEntry(&r.e);
+            for (self.entries.items[self.head..]) |*r| self.deinitRecord(r);
             self.entries.shrinkRetainingCapacity(self.head);
-            self.entries.append(self.gpa, .{ .e = entry, .txn_start = starts_unit }) catch {
+            const ts: u64 = if (self.clock) |now| now() else 0;
+            self.entries.append(self.gpa, .{ .e = entry, .txn_start = starts_unit, .ts = ts, .label = label }) catch {
                 // Out of memory: drop history rather than keep a journal
                 // that lies about the timeline's past.
                 var dead = entry;
                 self.deinitEntry(&dead);
-                for (self.entries.items) |*r| self.deinitEntry(&r.e);
+                if (label) |l| self.gpa.free(l);
+                for (self.entries.items) |*r| self.deinitRecord(r);
                 self.entries.clearRetainingCapacity();
                 self.head = 0;
                 return;
@@ -207,12 +307,64 @@ pub fn Journal(comptime Op: type) type {
                 var next = cut + 1;
                 while (next < self.entries.items.len and !self.entries.items[next].txn_start) next += 1;
                 if (next >= self.entries.items.len) break; // one giant unit
-                for (self.entries.items[cut..next]) |*r| self.deinitEntry(&r.e);
+                for (self.entries.items[cut..next]) |*r| self.deinitRecord(r);
                 cut = next;
             }
             if (cut == 0) return;
             self.entries.replaceRange(self.gpa, 0, cut, &.{}) catch return;
             self.head -|= cut;
+        }
+
+        // -- introspection / memory pressure -----------------------------------
+
+        /// Iterate undo/redo units oldest-first.
+        pub fn units(self: *const Self) UnitIter {
+            return .{ .j = self };
+        }
+
+        pub fn entryCount(self: *const Self) u32 {
+            return @intCast(self.entries.items.len);
+        }
+
+        /// Number of units that `undo` can unwind.
+        pub fn undoDepth(self: *const Self) u32 {
+            var n: u32 = 0;
+            for (self.entries.items[0..self.head]) |r| {
+                if (r.txn_start) n += 1;
+            }
+            return n;
+        }
+
+        /// Number of units that `redo` can replay.
+        pub fn redoDepth(self: *const Self) u32 {
+            var n: u32 = 0;
+            for (self.entries.items[self.head..]) |r| {
+                if (r.txn_start) n += 1;
+            }
+            return n;
+        }
+
+        /// Evict the oldest undo units until at most `keep` remain. Whole
+        /// units only. Returns the number of entries dropped.
+        pub fn trimUndo(self: *Self, keep: u32) u32 {
+            var dropped: u32 = 0;
+            while (self.undoDepth() > keep) {
+                var next: usize = 1;
+                while (next < self.head and !self.entries.items[next].txn_start) next += 1;
+                for (self.entries.items[0..next]) |*r| self.deinitRecord(r);
+                self.entries.replaceRange(self.gpa, 0, next, &.{}) catch return dropped;
+                self.head -= next;
+                dropped += @intCast(next);
+            }
+            return dropped;
+        }
+
+        /// Drop everything that `redo` could replay. Returns entries dropped.
+        pub fn dropRedo(self: *Self) u32 {
+            const n: u32 = @intCast(self.entries.items.len - self.head);
+            for (self.entries.items[self.head..]) |*r| self.deinitRecord(r);
+            self.entries.shrinkRetainingCapacity(self.head);
+            return n;
         }
 
         // -- undo / redo ------------------------------------------------------

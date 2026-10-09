@@ -50,6 +50,34 @@ pub fn Checkpoints(comptime Domain: type) type {
             }
         }
 
+        pub fn count(self: *const Self) u32 {
+            return @intCast(self.entries.items.len);
+        }
+
+        /// Keep at most `keep` checkpoints, preferring the ones nearest
+        /// `marker` (ties drop the older position). Returns how many were
+        /// dropped. The configured `max` is unchanged; this is a one-off
+        /// release of memory.
+        pub fn trimTo(self: *Self, keep: u8, marker: u32) u32 {
+            var dropped: u32 = 0;
+            while (self.entries.items.len > keep) {
+                var worst: usize = 0;
+                var worst_d: u64 = 0;
+                for (self.entries.items, 0..) |e, i| {
+                    const d: u64 = if (e.pos > marker) e.pos - marker else marker - e.pos;
+                    const further = d > worst_d or (d == worst_d and e.pos < self.entries.items[worst].pos);
+                    if (i == 0 or further) {
+                        worst = i;
+                        worst_d = d;
+                    }
+                }
+                var dead = self.entries.orderedRemove(worst);
+                self.destroyEntry(&dead);
+                dropped += 1;
+            }
+            return dropped;
+        }
+
         /// The closest checkpoint at or before `pos`, or null.
         pub fn bestBefore(self: *Self, pos: u32) ?*Entry {
             var best: ?*Entry = null;
