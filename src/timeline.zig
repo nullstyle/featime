@@ -154,12 +154,25 @@ pub fn Timeline(comptime Domain: type) type {
         evaluating: bool = false,
         /// Re-entry guard for `version()` across a cycle in the link graph.
         checking_links: bool = false,
+        /// While applying: where the running replay keeps its progress
+        /// (the index being applied is `applying_base + applying_ptr.*`).
+        applying_ptr: ?*const u32 = null,
+        applying_base: u32 = 0,
         /// Marks whose positions keep a checkpoint (`pin`). Anchored like
         /// chapters: the position follows the feature.
         pins: std.ArrayList(ft.Mark) = .empty,
-        /// How many of `gen`'s steps were marker moves; `structureVersion`
-        /// leaves them out.
-        marker_moves: u64 = 0,
+        /// Recent changes as (sequence, lowest index affected), oldest
+        /// first, kept so that indices rise along the list: an older change
+        /// whose index is not below a newer one's can never be the answer
+        /// to `prefixVersion` and is dropped. See `noteChange`.
+        changes: [64]ChangeEvent = undefined,
+        changes_len: u8 = 0,
+        change_seq: u64 = 0,
+        /// Sequence of the newest change forgotten for lack of room; the
+        /// answer for positions no kept change is below.
+        change_floor: u64 = 0,
+
+        const ChangeEvent = struct { seq: u64, idx: u32 };
 
         // ------------------------------------------------------------------
         // Lifecycle
@@ -315,7 +328,6 @@ pub fn Timeline(comptime Domain: type) type {
             const target = @min(pos, self.list.items.len);
             if (target == self.marker_pos) return;
             self.touch();
-            self.marker_moves += 1;
             self.syncPins();
             if (self.config.checkpoint_on_scrub and !self.dirty()) {
                 self.cps.add(self.marker_pos, &self.live_doc, self.list.items);
@@ -352,20 +364,26 @@ pub fn Timeline(comptime Domain: type) type {
         /// If the timeline is exactly at a clean state, the feature is applied
         /// immediately; otherwise (or if a hard error occurs) the work is
         /// deferred to the next `state()`.
-        pub fn commit(self: *Self, op: Op) error{OutOfMemory}!ft.FeatureId {
+        pub fn commit(self: *Self, op: Op) CommitError!ft.FeatureId {
             const meta: ?ft.Meta = if (self.config.now) |now| .{ .ts = now() } else null;
             return self.commitInner(op, meta);
         }
 
         /// Commit with explicit provenance. When `Config.now` is set, plain
         /// `commit` auto-stamps; this overrides/supplements it.
-        pub fn commitWithMeta(self: *Self, op: Op, meta: ft.Meta) error{OutOfMemory}!ft.FeatureId {
+        pub fn commitWithMeta(self: *Self, op: Op, meta: ft.Meta) CommitError!ft.FeatureId {
             return self.commitInner(op, meta);
         }
 
-        fn commitInner(self: *Self, op: Op, meta: ?ft.Meta) error{OutOfMemory}!ft.FeatureId {
+        /// `error.ForwardReference`: a pinned link in the op would read this
+        /// timeline at or past the feature itself (a cycle); see
+        /// `LinkCollector.pin`.
+        pub const CommitError = error{ OutOfMemory, ForwardReference };
+
+        fn commitInner(self: *Self, op: Op, meta: ?ft.Meta) CommitError!ft.FeatureId {
             // Allocate first, mutate second. The id and the lamport tick go
             // back on failure, so nothing observable moves.
+            try self.checkForwardReferences(op, self.marker_pos, self.marker_pos);
             try self.journal.reserve(1);
             const saved_next_id = self.next_id;
             errdefer self.next_id = saved_next_id;
@@ -389,6 +407,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// Bookkeeping after a feature lands at `at` (shared by commit and
         /// journal redo).
         fn afterInsert(self: *Self, at: u32) void {
+            self.noteChange(at);
             self.cps.noteMutation(at);
             // The inserted feature is `.pending` by default and the shifted
             // features now sit at/after the advanced marker; their old
@@ -402,7 +421,12 @@ pub fn Timeline(comptime Domain: type) type {
                 var scratch = std.heap.ArenaAllocator.init(self.gpa);
                 defer scratch.deinit();
                 self.evaluating = true;
-                defer self.evaluating = false;
+                self.applying_ptr = &applied;
+                self.applying_base = 0;
+                defer {
+                    self.evaluating = false;
+                    self.applying_ptr = null;
+                }
                 ft.rebuild.applyRange(Domain, self.list.items, at, at + 1, &self.live_doc, self.allocators(&scratch), self.env, self.registry, self.ptab.items(), &applied) catch |err| {
                     // Hard failure: features before `at` are still good on the
                     // live doc, but this op may have partially mutated it.
@@ -418,8 +442,9 @@ pub fn Timeline(comptime Domain: type) type {
         /// Replace a feature's parameters (Fusion's "edit feature"). The
         /// feature keeps its id and position; the document recomputes lazily
         /// from the nearest surviving checkpoint.
-        pub fn edit(self: *Self, id: ft.FeatureId, new_op: Op) error{ OutOfMemory, UnknownFeature }!void {
+        pub fn edit(self: *Self, id: ft.FeatureId, new_op: Op) error{ OutOfMemory, UnknownFeature, ForwardReference }!void {
             const idx = self.indexOf(id) orelse return error.UnknownFeature;
+            try self.checkForwardReferences(new_op, idx, null);
             try self.journal.reserve(1);
             self.touch();
             const old_op = self.list.items[idx].op;
@@ -969,6 +994,7 @@ pub fn Timeline(comptime Domain: type) type {
             } else if (from >= self.marker_pos and to < self.marker_pos) {
                 self.marker_pos += 1;
             }
+            self.noteChange(lo);
             self.cps.noteMutation(lo);
             if (lo < self.built_pos) self.live_stale = true;
         }
@@ -1013,16 +1039,26 @@ pub fn Timeline(comptime Domain: type) type {
             return .{
                 .ptr = self,
                 .version = &versionErased,
-                .structure_version = &structureVersionErased,
+                .prefix_version = &prefixVersionErased,
                 .evaluating = &evaluatingErased,
+                .applying = &applyingErased,
+                .links_before = &linksBeforeErased,
+                .mark_position = &markPositionErased,
+                .len = &lenErased,
             };
         }
 
-        /// Like `version`, but marker moves do not count: what a pinned
-        /// link compares, since it reads a position of its own choosing.
-        pub fn structureVersion(self: *Self) u64 {
+        /// A number that changes when `features[0..pos)` replay differently:
+        /// an edit, insert, removal, move, suppression, parameter or link
+        /// change at an index below `pos`. Marker moves and changes at or
+        /// after `pos` leave it alone. What a pinned link compares.
+        pub fn prefixVersion(self: *Self, pos: u32) u64 {
             self.checkLinks();
-            return self.gen - self.marker_moves;
+            var i = self.changes_len;
+            while (i > 0) : (i -= 1) {
+                if (self.changes[i - 1].idx < pos) return self.changes[i - 1].seq;
+            }
+            return self.change_floor;
         }
 
         // ------------------------------------------------------------------
@@ -1037,30 +1073,38 @@ pub fn Timeline(comptime Domain: type) type {
         /// statuses keep describing the marker. At a pinned position the
         /// result is also kept as a checkpoint, so the next view is a copy.
         pub fn viewAt(self: *Self, pos: u32) anyerror!Doc {
-            self.checkLinks();
-            self.syncPins();
+            // A view of ourselves while we are being evaluated (a backward
+            // reference): only the prefix before the feature being applied
+            // is final, and the live document is in flux.
+            const nested = self.evaluating;
             const target: u32 = @min(pos, self.len());
+            if (nested) {
+                if (target > (self.applyingIndex() orelse 0)) return error.ReferenceCycle;
+            } else {
+                self.checkLinks();
+            }
+            self.syncPins();
             const pinned = self.cps.isPinned(target);
             if (self.cps.bestBefore(target)) |e| {
                 if (e.pos == target) return ft.cloneDoc(Domain, &e.doc, self.docAllocator());
             }
-            if (!self.dirty() and self.built_pos == target) {
+            if (!nested and !self.dirty() and self.built_pos == target) {
                 if (pinned) self.cps.add(target, &self.live_doc, self.list.items);
                 return ft.cloneDoc(Domain, &self.live_doc, self.docAllocator());
             }
 
             var start: u32 = 0;
             var base: *const Doc = &self.seed_doc;
-            var base_statuses: ?[]const ft.Status = null;
+            var base_kind: BaseKind = .seed;
             if (self.cps.bestBefore(target)) |e| {
                 start = e.pos;
                 base = &e.doc;
-                base_statuses = e.statuses;
+                base_kind = .checkpoint;
             }
-            if (self.broken == null and !self.live_stale and self.built_pos <= target and self.built_pos > start) {
+            if (!nested and self.broken == null and !self.live_stale and self.built_pos <= target and self.built_pos > start) {
                 start = self.built_pos;
                 base = &self.live_doc;
-                base_statuses = null; // the live statuses describe [0..built_pos)
+                base_kind = .live;
             }
             var doc = try ft.cloneDoc(Domain, base, self.docAllocator());
             errdefer ft.deinitDoc(Domain, &doc, self.docAllocator());
@@ -1081,13 +1125,23 @@ pub fn Timeline(comptime Domain: type) type {
             defer scratch.deinit();
             var applied: u32 = 0;
             const was_evaluating = self.evaluating;
+            const was_ptr = self.applying_ptr;
+            const was_base = self.applying_base;
             self.evaluating = true;
-            defer self.evaluating = was_evaluating;
+            self.applying_ptr = &applied;
+            self.applying_base = start;
+            defer {
+                self.evaluating = was_evaluating;
+                self.applying_ptr = was_ptr;
+                self.applying_base = was_base;
+            }
             try ft.rebuild.applyRange(Domain, range, 0, @intCast(range.len), &doc, self.allocators(&scratch), self.env, self.registry, self.ptab.items(), &applied);
             self.recordLinks(start, target);
-            if (pinned) self.cacheView(target, &doc, base_statuses, start, range) catch {};
+            if (pinned) self.cacheView(target, &doc, base_kind, start, range) catch {};
             return doc;
         }
+
+        const BaseKind = enum { seed, checkpoint, live };
 
         /// `viewAt` at a mark's position (`markPosition`).
         pub fn viewAtMark(self: *Self, mark: ft.Mark) anyerror!Doc {
@@ -1135,7 +1189,17 @@ pub fn Timeline(comptime Domain: type) type {
         /// Keep a view at a pinned position as a checkpoint: a copy of the
         /// document, with statuses assembled from the base's and the
         /// replayed range's.
-        fn cacheView(self: *Self, pos: u32, doc: *const Doc, base_statuses: ?[]const ft.Status, start: u32, range: []const Feature) !void {
+        fn cacheView(self: *Self, pos: u32, doc: *const Doc, base_kind: BaseKind, start: u32, range: []const Feature) !void {
+            // The base's statuses, looked up again: a nested view may have
+            // changed the cache since the base was chosen.
+            const cp_statuses: ?[]const ft.Status = switch (base_kind) {
+                .seed, .live => null,
+                .checkpoint => blk: {
+                    const e = self.cps.bestBefore(start) orelse return error.BaseGone;
+                    if (e.pos != start) return error.BaseGone;
+                    break :blk e.statuses;
+                },
+            };
             const statuses = try self.gpa.alloc(ft.Status, pos);
             var filled: usize = 0;
             errdefer {
@@ -1147,7 +1211,7 @@ pub fn Timeline(comptime Domain: type) type {
             }
             var i: usize = 0;
             while (i < start) : (i += 1) {
-                const src: ft.Status = if (base_statuses) |bs| bs[i] else self.list.items[i].status;
+                const src: ft.Status = if (cp_statuses) |bs| bs[i] else self.list.items[i].status;
                 statuses[i] = switch (src) {
                     .failed => |m| .{ .failed = try self.gpa.dupe(u8, m) },
                     else => src,
@@ -1628,6 +1692,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// marker at the tip follows the tip. A remote insert in the grey
         /// future leaves the slider alone. The rebuild happens lazily.
         fn afterRemoteInsert(self: *Self, at: u32) void {
+            self.noteChange(at);
             self.cps.noteMutation(at);
             self.resetStatuses(at + 1);
             if (at <= self.marker_pos) self.marker_pos += 1;
@@ -1672,7 +1737,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// whose dependency is absent here simply soft-fails on rebuild,
         /// like any other. Pairs with `persistence.savePrefix` for scenario
         /// variants.
-        pub fn cherryPick(self: *Self, src: *const Self, id: ft.FeatureId, opts: CherryPickOptions) error{ OutOfMemory, UnknownFeature }!ft.FeatureId {
+        pub fn cherryPick(self: *Self, src: *const Self, id: ft.FeatureId, opts: CherryPickOptions) error{ OutOfMemory, UnknownFeature, ForwardReference }!ft.FeatureId {
             const view = src.featureById(id) orelse return error.UnknownFeature;
             const op = view.op.*; // copy before mutating: `src` may be `self`
             const suppressed = view.suppressed;
@@ -1694,7 +1759,7 @@ pub fn Timeline(comptime Domain: type) type {
             };
         }
 
-        fn cherryPickSteps(self: *Self, src: *const Self, id: ft.FeatureId, op: Op, meta: ?ft.Meta, suppressed: bool, opts: CherryPickOptions) error{ OutOfMemory, UnknownFeature }!ft.FeatureId {
+        fn cherryPickSteps(self: *Self, src: *const Self, id: ft.FeatureId, op: Op, meta: ?ft.Meta, suppressed: bool, opts: CherryPickOptions) error{ OutOfMemory, UnknownFeature, ForwardReference }!ft.FeatureId {
             const new_id = try self.commitInner(op, meta);
             if (opts.annotations) {
                 if (src.featureName(id)) |n| try self.setFeatureName(new_id, n);
@@ -2152,9 +2217,26 @@ pub fn Timeline(comptime Domain: type) type {
         /// document is stale if the mutation sits below the applied region
         /// (its old suffix effects are baked in and cannot be un-applied).
         fn invalidate(self: *Self, idx: u32) void {
+            self.noteChange(idx);
             self.resetStatuses(idx);
             self.cps.noteMutation(idx);
             if (idx < self.built_pos) self.live_stale = true;
+        }
+
+        /// Record that `features[idx..]` replay differently from now on.
+        /// Keeps the list monotone (see `changes`); when it is full the
+        /// oldest change is forgotten and `change_floor` remembers its
+        /// sequence, so older readers re-run once (never miss a change).
+        fn noteChange(self: *Self, idx: u32) void {
+            self.change_seq += 1;
+            while (self.changes_len > 0 and self.changes[self.changes_len - 1].idx >= idx) self.changes_len -= 1;
+            if (self.changes_len == self.changes.len) {
+                self.change_floor = self.changes[0].seq;
+                std.mem.copyForwards(ChangeEvent, self.changes[0 .. self.changes_len - 1], self.changes[1..self.changes_len]);
+                self.changes_len -= 1;
+            }
+            self.changes[self.changes_len] = .{ .seq = self.change_seq, .idx = idx };
+            self.changes_len += 1;
         }
 
         // ------------------------------------------------------------------
@@ -2411,9 +2493,14 @@ pub fn Timeline(comptime Domain: type) type {
             self.syncPins();
             if (!self.dirty()) return; // clean
             // Features applied from here may read other timelines; a read
-            // back into this one is a cycle (see `ApplyContext.link`).
+            // back into this one at or past the feature being applied is a
+            // cycle (see `ApplyContext.link` / `linkAt`).
             self.evaluating = true;
-            defer self.evaluating = false;
+            self.applying_base = 0;
+            defer {
+                self.evaluating = false;
+                self.applying_ptr = null;
+            }
 
             // 1. Exact checkpoint restore — the slider fast path. Scrubbing
             //    back to a snapshotted position costs zero applies.
@@ -2440,6 +2527,7 @@ pub fn Timeline(comptime Domain: type) type {
                 var applied: u32 = from;
                 var scratch = std.heap.ArenaAllocator.init(self.gpa);
                 defer scratch.deinit();
+                self.applying_ptr = &applied;
                 ft.rebuild.applyRange(Domain, self.list.items, from, self.marker_pos, &self.live_doc, self.allocators(&scratch), self.env, self.registry, self.ptab.items(), &applied) catch |err| {
                     self.broken = err;
                     self.built_pos = applied;
@@ -2484,6 +2572,7 @@ pub fn Timeline(comptime Domain: type) type {
                 else
                     self.marker_pos;
                 var applied: u32 = pos;
+                self.applying_ptr = &applied;
                 ft.rebuild.applyRange(Domain, self.list.items, pos, end, &scratch, self.allocators(&scratch_arena), self.env, self.registry, self.ptab.items(), &applied) catch |err| {
                     ft.deinitDoc(Domain, &scratch, self.docAllocator());
                     self.broken = err;
@@ -2516,16 +2605,120 @@ pub fn Timeline(comptime Domain: type) type {
             return self.evaluating;
         }
 
-        fn structureVersionErased(ptr: *anyopaque) u64 {
+        /// Index of the feature being applied right now, or null.
+        fn applyingIndex(self: *const Self) ?u32 {
+            const p = self.applying_ptr orelse return null;
+            return self.applying_base + p.*;
+        }
+
+        fn applyingErased(ptr: *anyopaque) ?u32 {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            return self.applyingIndex();
+        }
+
+        fn prefixVersionErased(ptr: *anyopaque, mark: ft.Mark) u64 {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            return self.structureVersion();
+            return self.prefixVersion(self.markPosition(mark));
+        }
+
+        fn linksBeforeErased(ptr: *anyopaque, pos: u32, out: *ft.LinkCollector) void {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            self.linksBefore(pos, out);
+        }
+
+        fn markPositionErased(ptr: *anyopaque, mark: ft.Mark) u32 {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            return self.markPosition(mark);
+        }
+
+        fn lenErased(ptr: *anyopaque) u32 {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            return self.len();
+        }
+
+        /// The links declared by the unsuppressed features before `pos`.
+        fn linksBefore(self: *const Self, pos: u32, out: *ft.LinkCollector) void {
+            if (comptime !@hasDecl(Domain, "links")) return;
+            const end = @min(pos, self.len());
+            for (self.list.items[0..end]) |f| {
+                if (f.suppressed) continue;
+                Domain.links(f.op, out);
+            }
         }
 
         /// The version a link compares: the whole version for a live link,
-        /// the structure version for a pinned one.
+        /// the version of the prefix before the mark for a pinned one.
         fn currentVersion(reg: ft.Registry, link: ft.Link) ?u64 {
             const h = reg.resolve(reg.ctx, link.timeline) orelse return null;
-            return if (link.pinned) h.structure_version(h.ptr) else h.version(h.ptr);
+            return if (link.mark) |m| h.prefix_version(h.ptr, m) else h.version(h.ptr);
+        }
+
+        /// Where a pin of this very timeline at `mark` ends, once a feature
+        /// has been inserted at `inserting_at` (null: no insert pending). A
+        /// tip pin or a dead anchor reads past everything.
+        fn selfPinPosition(self: *const Self, mark: ft.Mark, inserting_at: ?u32) u32 {
+            const extra: u32 = @intFromBool(inserting_at != null);
+            const anchor = mark.after orelse return self.len() + extra;
+            const j = self.indexOf(anchor) orelse return self.len() + extra;
+            var pos = j + 1;
+            if (inserting_at) |at| {
+                if (j >= at) pos += 1;
+            }
+            return pos;
+        }
+
+        const Visit = struct { ptr: *anyopaque, pos: u32 };
+
+        /// Refuse a pinned link in `op` whose pinned prefix would, directly
+        /// or through other pinned prefixes, read this timeline at a
+        /// position that includes the feature itself (index `limit`; with
+        /// `inserting_at` set the feature is about to be inserted there).
+        /// Live links on the way read everything, so they count as reaching
+        /// it. Best effort: the walk stops at a depth of 16 timelines and
+        /// the runtime cycle guard stays the safety net.
+        fn checkForwardReferences(self: *Self, op: Op, limit: u32, inserting_at: ?u32) error{ ForwardReference, OutOfMemory }!void {
+            if (comptime !@hasDecl(Domain, "links")) return;
+            const reg = self.registry orelse return;
+            var collector: ft.LinkCollector = .{ .gpa = self.gpa };
+            defer collector.links.deinit(self.gpa);
+            Domain.links(op, &collector);
+            if (collector.failed) return error.OutOfMemory;
+            var visited: [16]Visit = undefined;
+            visited[0] = .{ .ptr = self, .pos = 0 };
+            for (collector.links.items) |l| {
+                const mark = l.mark orelse continue; // live links: the runtime guard
+                const h = reg.resolve(reg.ctx, l.timeline) orelse continue;
+                if (h.ptr == @as(*anyopaque, self)) {
+                    if (self.selfPinPosition(mark, inserting_at) > limit) return error.ForwardReference;
+                    continue;
+                }
+                if (try self.reaches(reg, h, h.mark_position(h.ptr, mark), limit, inserting_at, &visited, 1)) return error.ForwardReference;
+            }
+        }
+
+        /// Does the prefix `[0..pos)` of the timeline behind `h` read this
+        /// timeline past `limit`, through any number of pinned prefixes?
+        fn reaches(self: *Self, reg: ft.Registry, h: ft.LinkHandle, pos: u32, limit: u32, inserting_at: ?u32, visited: *[16]Visit, n: usize) error{OutOfMemory}!bool {
+            for (visited[0..n]) |v| {
+                if (v.ptr == h.ptr and v.pos >= pos) return false; // explored already
+            }
+            if (n == visited.len) return false; // too deep to tell: the runtime guard decides
+            visited[n] = .{ .ptr = h.ptr, .pos = pos };
+            var collector: ft.LinkCollector = .{ .gpa = self.gpa };
+            defer collector.links.deinit(self.gpa);
+            h.links_before(h.ptr, pos, &collector);
+            if (collector.failed) return error.OutOfMemory;
+            for (collector.links.items) |l| {
+                const target = reg.resolve(reg.ctx, l.timeline) orelse continue;
+                if (target.ptr == @as(*anyopaque, self)) {
+                    const self_pos: u32 = if (l.mark) |m| self.selfPinPosition(m, inserting_at) else self.len() + 1;
+                    if (self_pos > limit) return true;
+                    continue;
+                }
+                const target_pos: u32 = if (l.mark) |m| target.mark_position(target.ptr, m) else target.len(target.ptr);
+                if (try self.reaches(reg, target, target_pos, limit, inserting_at, visited, n + 1)) return true;
+            }
+            return false;
         }
 
         /// True when a linked timeline changed since the features reading it
@@ -5122,7 +5315,7 @@ const LinkDomain = struct {
                 doc.value += other.state().value;
             },
             .read_at => |r| {
-                const other: *LinkTl = @ptrCast(@alignCast(ctx.link(r.timeline) orelse
+                const other: *LinkTl = @ptrCast(@alignCast(ctx.linkAt(r.timeline, .{ .after = r.after }) orelse
                     return ctx.fail("timeline {d} is unknown or in a cycle", .{r.timeline})));
                 var view = try other.viewAtMark(.{ .after = r.after });
                 defer other.freeView(&view);
@@ -5133,7 +5326,7 @@ const LinkDomain = struct {
     pub fn links(op: Op, out: *ft.LinkCollector) void {
         switch (op) {
             .read => |tid| out.link(tid),
-            .read_at => |r| out.pin(r.timeline),
+            .read_at => |r| out.pin(r.timeline, .{ .after = r.after }),
             .add => {},
         }
     }
@@ -5508,12 +5701,14 @@ test "links: pinned reads across a cycle end" {
     defer b.deinit();
     reg.add(&a);
     reg.add(&b);
-    a.setRegistry(reg.registry());
-    b.setRegistry(reg.registry());
+    // Without a registry the commit-time check sees nothing, so a cycle
+    // can be built; the evaluation guard still ends it.
     _ = try a.commit(.{ .add = 1 });
     _ = try a.commit(.{ .read_at = .{ .timeline = b.timelineId(), .after = null } });
     _ = try b.commit(.{ .add = 10 });
     _ = try b.commit(.{ .read_at = .{ .timeline = a.timelineId(), .after = null } });
+    a.setRegistry(reg.registry());
+    b.setRegistry(reg.registry());
     _ = a.state();
     _ = b.state();
     _ = a.version();
@@ -5522,4 +5717,118 @@ test "links: pinned reads across a cycle end" {
     a.freeView(&va);
     var vb = try b.viewAt(2);
     b.freeView(&vb);
+}
+
+test "links: an edit after the pinned mark leaves a pinned reader clean" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var child = try LinkTl.init(gpa, .{}, .{});
+    defer child.deinit();
+    var parent = try LinkTl.init(gpa, .{}, .{});
+    defer parent.deinit();
+    reg.add(&child);
+    parent.setRegistry(reg.registry());
+
+    const c1 = try child.commit(.{ .add = 1 });
+    _ = try child.commit(.{ .add = 2 });
+    const c3 = try child.commit(.{ .add = 3 });
+    _ = try parent.commit(.{ .read_at = .{ .timeline = child.timelineId(), .after = c1 } });
+    try std.testing.expectEqual(@as(i64, 1), parent.state().value);
+
+    // Changes at or after the pinned position do not reach the reader.
+    try child.edit(c3, .{ .add = 30 });
+    try std.testing.expect(!parent.dirty());
+    _ = try child.commit(.{ .add = 4 });
+    try std.testing.expect(!parent.dirty());
+    try child.remove(c3);
+    try std.testing.expect(!parent.dirty());
+    child.setMarker(0);
+    try std.testing.expect(!parent.dirty());
+    try std.testing.expectEqual(@as(i64, 1), parent.state().value);
+
+    // Changes before it do.
+    child.setMarker(child.len());
+    try child.edit(c1, .{ .add = 10 });
+    try std.testing.expect(parent.dirty());
+    try std.testing.expectEqual(@as(i64, 10), parent.state().value);
+    child.setMarker(0);
+    _ = try child.commit(.{ .add = 5 }); // inserted before c1
+    try std.testing.expect(parent.dirty());
+    try std.testing.expectEqual(@as(i64, 15), parent.state().value);
+}
+
+test "links: the change list stays exact after many changes" {
+    const gpa = std.testing.allocator;
+    var tl = try LinkTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    var ids: [100]ft.FeatureId = undefined;
+    for (&ids) |*id| id.* = try tl.commit(.{ .add = 1 });
+    const before = tl.prefixVersion(50);
+    // Edits past the position: the prefix version must not move, even
+    // after more changes than the list can hold.
+    var k: usize = 60;
+    while (k < 100) : (k += 1) try tl.edit(ids[k], .{ .add = 2 });
+    k = 60;
+    while (k < 100) : (k += 1) try tl.edit(ids[k], .{ .add = 3 });
+    try std.testing.expectEqual(before, tl.prefixVersion(50));
+    try std.testing.expect(tl.prefixVersion(100) != before);
+    // One edit before it moves it.
+    try tl.edit(ids[10], .{ .add = 9 });
+    try std.testing.expect(tl.prefixVersion(50) != before);
+}
+
+test "links: a pin that would read back past the pinning feature is refused" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var a = try LinkTl.init(gpa, .{}, .{});
+    defer a.deinit();
+    var b = try LinkTl.init(gpa, .{}, .{});
+    defer b.deinit();
+    reg.add(&a);
+    reg.add(&b);
+    a.setRegistry(reg.registry());
+    b.setRegistry(reg.registry());
+
+    const a1 = try a.commit(.{ .add = 1 });
+    const b1 = try b.commit(.{ .read_at = .{ .timeline = a.timelineId(), .after = a1 } }); // backward: fine
+    const a2 = try a.commit(.{ .read_at = .{ .timeline = b.timelineId(), .after = b1 } }); // b's prefix reads a before a2: fine
+    const b2 = try b.commit(.{ .read_at = .{ .timeline = a.timelineId(), .after = null } }); // a's prefix reads b before b2: fine
+    try std.testing.expectEqual(@as(i64, 3), b.state().value); // b1 = 1, b2 = a's tip = 1 + 1
+
+    // A pin whose prefix reads a's tip would include the new feature itself.
+    try std.testing.expectError(error.ForwardReference, a.commit(.{ .read_at = .{ .timeline = b.timelineId(), .after = b2 } }));
+    try std.testing.expectError(error.ForwardReference, a.edit(a2, .{ .read_at = .{ .timeline = b.timelineId(), .after = b2 } }));
+    try std.testing.expectEqual(@as(u32, 2), a.len());
+
+    // Pins of one's own earlier history are fine; of one's own tip, not.
+    _ = try a.commit(.{ .read_at = .{ .timeline = a.timelineId(), .after = a1 } });
+    try std.testing.expectError(error.ForwardReference, a.commit(.{ .read_at = .{ .timeline = a.timelineId(), .after = null } }));
+    try std.testing.expectEqual(@as(i64, 3), a.state().value); // 1 + b before b2 (1) + a before a2 (1)
+}
+
+test "links: a backward reference into a timeline being evaluated works" {
+    const gpa = std.testing.allocator;
+    var reg: LinkRegistry = .{};
+    var a = try LinkTl.init(gpa, .{}, .{});
+    defer a.deinit();
+    var b = try LinkTl.init(gpa, .{}, .{});
+    defer b.deinit();
+    reg.add(&a);
+    reg.add(&b);
+    a.setRegistry(reg.registry());
+    b.setRegistry(reg.registry());
+
+    // b reads a's first feature; a's second feature reads b: while a
+    // evaluates its second feature, b's view needs a's first one.
+    const a1 = try a.commit(.{ .add = 1 });
+    const b1 = try b.commit(.{ .read_at = .{ .timeline = a.timelineId(), .after = a1 } });
+    _ = try a.commit(.{ .read_at = .{ .timeline = b.timelineId(), .after = b1 } });
+    try std.testing.expectEqual(@as(i64, 2), a.state().value);
+
+    // Force a full re-evaluation of a with b's view computed from scratch.
+    try a.edit(a1, .{ .add = 5 });
+    try b.edit(b1, .{ .read_at = .{ .timeline = a.timelineId(), .after = a1 } });
+    _ = b.trim(.{ .checkpoints = 0 });
+    try std.testing.expectEqual(@as(i64, 10), a.state().value);
+    try std.testing.expectEqual(ft.Status.ok, firstStatus(&a, 1));
 }

@@ -195,6 +195,20 @@ pub const ApplyContext = struct {
         return h.ptr;
     }
 
+    /// Resolve a timeline for a pinned read at `mark` (`viewAtMark`). A
+    /// timeline being evaluated right now may still be read at positions
+    /// before the feature it is applying — its earlier history is final —
+    /// so backward references work; a position at or past that feature is
+    /// a cycle and yields null. Use this, not `link`, for pinned reads.
+    pub fn linkAt(self: *const ApplyContext, timeline_id: u64, mark: Mark) ?*anyopaque {
+        const reg = self.registry orelse return null;
+        const h = reg.resolve(reg.ctx, timeline_id) orelse return null;
+        if (h.applying(h.ptr)) |idx| {
+            if (h.mark_position(h.ptr, mark) > idx) return null;
+        }
+        return h.ptr;
+    }
+
     /// Read a parameter value by id, or null when absent (features
     /// typically soft-fail on a missing parameter).
     pub fn param(self: *const ApplyContext, id: ParamId) ?f64 {
@@ -227,25 +241,26 @@ pub const LinkCollector = struct {
     /// A live link: the op reads the timeline's `state()`, so its marker
     /// moves count as changes.
     pub fn link(self: *LinkCollector, timeline_id: u64) void {
-        self.links.append(self.gpa, .{ .timeline = timeline_id, .pinned = false }) catch {
+        self.links.append(self.gpa, .{ .timeline = timeline_id, .mark = null }) catch {
             self.failed = true;
         };
     }
 
-    /// A pinned link: the op reads the timeline at a position of its own
-    /// choosing (`viewAt`), so only edits count, not marker moves.
-    pub fn pin(self: *LinkCollector, timeline_id: u64) void {
-        self.links.append(self.gpa, .{ .timeline = timeline_id, .pinned = true }) catch {
+    /// A pinned link: the op reads the timeline at `mark` (`viewAtMark`),
+    /// so only changes before that position count — not marker moves, not
+    /// edits after it.
+    pub fn pin(self: *LinkCollector, timeline_id: u64, mark: Mark) void {
+        self.links.append(self.gpa, .{ .timeline = timeline_id, .mark = mark }) catch {
             self.failed = true;
         };
     }
 };
 
 /// One link an op declares: which timeline, and whether it reads it live
-/// (`state()`) or at a pinned position (`viewAt`).
+/// (`state()`, mark null) or at a pinned position (`viewAtMark`).
 pub const Link = struct {
     timeline: u64,
-    pinned: bool,
+    mark: ?Mark,
 };
 
 /// A type-erased view of a timeline that other timelines may read:
@@ -256,9 +271,17 @@ pub const LinkHandle = struct {
     ptr: *anyopaque,
     /// Changes on every edit and marker move (what a live link compares).
     version: *const fn (ptr: *anyopaque) u64,
-    /// Changes on edits only (what a pinned link compares).
-    structure_version: *const fn (ptr: *anyopaque) u64,
+    /// Changes when something before the mark's position changes (what a
+    /// pinned link compares): `Timeline.prefixVersion`.
+    prefix_version: *const fn (ptr: *anyopaque, mark: Mark) u64,
     evaluating: *const fn (ptr: *anyopaque) bool,
+    /// Index of the feature being applied right now, or null.
+    applying: *const fn (ptr: *anyopaque) ?u32,
+    /// The links declared by the features before `pos` (for the
+    /// forward-reference check at commit).
+    links_before: *const fn (ptr: *anyopaque, pos: u32, out: *LinkCollector) void,
+    mark_position: *const fn (ptr: *anyopaque, mark: Mark) u32,
+    len: *const fn (ptr: *anyopaque) u32,
 };
 
 /// How a timeline finds the timelines its features link to: an app-owned

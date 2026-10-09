@@ -3,7 +3,7 @@
 All notable changes to featuretree-zig. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
-## Unreleased
+## 0.10.0 — 2026-10-09
 
 ### Changed (breaking)
 - Containers are FTZ6: the header lists the ids of the timelines the
@@ -29,8 +29,7 @@ All notable changes to featuretree-zig. The format follows
   `first`/`last`, `name`), live strings are null in the stored entry, and
   the record observer still sees complete entries. `removeTag`,
   `removeChapter`, `removeGroup` and `removeParam` no longer allocate at
-  all. Chapter fixes carry the new mark on the wire (wire version 4 is
-  still unreleased).
+  all. Chapter fixes carry the new mark on the wire (wire version 4).
 
 - Sync envelopes. The record observer yields `Timeline.Envelope`
   `{ origin, seq, lamport, entry }` instead of a bare entry; `applyRemote`
@@ -77,13 +76,19 @@ All notable changes to featuretree-zig. The format follows
 - Pinned references, step 2. `viewAt(pos)` / `viewAtMark(mark)` compute
   the document at any position without moving the marker (the caller frees
   the result with `freeView`). `LinkCollector.pin(id)` declares a pinned
-  link, compared against the other timeline's new `structureVersion()`
-  (marker moves excluded), so a pinned reader stays clean while the other
-  timeline is scrubbed and re-runs when it is edited. `pin(mark)` /
-  `unpin(mark)` keep a checkpoint at a mark's position: it survives
-  eviction and `trim`, does not count against `max_checkpoints`, and the
-  next view restores it after an invalidating edit. `Stats.pins`. The
-  nested demo gains a pinned occurrence.
+  link, compared against the other timeline's new `prefixVersion(pos)`,
+  which changes only when something before the pinned position changes:
+  neither marker moves nor edits after the mark re-run a pinned reader.
+  `ctx.linkAt(id, mark)` resolves a pinned read and allows backward
+  references into a timeline that is being evaluated (positions before
+  the feature it is applying). `commit` and `edit` refuse a pin whose
+  prefix would read this timeline at or past the new feature with
+  `error.ForwardReference` (`Timeline.CommitError`), walking pinned
+  prefixes transitively. `pin(mark)` / `unpin(mark)` keep a checkpoint at
+  a mark's position: it survives eviction and `trim`, does not count
+  against `max_checkpoints`, and the next view restores it after an
+  invalidating edit. `Stats.pins`. The nested demo gains a pinned
+  occurrence.
 - `tests/oom.zig`: an out-of-memory sweep over every local mutator, every
   remote entry kind, `load` and `save`. Each call is run once per
   allocation index with that allocation failing; afterwards the state must

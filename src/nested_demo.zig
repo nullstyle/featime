@@ -94,7 +94,7 @@ const Globe = struct {
                 mergeRegion(doc, region.state());
             },
             .region_at => |o| {
-                const region: *RegionTimeline = @ptrCast(@alignCast(ctx.link(o.region) orelse
+                const region: *RegionTimeline = @ptrCast(@alignCast(ctx.linkAt(o.region, .{ .after = o.after }) orelse
                     return ctx.fail("region {d} is not registered, or is in a reference cycle", .{o.region})));
                 var view = try region.viewAtMark(.{ .after = o.after });
                 defer region.freeView(&view);
@@ -115,7 +115,7 @@ const Globe = struct {
     pub fn links(op: Op, out: *ft.LinkCollector) void {
         switch (op) {
             .region_occurrence => |o| out.link(o.region),
-            .region_at => |o| out.pin(o.region),
+            .region_at => |o| out.pin(o.region, .{ .after = o.after }),
             .set_sea_level => {},
         }
     }

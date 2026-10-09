@@ -164,7 +164,7 @@ documented with tests on its edges.
   `Timeline.cherryPick(src, id, opts)`. Merge stays out of scope.
 - **Memory pressure API** — `stats()` and `trim(budget)`.
 
-## Hardening — DELIVERED (unreleased)
+## Hardening — DELIVERED (0.10.0)
 
 - **Out-of-memory policy** — allocate first, then mutate: every mutator
   either completes or returns `error.OutOfMemory` with nothing changed;
@@ -225,7 +225,7 @@ for byte budgets. Pull when real usage shows mid-history edits dominating.
    whole question — and it belongs where document size and churn are known,
    in the application. Building the arena into the library stays parked.
 
-## References to other timelines (steps 1 and 2 DELIVERED, unreleased)
+## References to other timelines — DELIVERED (0.10.0)
 
 `docs/timeline-references.md` compares four options (live links with
 library-tracked staleness, pinned references with `viewAt`, snapshots
@@ -244,10 +244,10 @@ live links first, then pins.
   (`LinkCollector.pin`) compare `structureVersion()`, so marker moves in
   the other timeline do not re-run the reader; the mark rides in the op,
   so "update reference" is an ordinary edit.
-- Still open after step 2: a commit-time check that a pin points
-  backwards in time (the runtime cycle guard covers correctness); versions
-  per position, so an edit *after* a pinned mark does not re-run a pinned
-  reader (today any edit in the other timeline does).
+- Follow-ups, also in 0.10.0: `prefixVersion(pos)` (an edit after a
+  pinned mark no longer re-runs the reader), `ctx.linkAt` (backward
+  references into a timeline being evaluated), and the commit-time
+  forward-reference check (`error.ForwardReference`).
 - Snapshots (option C) stay in reserve for containers that must load
   alone or jobs that must run while children are edited.
 
@@ -276,7 +276,7 @@ load-bearing), and anything UI-shaped — the library stays headless.
   fixups ride the move's journal entry so undo and redo are exact.
 - Unknown ids are errors, never silent no-ops (0.7.0).
 - Out of memory never leaves a half-applied edit: allocate first, then
-  mutate; the journal slot is reserved before the change (unreleased).
+  mutate; the journal slot is reserved before the change (0.10.0).
 - Sync order model (0.10): a commit carries its predecessor and an order key
   (Lamport clock, origin id); remote placement is RGA-style — after the
   predecessor, past greater keys — so concurrent commits converge. Moves and

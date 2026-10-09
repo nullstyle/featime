@@ -1,9 +1,10 @@
 # References to other timelines — options
 
-Status (2026-10-09): decision taken — A then B. Both are built; see the
-README section "Hierarchical timelines and links" (pinned references
-included). Open after B: a commit-time backward-pin check and versions
-per position; C (snapshots) stays in reserve.
+Status (2026-10-09): decision taken — A then B. Both shipped in 0.10.0
+with the follow-ups (per-position versions, `ctx.linkAt` for backward
+references, the commit-time forward-reference check); see the README
+section "Hierarchical timelines and links". C (snapshots) stays in
+reserve.
 
 A *reference* is a feature in one timeline that reads another timeline.
 Today the library supports one shape of it: the parent's `apply` reads a

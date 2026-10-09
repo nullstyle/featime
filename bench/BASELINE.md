@@ -5,7 +5,7 @@
 plain data). Default `Config` (checkpoint interval 256, 4 checkpoints,
 journal 1024).
 
-## Unreleased (2026-10-09): checkpoint window, heap-heavy document
+## 0.10.0 (2026-10-09): checkpoint window, heap-heavy document
 
 Interval checkpoints are now taken only at the last `max_checkpoints`
 intervals before the marker: positions that would be evicted later in the

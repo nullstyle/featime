@@ -532,8 +532,10 @@ chapter; `null` means the tip), `apply` reads it with `viewAtMark`, and
 
 ```zig
 region_at: struct { region: u64, after: ?ft.FeatureId },
-// links:  .region_at => |o| out.pin(o.region),
-// apply:  var view = try region.viewAtMark(.{ .after = o.after });
+// links:  .region_at => |o| out.pin(o.region, .{ .after = o.after }),
+// apply:  const region: *ft.Timeline(Region) = @ptrCast(@alignCast(
+//             ctx.linkAt(o.region, .{ .after = o.after }) orelse return ctx.fail(...)));
+//         var view = try region.viewAtMark(.{ .after = o.after });
 //         defer region.freeView(&view);
 //         merge `view` into the doc
 ```
@@ -541,10 +543,11 @@ region_at: struct { region: u64, after: ?ft.FeatureId },
 `viewAt(pos)` computes the document at any position without moving the
 marker — from the nearest checkpoint, the live document or the seed,
 replaying the rest; the caller owns the result. A pinned link compares the
-other timeline's `structureVersion()`, which marker moves do not touch, so
-scrubbing the region leaves a pinned globe clean, while an edit in the
-region re-runs it. "Update the reference" is an ordinary `edit` of the op:
-it journals, undoes and syncs like any edit.
+other timeline's `prefixVersion(pos)`, which changes only when something
+before the pinned position changes: neither marker moves nor edits after
+the mark re-run the reader, an edit before it does. "Update the
+reference" is an ordinary `edit` of the op: it journals, undoes and syncs
+like any edit.
 
 A view far from the other timeline's marker replays from the seed.
 `pin(mark)` keeps a checkpoint at the mark's position: pinned checkpoints
@@ -553,10 +556,15 @@ dropped by an edit before the position like any checkpoint, and come back
 with the next view there. `unpin(mark)` releases one; `stats().pins`
 counts them. Pins are runtime state, not saved: pin again after `load`.
 
-A cycle through pinned reads ends like a live one: the read that closes
-it fails softly, inside the view. A pin that points backwards in time
-(to features older than the pinning feature) cannot close a cycle; the
-library does not check that at commit yet.
+Backward references are legal: `ctx.linkAt` lets a feature read another
+timeline's history even while that timeline is evaluating a later
+feature, as long as the position lies before the feature being applied
+(its earlier history is final). A position at or past it is a cycle:
+`linkAt` returns null and the read fails softly. `commit` and `edit`
+refuse a pinned link whose prefix would, directly or through other pinned
+prefixes, read this timeline at or past the new feature
+(`error.ForwardReference`); live links on the way count as reading
+everything. Remote entries are not checked; the runtime guard still holds.
 
 For a multiuser editor this shape doubles as the sync/merge unit: each
 sub-timeline (with its stable ids and flat journal) is an independent
@@ -615,7 +623,7 @@ bench/bench.zig    benchmark suite (zig build bench); BASELINE.md has the number
 
 ## Status & non-goals
 
-v0.9.1 — all four roadmap waves plus the deferred tail delivered (minus disk-backed checkpoints); see [ROADMAP.md](ROADMAP.md) for the deferred tail. Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
+v0.10.0 — all four roadmap waves, the deferred tail, hardening (allocate-first mutators, allocation-free undo, the out-of-memory sweep, fuzz tests), sync envelopes with deterministic ordering, and references to other timelines (live and pinned links) delivered; disk-backed checkpoints stay parked. See [ROADMAP.md](ROADMAP.md). Designed for (and shaped by) a multiuser globe-scale GIS/game editor:
 feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are
