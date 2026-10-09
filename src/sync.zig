@@ -65,7 +65,7 @@ fn writeFramedOp(
 ) !void {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
-    try Domain.encodeOp(op, &aw.writer);
+    Domain.encodeOp(op, &aw.writer) catch |err| return persistence.scratchError(err);
     try w.writeInt(u32, @intCast(aw.written().len), .little);
     try w.writeAll(aw.written());
 }
@@ -143,22 +143,20 @@ fn writeChapterFixes(w: *std.Io.Writer, fixes: []const annotations.ChapterFix) !
     for (fixes) |f| {
         try w.writeInt(u64, f.chapter_id, .little);
         try w.writeInt(u64, f.old_mark.after orelse 0, .little);
+        try w.writeInt(u64, f.new_mark.after orelse 0, .little);
     }
 }
 
 fn readChapterFixes(gpa: std.mem.Allocator, r: *std.Io.Reader) ![]annotations.ChapterFix {
     const n = try r.takeInt(u32, .little);
     const out = try gpa.alloc(annotations.ChapterFix, n);
-    var filled: usize = 0;
-    errdefer {
-        gpa.free(out[0..filled]);
-        gpa.free(out);
-    }
+    errdefer gpa.free(out); // plain structs: nothing to free per element
     for (out) |*f| {
         f.chapter_id = try r.takeInt(u64, .little);
         const after = try r.takeInt(u64, .little);
         f.old_mark = .{ .after = if (after == 0) null else after };
-        filled += 1;
+        const new_after = try r.takeInt(u64, .little);
+        f.new_mark = .{ .after = if (new_after == 0) null else new_after };
     }
     return out;
 }
@@ -177,18 +175,13 @@ fn writeGroupFixes(w: *std.Io.Writer, fixes: []const annotations.GroupFix) !void
 fn readGroupFixes(gpa: std.mem.Allocator, r: *std.Io.Reader) ![]annotations.GroupFix {
     const n = try r.takeInt(u32, .little);
     const out = try gpa.alloc(annotations.GroupFix, n);
-    var filled: usize = 0;
-    errdefer {
-        gpa.free(out[0..filled]);
-        gpa.free(out);
-    }
+    errdefer gpa.free(out); // plain structs: nothing to free per element
     for (out) |*f| {
         f.group_id = try r.takeInt(u64, .little);
         f.old_first = try r.takeInt(u64, .little);
         f.old_last = try r.takeInt(u64, .little);
         f.new_first = try r.takeInt(u64, .little);
         f.new_last = try r.takeInt(u64, .little);
-        filled += 1;
     }
     return out;
 }
@@ -252,7 +245,7 @@ pub fn encode(
             try writeOptString(w, e.name);
             try writeMeta(w, e.meta);
             try writeChapterFixes(w, e.chapter_fixes);
-            try writeTags(w, e.tags);
+            try writeTags(w, e.tags.items);
             try writeGroupFixes(w, e.group_fixes);
         },
         .suppress => |e| {
@@ -384,18 +377,37 @@ pub fn decode(
             .old_op = try readOp(Domain, gpa, r, stored_format),
             .new_op = try readOp(Domain, gpa, r, stored_format),
         } },
-        3 => .{ .remove = .{
-            .id = try r.takeInt(u64, .little),
-            .op = try readOp(Domain, gpa, r, stored_format),
-            .at = try r.takeInt(u32, .little),
-            .suppressed = (try r.take(1))[0] != 0,
-            .marker_pre = try r.takeInt(u32, .little),
-            .name = try readOptString(gpa, r),
-            .meta = try readMeta(r),
-            .chapter_fixes = try readChapterFixes(gpa, r),
-            .tags = try readTags(gpa, r),
-            .group_fixes = try readGroupFixes(gpa, r),
-        } },
+        3 => blk: {
+            // Several owned parts: free the earlier ones if a later read fails.
+            const id = try r.takeInt(u64, .little);
+            const op = try readOp(Domain, gpa, r, stored_format);
+            const at = try r.takeInt(u32, .little);
+            const suppressed = (try r.take(1))[0] != 0;
+            const marker_pre = try r.takeInt(u32, .little);
+            const name = try readOptString(gpa, r);
+            errdefer if (name) |n| gpa.free(n);
+            const meta = try readMeta(r);
+            const chapter_fixes = try readChapterFixes(gpa, r);
+            errdefer gpa.free(chapter_fixes);
+            const tags = try readTags(gpa, r);
+            errdefer {
+                for (tags) |t| gpa.free(@constCast(t));
+                gpa.free(tags);
+            }
+            const group_fixes = try readGroupFixes(gpa, r);
+            break :blk .{ .remove = .{
+                .id = id,
+                .op = op,
+                .at = at,
+                .suppressed = suppressed,
+                .marker_pre = marker_pre,
+                .name = name,
+                .meta = meta,
+                .chapter_fixes = chapter_fixes,
+                .tags = std.ArrayList([]const u8).fromOwnedSlice(tags),
+                .group_fixes = group_fixes,
+            } };
+        },
         4 => .{ .suppress = .{
             .id = try r.takeInt(u64, .little),
             .prev = (try r.take(1))[0] != 0,
@@ -407,61 +419,76 @@ pub fn decode(
             .marker_pre = try r.takeInt(u32, .little),
             .group_fixes = try readGroupFixes(gpa, r),
         } },
-        6 => .{ .name_set = .{
-            .id = try r.takeInt(u64, .little),
-            .old = try readOptString(gpa, r),
-            .new = try readOptString(gpa, r),
-        } },
+        6 => blk: {
+            const id = try r.takeInt(u64, .little);
+            const old = try readOptString(gpa, r);
+            errdefer if (old) |o| gpa.free(o);
+            const new = try readOptString(gpa, r);
+            break :blk .{ .name_set = .{ .id = id, .old = old, .new = new } };
+        },
         7 => .{ .tag_add = .{
             .id = try r.takeInt(u64, .little),
             .tag = try readString(gpa, r),
         } },
-        8 => .{ .tag_remove = .{
-            .id = try r.takeInt(u64, .little),
-            .tag = try readString(gpa, r),
-        } },
+        8 => .{
+            .tag_remove = .{
+                .id = try r.takeInt(u64, .little),
+                .tag = try readString(gpa, r),
+                .at = 0, // local bookkeeping; the receiver finds its own position
+            },
+        },
         9 => .{ .chapter_add = .{
             .chapter = try readChapter(gpa, r),
         } },
         10 => .{ .chapter_remove = .{
             .chapter = try readChapter(gpa, r),
         } },
-        11 => .{ .chapter_rename = .{
-            .id = try r.takeInt(u64, .little),
-            .old = try readString(gpa, r),
-            .new = try readString(gpa, r),
-        } },
+        11 => blk: {
+            const id = try r.takeInt(u64, .little);
+            const old = try readString(gpa, r);
+            errdefer gpa.free(old);
+            const new = try readString(gpa, r);
+            break :blk .{ .chapter_rename = .{ .id = id, .old = old, .new = new } };
+        },
         12 => .{ .group_add = .{
             .group = try readGroup(gpa, r),
         } },
         13 => .{ .group_remove = .{
             .group = try readGroup(gpa, r),
         } },
-        14 => .{ .group_rename = .{
-            .id = try r.takeInt(u64, .little),
-            .old = try readString(gpa, r),
-            .new = try readString(gpa, r),
-        } },
-        15 => .{ .param_add = .{
-            .id = try r.takeInt(u64, .little),
-            .name = try readString(gpa, r),
-            .value = @bitCast(try r.takeInt(u64, .little)),
-        } },
-        16 => .{ .param_remove = .{
-            .id = try r.takeInt(u64, .little),
-            .name = try readString(gpa, r),
-            .value = @bitCast(try r.takeInt(u64, .little)),
-        } },
+        14 => blk: {
+            const id = try r.takeInt(u64, .little);
+            const old = try readString(gpa, r);
+            errdefer gpa.free(old);
+            const new = try readString(gpa, r);
+            break :blk .{ .group_rename = .{ .id = id, .old = old, .new = new } };
+        },
+        15 => blk: {
+            const id = try r.takeInt(u64, .little);
+            const name = try readString(gpa, r);
+            errdefer gpa.free(name);
+            const value: f64 = @bitCast(try r.takeInt(u64, .little));
+            break :blk .{ .param_add = .{ .id = id, .name = name, .value = value } };
+        },
+        16 => blk: {
+            const id = try r.takeInt(u64, .little);
+            const name = try readString(gpa, r);
+            errdefer gpa.free(name);
+            const value: f64 = @bitCast(try r.takeInt(u64, .little));
+            break :blk .{ .param_remove = .{ .id = id, .name = name, .value = value } };
+        },
         17 => .{ .param_set = .{
             .id = try r.takeInt(u64, .little),
             .old = @bitCast(try r.takeInt(u64, .little)),
             .new = @bitCast(try r.takeInt(u64, .little)),
         } },
-        18 => .{ .param_rename = .{
-            .id = try r.takeInt(u64, .little),
-            .old = try readString(gpa, r),
-            .new = try readString(gpa, r),
-        } },
+        18 => blk: {
+            const id = try r.takeInt(u64, .little);
+            const old = try readString(gpa, r);
+            errdefer gpa.free(old);
+            const new = try readString(gpa, r);
+            break :blk .{ .param_rename = .{ .id = id, .old = old, .new = new } };
+        },
         else => return error.BadEntryTag,
     };
     return .{ .origin = origin, .seq = seq, .lamport = lamport, .entry = entry };
@@ -492,8 +519,8 @@ pub fn deinit(comptime Op: type, gpa: std.mem.Allocator, env: *Envelope(Op)) voi
         .remove => |*e| {
             if (e.name) |n| gpa.free(n);
             gpa.free(e.chapter_fixes);
-            for (e.tags) |t| gpa.free(@constCast(t));
-            gpa.free(e.tags);
+            for (e.tags.items) |t| gpa.free(@constCast(t));
+            e.tags.deinit(gpa);
             gpa.free(e.group_fixes);
         },
         .move => |*e| gpa.free(e.group_fixes),

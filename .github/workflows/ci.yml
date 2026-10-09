@@ -12,18 +12,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
-      # Installs the Zig version pinned in mise.toml, the same one used locally.
-      - uses: jdx/mise-action@v2
+      # Installs the Zig version pinned in mise.toml, the same one used
+      # locally. The action is pinned by commit; bump both lines together.
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.6
 
       - run: zig version
-      - run: zig fmt --check build.zig build.zig.zon src examples tests
+      - run: zig fmt --check build.zig build.zig.zon src examples tests bench
       - run: zig build test --summary all
       - run: zig build test -Doptimize=ReleaseSafe --summary all
       - run: zig build test -Doptimize=ReleaseFast --summary all
       - run: zig build examples
       - run: zig build run
       - run: zig build bench -Dbench-max=10000
+      - run: zig build docs

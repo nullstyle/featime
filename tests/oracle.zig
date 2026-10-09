@@ -96,7 +96,7 @@ const NaiveEntry = union(enum) {
         group_fixes: []NGroupFix,
     },
     tag_add: struct { idx: u32, tag: []u8 },
-    tag_remove: struct { idx: u32, tag: []u8 },
+    tag_remove: struct { idx: u32, tag: []u8, at: u32 },
     param_add: struct { id: u64, name: []const u8, value: f64 },
     param_remove: struct { id: u64, name: []const u8, value: f64 },
     param_set: struct { id: u64, old: f64, new: f64 },
@@ -458,6 +458,17 @@ const Naive = struct {
         list.append(self.gpa, stored) catch self.gpa.free(stored);
     }
 
+    /// Undo of a tag removal puts the tag back where it was.
+    fn insertTagRaw(self: *Naive, idx: u32, tag: []const u8, at: u32) void {
+        const list = &self.tag_lists.items[idx];
+        for (list.items) |t| {
+            if (std.mem.eql(u8, t, tag)) return;
+        }
+        const stored = self.gpa.dupe(u8, tag) catch return;
+        const pos: usize = @min(at, list.items.len);
+        list.insert(self.gpa, pos, stored) catch self.gpa.free(stored);
+    }
+
     fn removeTagRaw(self: *Naive, idx: u32, tag: []const u8) void {
         const list = &self.tag_lists.items[idx];
         for (list.items, 0..) |t, i| {
@@ -512,7 +523,7 @@ const Naive = struct {
                     return;
                 };
                 self.gpa.free(dead);
-                self.record(.{ .tag_remove = .{ .idx = idx, .tag = entry_tag } });
+                self.record(.{ .tag_remove = .{ .idx = idx, .tag = entry_tag, .at = @intCast(i) } });
                 return;
             }
         }
@@ -839,7 +850,7 @@ const Naive = struct {
             },
             .name_set => |n| self.setNameRaw(n.idx, n.old),
             .tag_add => |t| self.removeTagRaw(t.idx, t.tag),
-            .tag_remove => |t| self.addTagRaw(t.idx, t.tag),
+            .tag_remove => |t| self.insertTagRaw(t.idx, t.tag, t.at),
             .param_add => |p| {
                 for (self.param_mirror.items, 0..) |pm, i| {
                     if (pm.id == p.id) {

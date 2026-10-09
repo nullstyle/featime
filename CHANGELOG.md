@@ -6,6 +6,22 @@ All notable changes to featuretree-zig. The format follows
 ## Unreleased
 
 ### Changed (breaking)
+- Out-of-memory policy: every mutator allocates everything it needs before
+  it changes anything, so `error.OutOfMemory` always means "nothing
+  happened". The journal reserves its slot first (it no longer drops the
+  whole history when it cannot grow). `edit`, `setSuppressed`,
+  `setGroupSuppressed`, `setParam`, `remove`, `move` and `moveGroup` can
+  now return `error.OutOfMemory`. The library's multi-step edits
+  (`moveGroup`, `removeGroupContents`, `cherryPick`) unwind what they had
+  done; the unwinding needs no memory. `applyRemote` answers a new
+  `ApplyResult.out_of_memory` with nothing applied and the sequence left
+  unacknowledged, so the same envelope can be delivered again.
+- Undo and redo of a feature removal move the feature's name and tags
+  between the journal entry and the annotations instead of copying them
+  (no memory needed); the journal's `remove` entry keeps the tags as a
+  list and the feature's order key. Chapter fixes carry the new mark on
+  the wire (wire version 4 is still unreleased).
+
 - Sync envelopes. The record observer yields `Timeline.Envelope`
   `{ origin, seq, lamport, entry }` instead of a bare entry; `applyRemote`
   takes an envelope and returns `ApplyResult` (`.applied`, `.dropped`,
@@ -19,7 +35,33 @@ All notable changes to featuretree-zig. The format follows
   it). Full replays at 100k features: 45 ms → 1.3 ms on a 16 KiB document,
   431 ms → 14 ms on a 100k-entity heap document; allocations 59M → 2.1M.
 
+### Fixed
+- Remote suppress entries were dropped by an inverted check, so a
+  suppression never reached other replicas.
+- Redo of a group add, remove or rename did the opposite (removed the
+  added group, re-added the removed one, restored the old name).
+- Undo of a tag, chapter, group or parameter removal appended the item at
+  the end instead of putting it back where it was.
+- Undo of a feature removal lost the feature's sync order key.
+- With `max_journal = 0` and a record observer, the observer saw memory
+  the journal had already freed.
+- `sync.decode` leaked the parts it had already decoded when a later read
+  failed; `persistence.load` freed a name twice on failure and silently
+  dropped tags when memory ran out.
+- `persistence.save` and `sync.encode` report exhaustion of their scratch
+  memory as `error.OutOfMemory` instead of `error.WriteFailed`.
+
 ### Added
+- `tests/oom.zig`: an out-of-memory sweep over every local mutator, every
+  remote entry kind, `load` and `save`. Each call is run once per
+  allocation index with that allocation failing; afterwards the state must
+  be unchanged, the retried call must match a clean run, and undo and redo
+  must still work. It found every bug listed under Fixed.
+- `tests/fuzz.zig`: `persistence.load` and `sync.decode` + `applyRemote`
+  on arbitrary bytes (`zig build test` runs the corpus; `zig build test
+  --fuzz` keeps going).
+- `zig build docs` generates the API reference into `zig-out/docs`.
+- CI runs on Windows too; the mise action is pinned by commit.
 - Benchmark part 2: a heap-heavy document (entity list with owned strings);
   `bench/BASELINE.md` records before and after.
 - Deterministic order for concurrent commits: each commit carries its

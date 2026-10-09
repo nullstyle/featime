@@ -58,7 +58,11 @@ pub fn Journal(comptime Op: type) type {
                 name: ?[]const u8 = null, // owned by this entry
                 meta: ?annotations.Meta = null,
                 chapter_fixes: []annotations.ChapterFix = &.{}, // owned slice
-                tags: [][]const u8 = &.{}, // owned strings + owned slice
+                /// Owned strings and buffer. Moves back into the annotations
+                /// on undo and returns on redo (no copies).
+                tags: std.ArrayList([]const u8) = .empty,
+                /// The feature's sync order key, restored by undo.
+                order: ft.OrderKey = .{ .lamport = 0, .origin = 0 },
                 group_fixes: []annotations.GroupFix = &.{}, // owned slice
             },
             suppress: struct { id: ft.FeatureId, prev: bool },
@@ -73,15 +77,19 @@ pub fn Journal(comptime Op: type) type {
             },
             name_set: struct { id: ft.FeatureId, old: ?[]const u8, new: ?[]const u8 },
             tag_add: struct { id: ft.FeatureId, tag: []const u8 },
-            tag_remove: struct { id: ft.FeatureId, tag: []const u8 },
+            /// `at`: the tag's position, so undo restores the order (local
+            /// bookkeeping; not on the wire).
+            tag_remove: struct { id: ft.FeatureId, tag: []const u8, at: u32 = 0 },
             chapter_add: struct { chapter: annotations.Chapter },
-            chapter_remove: struct { chapter: annotations.Chapter },
+            /// `at`: list position, so undo restores creation order (local
+            /// bookkeeping; not on the wire). Same for groups and params.
+            chapter_remove: struct { chapter: annotations.Chapter, at: u32 = 0 },
             chapter_rename: struct { id: annotations.ChapterId, old: []const u8, new: []const u8 },
             group_add: struct { group: annotations.Group },
-            group_remove: struct { group: annotations.Group },
+            group_remove: struct { group: annotations.Group, at: u32 = 0 },
             group_rename: struct { id: annotations.GroupId, old: []const u8, new: []const u8 },
             param_add: struct { id: params.ParamId, name: []const u8, value: f64 },
-            param_remove: struct { id: params.ParamId, name: []const u8, value: f64 },
+            param_remove: struct { id: params.ParamId, name: []const u8, value: f64, at: u32 = 0 },
             param_set: struct { id: params.ParamId, old: f64, new: f64 },
             param_rename: struct { id: params.ParamId, old: []const u8, new: []const u8 },
         };
@@ -162,8 +170,11 @@ pub fn Journal(comptime Op: type) type {
 
         /// One yielded entry of an undo or redo unit; `unit_done` marks the
         /// last entry of the unit.
-        pub const UndoStep = struct { entry: Entry, unit_done: bool };
-        pub const RedoStep = struct { entry: Entry, unit_done: bool };
+        /// `entry` points into the journal: undo and redo move owned
+        /// strings between the entry and the live structures instead of
+        /// copying them, so they need no memory.
+        pub const UndoStep = struct { entry: *Entry, unit_done: bool };
+        pub const RedoStep = struct { entry: *Entry, unit_done: bool };
 
         gpa: std.mem.Allocator,
         max: u32,
@@ -219,8 +230,9 @@ pub fn Journal(comptime Op: type) type {
                 .remove => |r| {
                     if (r.name) |n| self.gpa.free(n);
                     self.gpa.free(r.chapter_fixes);
-                    for (r.tags) |t| self.gpa.free(t);
-                    self.gpa.free(r.tags);
+                    for (r.tags.items) |t| self.gpa.free(t);
+                    var tags = r.tags;
+                    tags.deinit(self.gpa);
                     self.gpa.free(r.group_fixes);
                 },
                 .move => |m| self.gpa.free(m.group_fixes),
@@ -289,6 +301,47 @@ pub fn Journal(comptime Op: type) type {
             return self.txn_depth > 0;
         }
 
+        /// Reserve room for `n` more records so the next `n` `record` calls
+        /// cannot fail. Mutators call this before they change anything:
+        /// allocate first, then mutate.
+        pub fn reserve(self: *Self, n: usize) error{OutOfMemory}!void {
+            if (self.max == 0) return;
+            try self.entries.ensureUnusedCapacity(self.gpa, n);
+        }
+
+        /// Number of records on the undo side: a position to unwind to.
+        pub fn undoEntryCount(self: *const Self) usize {
+            return self.head;
+        }
+
+        /// Remove and return the newest undo-side record, for unwinding a
+        /// failed multi-step edit (reverse it, then `destroyRecord`). Only
+        /// valid right after `record`, when the redo region is empty. A
+        /// record that opened the unit of a still-open transaction hands
+        /// the boundary (and its label) back, so the transaction's next
+        /// record starts the unit again.
+        pub fn popNewest(self: *Self) ?Record {
+            if (self.head == 0) return null;
+            std.debug.assert(self.head == self.live().len);
+            self.head -= 1;
+            var rec = self.live()[self.head];
+            self.entries.shrinkRetainingCapacity(self.start + self.head);
+            if (rec.txn_start and self.txn_depth > 0) {
+                self.txn_pending = true;
+                if (rec.label) |l| {
+                    if (self.txn_label) |old| self.gpa.free(old);
+                    self.txn_label = l;
+                    rec.label = null;
+                }
+            }
+            return rec;
+        }
+
+        /// Free a record obtained from `popNewest`.
+        pub fn destroyRecord(self: *Self, r: *const Record) void {
+            self.deinitRecord(r);
+        }
+
         // -- recording -----------------------------------------------------------
 
         pub fn record(self: *Self, entry: Entry) void {
@@ -312,7 +365,8 @@ pub fn Journal(comptime Op: type) type {
             self.entries.shrinkRetainingCapacity(self.start + self.head);
             const ts: u64 = if (self.clock) |now| now() else 0;
             self.entries.append(self.gpa, .{ .e = entry, .txn_start = starts_unit, .ts = ts, .label = label }) catch {
-                // Out of memory: drop history rather than keep a journal
+                // Unreachable after `reserve`; kept as belt and braces. Out
+                // of memory here: drop history rather than keep a journal
                 // that lies about the timeline's past.
                 var dead = entry;
                 self.deinitEntry(&dead);
@@ -414,8 +468,8 @@ pub fn Journal(comptime Op: type) type {
         pub fn nextUndo(self: *Self) ?UndoStep {
             if (self.head == 0) return null;
             self.head -= 1;
-            const rec = self.live()[self.head];
-            return .{ .entry = rec.e, .unit_done = rec.txn_start };
+            const rec = &self.live()[self.head];
+            return .{ .entry = &rec.e, .unit_done = rec.txn_start };
         }
 
         /// Yield the next entry of the redoable unit, oldest-first. The
@@ -424,10 +478,10 @@ pub fn Journal(comptime Op: type) type {
         pub fn nextRedo(self: *Self) ?RedoStep {
             const items = self.live();
             if (self.head >= items.len) return null;
-            const rec = items[self.head];
+            const rec = &items[self.head];
             self.head += 1;
             const done = self.head >= items.len or items[self.head].txn_start;
-            return .{ .entry = rec.e, .unit_done = done };
+            return .{ .entry = &rec.e, .unit_done = done };
         }
     };
 }

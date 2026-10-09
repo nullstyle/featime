@@ -235,13 +235,15 @@ pub fn Timeline(comptime Domain: type) type {
         /// an envelope stamped with this replica's id, the next sequence
         /// number, and `lamport`.
         fn recordAt(self: *Self, entry: journaling.Journal(Op).Entry, lamport: u64) void {
-            self.journal.record(entry);
+            // The observer sees the entry before the journal takes it: with
+            // `max_journal = 0` the journal frees the entry's memory at once.
             if (!self.applying_remote) {
                 if (self.observer) |obs| {
                     self.seq += 1;
                     obs.func(obs.ctx, &.{ .origin = self.replica_id, .seq = self.seq, .lamport = lamport, .entry = entry });
                 }
             }
+            self.journal.record(entry);
         }
 
         // ------------------------------------------------------------------
@@ -312,16 +314,23 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         fn commitInner(self: *Self, op: Op, meta: ?ft.Meta) error{OutOfMemory}!ft.FeatureId {
-            self.touch();
+            // Allocate first, mutate second. The id and the lamport tick go
+            // back on failure, so nothing observable moves.
+            try self.journal.reserve(1);
+            const saved_next_id = self.next_id;
+            errdefer self.next_id = saved_next_id;
+            const saved_lamport = self.lamport;
+            errdefer self.lamport = saved_lamport;
             const id = self.allocId();
             const at = self.marker_pos;
             const after: ?ft.FeatureId = if (at > 0) self.list.items[at - 1].id else null;
             const lamport = self.nextLamport();
             const order: ft.OrderKey = .{ .lamport = lamport, .origin = self.replica_id };
-
+            if (meta) |m| try self.ann.setProvenance(id, m);
+            errdefer if (meta != null) self.ann.removeProvenance(id);
             try self.listInsert(at, .{ .id = id, .op = op, .order = order });
+            self.touch();
             self.recordAt(.{ .commit = .{ .id = id, .op = op, .at = at, .meta = meta, .after = after, .order = order } }, lamport);
-            if (meta) |m| self.ann.setProvenance(id, m) catch {};
             if (meta != null) self.annTouch();
             self.afterInsert(at);
             return id;
@@ -356,8 +365,9 @@ pub fn Timeline(comptime Domain: type) type {
         /// Replace a feature's parameters (Fusion's "edit feature"). The
         /// feature keeps its id and position; the document recomputes lazily
         /// from the nearest surviving checkpoint.
-        pub fn edit(self: *Self, id: ft.FeatureId, new_op: Op) error{UnknownFeature}!void {
+        pub fn edit(self: *Self, id: ft.FeatureId, new_op: Op) error{ OutOfMemory, UnknownFeature }!void {
             const idx = self.indexOf(id) orelse return error.UnknownFeature;
+            try self.journal.reserve(1);
             self.touch();
             const old_op = self.list.items[idx].op;
             self.record(.{ .edit = .{ .id = id, .old_op = old_op, .new_op = new_op } });
@@ -367,34 +377,37 @@ pub fn Timeline(comptime Domain: type) type {
 
         /// Remove a feature from the timeline. The marker adjusts so the
         /// visible document stays consistent.
-        pub fn remove(self: *Self, id: ft.FeatureId) error{UnknownFeature}!void {
+        pub fn remove(self: *Self, id: ft.FeatureId) error{ OutOfMemory, UnknownFeature }!void {
             const idx = self.indexOf(id) orelse return error.UnknownFeature;
-            self.touch();
-            self.removeAt(idx);
+            try self.removeAt(idx);
         }
 
         /// Remove the feature at a known-valid index, journaling annotation
         /// snapshots for exact undo. Shared by `remove`, `removeGroupContents`
         /// and remote integration (the observer is muted by `record` while
         /// `applying_remote` is set).
-        fn removeAt(self: *Self, idx: u32) void {
+        fn removeAt(self: *Self, idx: u32) error{OutOfMemory}!void {
+            try self.journal.reserve(1);
             const f = self.list.items[idx];
             const id = f.id;
-
-            // Snapshot annotations for exact undo, then re-anchor chapters
-            // that point at this feature to its successor-in-place.
             const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
                 self.list.items[idx + 1].id
             else
                 null;
-            const name_snap: ?[]const u8 = if (self.ann.nameOf(id)) |n|
-                self.gpa.dupe(u8, n) catch null
-            else
-                null;
-            const fixes = self.ann.reanchorAfterRemove(id, replacement) catch @as([]annotations.ChapterFix, &.{});
-            const tags_snap = self.ann.takeTags(id) catch @as([][]const u8, &.{});
-            const group_fixes = self.reanchorGroupBoundaries(id, idx, null) catch @as([]annotations.GroupFix, &.{});
 
+            // Every plan is allocated before anything changes, so an
+            // allocation failure leaves the timeline exactly as it was. The
+            // name and tags then move into the entry (no copies).
+            const fixes = try self.ann.planReanchorAfterRemove(id, replacement);
+            errdefer self.gpa.free(fixes);
+            const group_fixes = try self.planGroupReanchor(id, idx, null);
+            errdefer self.gpa.free(group_fixes);
+            const name_snap = self.ann.takeName(id);
+            const tags_snap = self.ann.takeTagList(id);
+
+            self.touch();
+            self.ann.applyFixesForward(fixes);
+            self.ann.applyGroupFixesForward(group_fixes);
             self.record(.{ .remove = .{
                 .id = id,
                 .op = f.op,
@@ -405,6 +418,7 @@ pub fn Timeline(comptime Domain: type) type {
                 .meta = self.ann.provenance(id),
                 .chapter_fixes = fixes,
                 .tags = tags_snap,
+                .order = f.order,
                 .group_fixes = group_fixes,
             } });
             self.ann.removeFeature(id);
@@ -419,8 +433,10 @@ pub fn Timeline(comptime Domain: type) type {
         /// the timeline but is skipped by rebuilds. Setting the flag it
         /// already has is a no-op: nothing is journaled and in-flight
         /// background jobs stay valid.
-        pub fn setSuppressed(self: *Self, id: ft.FeatureId, suppressed: bool) error{UnknownFeature}!void {
+        pub fn setSuppressed(self: *Self, id: ft.FeatureId, suppressed: bool) error{ OutOfMemory, UnknownFeature }!void {
             const idx = self.indexOf(id) orelse return error.UnknownFeature;
+            if (self.list.items[idx].suppressed == suppressed) return;
+            try self.journal.reserve(1);
             self.setSuppressedAt(idx, suppressed);
         }
 
@@ -440,6 +456,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// Assign (or replace) a feature's display name.
         pub fn setFeatureName(self: *Self, id: ft.FeatureId, new_name: []const u8) error{ OutOfMemory, UnknownFeature }!void {
             if (self.indexOf(id) == null) return error.UnknownFeature;
+            try self.journal.reserve(1);
             const old = self.ann.nameOf(id);
             const old_snap: ?[]const u8 = if (old) |o| try self.gpa.dupe(u8, o) else null;
             errdefer if (old_snap) |o| self.gpa.free(o);
@@ -454,6 +471,7 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn clearFeatureName(self: *Self, id: ft.FeatureId) error{ OutOfMemory, UnknownFeature }!void {
             if (self.indexOf(id) == null) return error.UnknownFeature;
             const old = self.ann.nameOf(id) orelse return;
+            try self.journal.reserve(1);
             const old_snap = try self.gpa.dupe(u8, old);
             errdefer self.gpa.free(old_snap);
             try self.ann.setName(id, null);
@@ -473,6 +491,8 @@ pub fn Timeline(comptime Domain: type) type {
         /// Add a tag to a feature (set semantics: no-op if already present).
         pub fn addTag(self: *Self, id: ft.FeatureId, tag: []const u8) error{ OutOfMemory, UnknownFeature }!void {
             if (self.indexOf(id) == null) return error.UnknownFeature;
+            if (self.ann.hasTag(id, tag)) return;
+            try self.journal.reserve(1);
             const entry_tag = try self.gpa.dupe(u8, tag);
             errdefer self.gpa.free(entry_tag);
             const added = try self.ann.addTag(id, tag);
@@ -489,9 +509,10 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn removeTag(self: *Self, id: ft.FeatureId, tag: []const u8) error{ OutOfMemory, UnknownFeature }!void {
             if (self.indexOf(id) == null) return error.UnknownFeature;
             if (!self.ann.hasTag(id, tag)) return;
+            try self.journal.reserve(1);
             const entry_tag = try self.gpa.dupe(u8, tag);
-            _ = self.ann.removeTag(id, tag);
-            self.record(.{ .tag_remove = .{ .id = id, .tag = entry_tag } });
+            const at = self.ann.removeTag(id, tag).?; // present: checked above
+            self.record(.{ .tag_remove = .{ .id = id, .tag = entry_tag, .at = at } });
             self.annTouch();
         }
 
@@ -524,6 +545,9 @@ pub fn Timeline(comptime Domain: type) type {
         /// Add a named chapter (a slider bookmark) at `mark`. Chapter ids
         /// share the feature id space and are never reused.
         pub fn addChapter(self: *Self, name: []const u8, mark: ft.Mark) error{OutOfMemory}!ft.ChapterId {
+            try self.journal.reserve(1);
+            const saved_next_id = self.next_id;
+            errdefer self.next_id = saved_next_id;
             const cid: ft.ChapterId = self.allocId();
             const entry_name = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(entry_name);
@@ -540,18 +564,20 @@ pub fn Timeline(comptime Domain: type) type {
             // the pointer into the chapters array.
             const cid = c.id;
             const mark = c.mark;
+            try self.journal.reserve(1);
             const entry_name = try self.gpa.dupe(u8, c.name);
-            self.ann.removeChapter(id);
+            const at = self.ann.removeChapter(id).?; // present: looked up above
             self.record(.{ .chapter_remove = .{ .chapter = .{
                 .id = cid,
                 .name = entry_name,
                 .mark = mark,
-            } } });
+            }, .at = at } });
             self.annTouch();
         }
 
         pub fn renameChapter(self: *Self, id: ft.ChapterId, new_name: []const u8) error{ OutOfMemory, UnknownChapter }!void {
             const c = self.ann.chapterById(id) orelse return error.UnknownChapter;
+            try self.journal.reserve(1);
             const old_snap = try self.gpa.dupe(u8, c.name);
             errdefer self.gpa.free(old_snap);
             const new_snap = try self.gpa.dupe(u8, new_name);
@@ -591,6 +617,9 @@ pub fn Timeline(comptime Domain: type) type {
             const li = self.indexOf(last) orelse return error.UnknownFeature;
             const lo = @min(fi, li);
             const hi = @max(fi, li);
+            try self.journal.reserve(1);
+            const saved_next_id = self.next_id;
+            errdefer self.next_id = saved_next_id;
             const gid: ft.annotations.GroupId = self.allocId();
             const entry_name = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(entry_name);
@@ -608,6 +637,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// Ungroup: remove the group, keep the features.
         pub fn removeGroup(self: *Self, id: ft.annotations.GroupId) error{ OutOfMemory, UnknownGroup }!void {
             const g = self.ann.groupById(id) orelse return error.UnknownGroup;
+            try self.journal.reserve(1);
             const entry_name = try self.gpa.dupe(u8, g.name);
             self.removeGroupOwned(id, entry_name);
         }
@@ -618,18 +648,19 @@ pub fn Timeline(comptime Domain: type) type {
             const gid = g.id;
             const first = g.first;
             const last = g.last;
-            self.ann.removeGroup(id);
+            const at = self.ann.removeGroup(id).?; // present: looked up above
             self.record(.{ .group_remove = .{ .group = .{
                 .id = gid,
                 .name = entry_name,
                 .first = first,
                 .last = last,
-            } } });
+            }, .at = at } });
             self.annTouch();
         }
 
         pub fn renameGroup(self: *Self, id: ft.annotations.GroupId, new_name: []const u8) error{ OutOfMemory, UnknownGroup }!void {
             const g = self.ann.groupById(id) orelse return error.UnknownGroup;
+            try self.journal.reserve(1);
             const old_snap = try self.gpa.dupe(u8, g.name);
             errdefer self.gpa.free(old_snap);
             const new_snap = try self.gpa.dupe(u8, new_name);
@@ -674,9 +705,10 @@ pub fn Timeline(comptime Domain: type) type {
         /// Suppress or unsuppress every member of a group — one undo step
         /// (a transaction over per-member suppress entries). An empty group
         /// is a no-op.
-        pub fn setGroupSuppressed(self: *Self, id: ft.annotations.GroupId, suppressed: bool) error{UnknownGroup}!void {
+        pub fn setGroupSuppressed(self: *Self, id: ft.annotations.GroupId, suppressed: bool) error{ OutOfMemory, UnknownGroup }!void {
             const g = self.ann.groupById(id) orelse return error.UnknownGroup;
             const span = self.groupSpan(g) orelse return;
+            try self.journal.reserve(span.hi - span.lo + 1);
             self.beginTransaction();
             defer self.endTransaction();
             var i: u32 = span.lo;
@@ -689,7 +721,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// rides in a single undo unit, and eviction never splits a unit.
         pub const max_group_move: u32 = 4096;
 
-        pub const GroupMoveError = error{ DependencyViolation, UnknownGroup, GroupTooLarge };
+        pub const GroupMoveError = error{ DependencyViolation, UnknownGroup, GroupTooLarge, OutOfMemory };
 
         /// Relocate a group's members to `new_pos` (the block's first index
         /// in the resulting list), preserving member order — one undo step.
@@ -707,7 +739,7 @@ pub fn Timeline(comptime Domain: type) type {
             if (comptime hasDeps(Domain)) {
                 if (self.groupMoveViolatesDeps(span, to)) return error.DependencyViolation;
             }
-            self.touch();
+            try self.journal.reserve(n);
 
             // A transaction of per-member move entries. Moving left, the
             // members not yet moved keep their original indices, so member k
@@ -715,6 +747,7 @@ pub fn Timeline(comptime Domain: type) type {
             // each removal shifts the rest of the block down to `span.lo`
             // and every member lands at the block's final end (`to + n - 1`):
             // earlier members slide left into place as later ones leave.
+            const mark = self.journal.undoEntryCount();
             self.beginTransaction();
             defer self.endTransaction();
             var k: u32 = 0;
@@ -724,8 +757,13 @@ pub fn Timeline(comptime Domain: type) type {
                 const member = self.list.items[from].id;
                 // Other folders re-anchor as members pass through them; the
                 // folder being moved keeps its anchors (they travel with
-                // the block).
-                const gfixes = self.reanchorGroupBoundaries(member, from, id) catch @as([]annotations.GroupFix, &.{});
+                // the block). Out of memory mid-block: unwind what moved.
+                const gfixes = self.planGroupReanchor(member, from, id) catch {
+                    self.rollbackTo(mark);
+                    return error.OutOfMemory;
+                };
+                self.touch();
+                self.ann.applyGroupFixesForward(gfixes);
                 self.record(.{ .move = .{
                     .id = member,
                     .from = from,
@@ -734,6 +772,20 @@ pub fn Timeline(comptime Domain: type) type {
                     .group_fixes = gfixes,
                 } });
                 self.rawMove(member, dest);
+            }
+        }
+
+        /// A multi-step edit ran out of memory halfway: unwind the records
+        /// it made since `mark`, so the caller sees an unchanged timeline.
+        /// Reversing moves and suppression needs no allocation; the names
+        /// and tags of an unwound removal come back on a best-effort basis.
+        /// With `max_journal = 0` there is nothing to unwind. The unwound
+        /// records are destroyed, never offered to `redo`.
+        fn rollbackTo(self: *Self, mark: usize) void {
+            while (self.journal.undoEntryCount() > mark) {
+                var rec = self.journal.popNewest() orelse break;
+                self.reverse(&rec.e);
+                self.journal.destroyRecord(&rec);
             }
         }
 
@@ -780,19 +832,24 @@ pub fn Timeline(comptime Domain: type) type {
         pub fn removeGroupContents(self: *Self, id: ft.annotations.GroupId) error{ OutOfMemory, UnknownGroup }!void {
             const g = self.ann.groupById(id) orelse return error.UnknownGroup;
             const gid = g.id;
-            const entry_name = try self.gpa.dupe(u8, g.name);
             const span = self.groupSpan(g);
             const count: usize = if (span) |sp| sp.hi - sp.lo + 1 else 0;
-            if (count > 0) self.touch();
-
+            try self.journal.reserve(count + 1);
+            const entry_name = try self.gpa.dupe(u8, g.name);
+            const mark = self.journal.undoEntryCount();
             self.beginTransaction();
             defer self.endTransaction();
             var k: u32 = 0;
             while (k < count) : (k += 1) {
                 // The span head keeps re-anchoring to the successor, so the
-                // first member is always at the span start.
+                // first member is always at the span start. Out of memory
+                // mid-way: put back what was removed.
                 const sp = self.groupSpan(self.ann.groupById(gid).?) orelse break;
-                self.removeAt(sp.lo);
+                self.removeAt(sp.lo) catch {
+                    self.gpa.free(entry_name);
+                    self.rollbackTo(mark);
+                    return error.OutOfMemory;
+                };
             }
             self.removeGroupOwned(gid, entry_name);
         }
@@ -814,13 +871,16 @@ pub fn Timeline(comptime Domain: type) type {
             if (comptime hasDeps(Domain)) {
                 if (self.depsViolated(from, to)) return error.DependencyViolation;
             }
-            self.touch();
+            try self.journal.reserve(1);
 
             // Fusion folder semantics: a boundary member dragged out of its
             // span leaves the group, which re-anchors to the remaining
             // members (journaled for exact undo). Membership itself is
-            // positional, so dragging a feature into a span joins it.
-            const gfixes = self.reanchorGroupBoundaries(id, from, null) catch @as([]annotations.GroupFix, &.{});
+            // positional, so dragging a feature into a span joins it. The
+            // plan is allocated before anything changes.
+            const gfixes = try self.planGroupReanchor(id, from, null);
+            self.touch();
+            self.ann.applyGroupFixesForward(gfixes);
             self.record(.{ .move = .{
                 .id = id,
                 .from = from,
@@ -831,7 +891,7 @@ pub fn Timeline(comptime Domain: type) type {
             self.rawMove(id, to);
         }
 
-        pub const MoveError = error{ DependencyViolation, UnknownFeature };
+        pub const MoveError = error{ DependencyViolation, UnknownFeature, OutOfMemory };
 
         fn hasDeps(comptime D: type) bool {
             return @hasDecl(D, "dependencies");
@@ -912,6 +972,9 @@ pub fn Timeline(comptime Domain: type) type {
         /// Add a named numeric parameter and return its stable id. Names are
         /// unique; fails on a duplicate.
         pub fn addParam(self: *Self, name: []const u8, value: f64) error{ OutOfMemory, DuplicateParam }!ft.ParamId {
+            try self.journal.reserve(1);
+            const saved_next_id = self.next_id;
+            errdefer self.next_id = saved_next_id;
             const pid: ft.ParamId = self.allocId();
             const entry_name = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(entry_name);
@@ -925,9 +988,10 @@ pub fn Timeline(comptime Domain: type) type {
         /// hook the timeline cannot see the dependency and the app must
         /// `refresh` affected features itself. Setting the current value is
         /// a no-op.
-        pub fn setParam(self: *Self, id: ft.ParamId, value: f64) error{UnknownParam}!void {
+        pub fn setParam(self: *Self, id: ft.ParamId, value: f64) error{ OutOfMemory, UnknownParam }!void {
             const old = self.ptab.valueOf(id) orelse return error.UnknownParam;
             if (old == value) return;
+            try self.journal.reserve(1);
             _ = self.ptab.set(id, value);
             self.record(.{ .param_set = .{ .id = id, .old = old, .new = value } });
             self.touch();
@@ -938,9 +1002,11 @@ pub fn Timeline(comptime Domain: type) type {
         /// null on the next rebuild and typically soft-fail.
         pub fn removeParam(self: *Self, id: ft.ParamId) error{ OutOfMemory, UnknownParam }!void {
             const p = self.ptab.byId(id) orelse return error.UnknownParam;
+            const value = p.value; // copied out before the table shifts
+            try self.journal.reserve(1);
             const entry_name = try self.gpa.dupe(u8, p.name);
-            _ = self.ptab.remove(id);
-            self.record(.{ .param_remove = .{ .id = id, .name = entry_name, .value = p.value } });
+            const at = self.ptab.remove(id).?; // present: looked up above
+            self.record(.{ .param_remove = .{ .id = id, .name = entry_name, .value = value, .at = at } });
             self.touch();
             self.invalidateReferencing(id);
         }
@@ -948,6 +1014,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// Rename a parameter (display only — ops reference ids, not names).
         pub fn renameParam(self: *Self, id: ft.ParamId, new_name: []const u8) error{ OutOfMemory, UnknownParam }!void {
             const old = self.ptab.byId(id) orelse return error.UnknownParam;
+            try self.journal.reserve(1);
             const old_snap = try self.gpa.dupe(u8, old.name);
             errdefer self.gpa.free(old_snap);
             const new_snap = try self.gpa.dupe(u8, new_name);
@@ -1084,6 +1151,8 @@ pub fn Timeline(comptime Domain: type) type {
             gap,
             /// Emitted by this replica itself (an echo): ignored.
             own,
+            /// An allocation failed before anything changed: retry later.
+            out_of_memory,
         };
 
         /// Integrate an edit that originated on another replica.
@@ -1116,13 +1185,23 @@ pub fn Timeline(comptime Domain: type) type {
                 const expected = self.expectedSeq(env.origin);
                 if (env.seq < expected) return .duplicate;
                 if (env.seq > expected) return .gap;
-                self.seen.put(self.gpa, env.origin, env.seq) catch return .dropped;
+                self.seen.ensureUnusedCapacity(self.gpa, 1) catch return .out_of_memory;
             }
+            self.journal.reserve(1) catch return .out_of_memory;
+            const saved_lamport = self.lamport;
             if (env.lamport > self.lamport) self.lamport = env.lamport;
             const prev = self.applying_remote;
             self.applying_remote = true;
             defer self.applying_remote = prev;
-            return self.applyRemoteInner(&env.entry);
+            const result = self.applyRemoteInner(&env.entry);
+            if (result == .out_of_memory) {
+                // Nothing changed. The sequence stays unacknowledged, so
+                // the sender can deliver the same envelope again.
+                self.lamport = saved_lamport;
+                return result;
+            }
+            if (env.seq != 0) self.seen.putAssumeCapacity(env.origin, env.seq);
+            return result;
         }
 
         /// A hash of the feature order and suppression flags. Replicas that
@@ -1150,15 +1229,20 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         fn applyRemoteInner(self: *Self, entry: *const Entry) ApplyResult {
+            // Every arm allocates what it needs before it changes anything,
+            // so `.out_of_memory` always means "nothing happened".
             switch (entry.*) {
                 .commit => |e| {
                     // Re-delivery is possible in any feed protocol: a
                     // commit whose id already exists here was integrated.
                     if (self.indexOf(e.id) != null) return .dropped;
                     const at = self.remotePosition(e.after, e.at, e.order);
-                    self.listInsert(at, .{ .id = e.id, .op = e.op, .order = e.order }) catch return .dropped;
+                    if (e.meta) |m| self.ann.setProvenance(e.id, m) catch return .out_of_memory;
+                    self.listInsert(at, .{ .id = e.id, .op = e.op, .order = e.order }) catch {
+                        if (e.meta != null) self.ann.removeProvenance(e.id);
+                        return .out_of_memory;
+                    };
                     self.touch();
-                    if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     self.journal.record(.{ .commit = .{
                         .id = e.id,
                         .op = e.op,
@@ -1183,28 +1267,28 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .remove => |e| {
                     const idx = self.indexOf(e.id) orelse return .dropped;
-                    self.touch();
-                    self.removeAt(idx);
+                    self.removeAt(idx) catch return .out_of_memory;
                 },
                 .suppress => |e| {
+                    // `prev` is the flag before the edit; a replica that
+                    // already shows the new flag has nothing to do.
                     const idx = self.indexOf(e.id) orelse return .dropped;
                     const prev_flag = self.list.items[idx].suppressed;
-                    if (prev_flag == e.prev) return .dropped;
+                    if (prev_flag != e.prev) return .dropped;
                     self.touch();
                     self.journal.record(.{ .suppress = .{ .id = e.id, .prev = prev_flag } });
                     self.list.items[idx].suppressed = !e.prev;
                     self.invalidate(idx);
                 },
                 .move => |e| {
-                    if (self.indexOf(e.id) == null) return .dropped;
-                    if (self.list.items.len == 0) return .dropped;
-                    const from = self.indexOf(e.id).?;
+                    const from = self.indexOf(e.id) orelse return .dropped;
                     const to = @min(e.to, @as(u32, @intCast(self.list.items.len - 1)));
                     if (from == to) return .dropped;
-                    self.touch();
                     // Boundary fixups are computed from the local state, not
                     // taken from the remote entry.
-                    const gfixes = self.reanchorGroupBoundaries(e.id, from, null) catch @as([]annotations.GroupFix, &.{});
+                    const gfixes = self.planGroupReanchor(e.id, from, null) catch return .out_of_memory;
+                    self.touch();
+                    self.ann.applyGroupFixesForward(gfixes);
                     self.journal.record(.{ .move = .{
                         .id = e.id,
                         .from = from,
@@ -1216,67 +1300,89 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .name_set => |e| {
                     if (self.indexOf(e.id) == null) return .dropped;
-                    const old = self.ann.nameOf(e.id);
-                    const old_snap: ?[]const u8 = if (old) |o| self.gpa.dupe(u8, o) catch null else null;
-                    self.ann.setName(e.id, e.new) catch return .dropped;
-                    const new_snap: ?[]const u8 = if (e.new) |n| self.gpa.dupe(u8, n) catch null else null;
+                    const old_snap: ?[]const u8 = if (self.ann.nameOf(e.id)) |o| (self.gpa.dupe(u8, o) catch return .out_of_memory) else null;
+                    const new_snap: ?[]const u8 = if (e.new) |n| (self.gpa.dupe(u8, n) catch {
+                        if (old_snap) |o| self.gpa.free(o);
+                        return .out_of_memory;
+                    }) else null;
+                    self.ann.setName(e.id, e.new) catch {
+                        if (old_snap) |o| self.gpa.free(o);
+                        if (new_snap) |n| self.gpa.free(n);
+                        return .out_of_memory;
+                    };
                     self.journal.record(.{ .name_set = .{ .id = e.id, .old = old_snap, .new = new_snap } });
                     self.annTouch();
                 },
                 .tag_add => |e| {
                     if (self.indexOf(e.id) == null) return .dropped;
-                    const added = self.ann.addTag(e.id, e.tag) catch return .dropped;
-                    if (added) {
-                        const tag_snap = self.gpa.dupe(u8, e.tag) catch return .dropped;
-                        self.journal.record(.{ .tag_add = .{ .id = e.id, .tag = tag_snap } });
-                    }
+                    if (self.ann.hasTag(e.id, e.tag)) return .dropped;
+                    const tag_snap = self.gpa.dupe(u8, e.tag) catch return .out_of_memory;
+                    _ = self.ann.addTag(e.id, e.tag) catch {
+                        self.gpa.free(tag_snap);
+                        return .out_of_memory;
+                    };
+                    self.journal.record(.{ .tag_add = .{ .id = e.id, .tag = tag_snap } });
                     self.annTouch();
                 },
                 .tag_remove => |e| {
                     if (!self.ann.hasTag(e.id, e.tag)) return .dropped;
-                    _ = self.ann.removeTag(e.id, e.tag);
-                    const tag_snap = self.gpa.dupe(u8, e.tag) catch return .dropped;
-                    self.journal.record(.{ .tag_remove = .{ .id = e.id, .tag = tag_snap } });
+                    const tag_snap = self.gpa.dupe(u8, e.tag) catch return .out_of_memory;
+                    const at = self.ann.removeTag(e.id, e.tag).?; // present: checked above
+                    self.journal.record(.{ .tag_remove = .{ .id = e.id, .tag = tag_snap, .at = at } });
                     self.annTouch();
                 },
                 .chapter_add => |e| {
                     if (self.ann.chapterById(e.chapter.id) != null) return .dropped;
-                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch return .dropped;
+                    const name_snap = self.gpa.dupe(u8, e.chapter.name) catch return .out_of_memory;
+                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch {
+                        self.gpa.free(name_snap);
+                        return .out_of_memory;
+                    };
                     self.journal.record(.{ .chapter_add = .{ .chapter = .{
                         .id = e.chapter.id,
-                        .name = self.gpa.dupe(u8, e.chapter.name) catch return .dropped,
+                        .name = name_snap,
                         .mark = e.chapter.mark,
                     } } });
                     self.annTouch();
                 },
                 .chapter_remove => |e| {
                     if (self.ann.chapterById(e.chapter.id) == null) return .dropped;
-                    self.ann.removeChapter(e.chapter.id);
+                    const name_snap = self.gpa.dupe(u8, e.chapter.name) catch return .out_of_memory;
+                    const at = self.ann.removeChapter(e.chapter.id).?;
                     self.journal.record(.{ .chapter_remove = .{ .chapter = .{
                         .id = e.chapter.id,
-                        .name = self.gpa.dupe(u8, e.chapter.name) catch return .dropped,
+                        .name = name_snap,
                         .mark = e.chapter.mark,
-                    } } });
+                    }, .at = at } });
                     self.annTouch();
                 },
                 .chapter_rename => |e| {
                     const c = self.ann.chapterById(e.id) orelse return .dropped;
-                    const old_snap = self.gpa.dupe(u8, c.name) catch return .dropped;
-                    self.ann.renameChapter(e.id, e.new) catch return .dropped;
-                    const new_snap = self.gpa.dupe(u8, e.new) catch return .dropped;
+                    const old_snap = self.gpa.dupe(u8, c.name) catch return .out_of_memory;
+                    const new_snap = self.gpa.dupe(u8, e.new) catch {
+                        self.gpa.free(old_snap);
+                        return .out_of_memory;
+                    };
+                    self.ann.renameChapter(e.id, e.new) catch {
+                        self.gpa.free(old_snap);
+                        self.gpa.free(new_snap);
+                        return .out_of_memory;
+                    };
                     self.journal.record(.{ .chapter_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
                     self.annTouch();
                 },
                 .group_add => |e| {
                     if (self.ann.groupById(e.group.id) != null) return .dropped;
-                    if (self.indexOf(e.group.first) == null and self.indexOf(e.group.last) == null and e.group.first != e.group.last) {
-                        // Span anchors unknown here: keep the folder empty
-                        // (dead anchors) rather than dropping the group.
-                    }
-                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch return .dropped;
+                    // Unknown anchors keep the folder empty (dead anchors)
+                    // rather than dropping the group.
+                    const name_snap = self.gpa.dupe(u8, e.group.name) catch return .out_of_memory;
+                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch {
+                        self.gpa.free(name_snap);
+                        return .out_of_memory;
+                    };
                     self.journal.record(.{ .group_add = .{ .group = .{
                         .id = e.group.id,
-                        .name = self.gpa.dupe(u8, e.group.name) catch return .dropped,
+                        .name = name_snap,
                         .first = e.group.first,
                         .last = e.group.last,
                     } } });
@@ -1284,41 +1390,48 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .group_remove => |e| {
                     if (self.ann.groupById(e.group.id) == null) return .dropped;
-                    self.ann.removeGroup(e.group.id);
+                    const name_snap = self.gpa.dupe(u8, e.group.name) catch return .out_of_memory;
+                    const at = self.ann.removeGroup(e.group.id).?;
                     self.journal.record(.{ .group_remove = .{ .group = .{
                         .id = e.group.id,
-                        .name = self.gpa.dupe(u8, e.group.name) catch return .dropped,
+                        .name = name_snap,
                         .first = e.group.first,
                         .last = e.group.last,
-                    } } });
+                    }, .at = at } });
                     self.annTouch();
                 },
                 .group_rename => |e| {
                     const g = self.ann.groupById(e.id) orelse return .dropped;
-                    const old_snap = self.gpa.dupe(u8, g.name) catch return .dropped;
-                    self.ann.renameGroup(e.id, e.new) catch return .dropped;
-                    const new_snap = self.gpa.dupe(u8, e.new) catch return .dropped;
+                    const old_snap = self.gpa.dupe(u8, g.name) catch return .out_of_memory;
+                    const new_snap = self.gpa.dupe(u8, e.new) catch {
+                        self.gpa.free(old_snap);
+                        return .out_of_memory;
+                    };
+                    self.ann.renameGroup(e.id, e.new) catch {
+                        self.gpa.free(old_snap);
+                        self.gpa.free(new_snap);
+                        return .out_of_memory;
+                    };
                     self.journal.record(.{ .group_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
                     self.annTouch();
                 },
                 .param_add => |e| {
                     if (self.ptab.byId(e.id) != null) return .dropped;
-                    self.ptab.add(e.id, e.name, e.value) catch return .dropped;
-                    self.journal.record(.{ .param_add = .{
-                        .id = e.id,
-                        .name = self.gpa.dupe(u8, e.name) catch return .dropped,
-                        .value = e.value,
-                    } });
+                    const name_snap = self.gpa.dupe(u8, e.name) catch return .out_of_memory;
+                    self.ptab.add(e.id, e.name, e.value) catch |err| {
+                        self.gpa.free(name_snap);
+                        return if (err == error.OutOfMemory) .out_of_memory else .dropped;
+                    };
+                    self.journal.record(.{ .param_add = .{ .id = e.id, .name = name_snap, .value = e.value } });
                 },
                 .param_remove => |e| {
-                    if (self.ptab.byId(e.id) == null) return .dropped;
+                    // Undo restores the local value, which a concurrent set
+                    // may have changed since the sender looked.
+                    const local = self.ptab.byId(e.id) orelse return .dropped;
+                    const name_snap = self.gpa.dupe(u8, local.name) catch return .out_of_memory;
                     self.touch();
-                    _ = self.ptab.remove(e.id);
-                    self.journal.record(.{ .param_remove = .{
-                        .id = e.id,
-                        .name = self.gpa.dupe(u8, e.name) catch return .dropped,
-                        .value = e.value,
-                    } });
+                    const at = self.ptab.remove(e.id).?;
+                    self.journal.record(.{ .param_remove = .{ .id = e.id, .name = name_snap, .value = local.value, .at = at } });
                     self.invalidateReferencing(e.id);
                 },
                 .param_set => |e| {
@@ -1331,9 +1444,16 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .param_rename => |e| {
                     const current = self.ptab.byId(e.id) orelse return .dropped;
-                    const old_snap = self.gpa.dupe(u8, current.name) catch return .dropped;
-                    _ = self.ptab.rename(e.id, e.new) catch false;
-                    const new_snap = self.gpa.dupe(u8, e.new) catch return .dropped;
+                    const old_snap = self.gpa.dupe(u8, current.name) catch return .out_of_memory;
+                    const new_snap = self.gpa.dupe(u8, e.new) catch {
+                        self.gpa.free(old_snap);
+                        return .out_of_memory;
+                    };
+                    _ = self.ptab.rename(e.id, e.new) catch {
+                        self.gpa.free(old_snap);
+                        self.gpa.free(new_snap);
+                        return .out_of_memory;
+                    };
                     self.journal.record(.{ .param_rename = .{ .id = e.id, .old = old_snap, .new = new_snap } });
                 },
             }
@@ -1402,8 +1522,18 @@ pub fn Timeline(comptime Domain: type) type {
             else
                 null;
 
+            const mark = self.journal.undoEntryCount();
+            const saved_next_id = self.next_id;
             self.beginTransaction();
             defer self.endTransaction();
+            return self.cherryPickSteps(src, id, op, meta, suppressed, opts) catch |err| {
+                self.rollbackTo(mark);
+                self.next_id = saved_next_id; // the unwound feature's id is free again
+                return err;
+            };
+        }
+
+        fn cherryPickSteps(self: *Self, src: *const Self, id: ft.FeatureId, op: Op, meta: ?ft.Meta, suppressed: bool, opts: CherryPickOptions) error{ OutOfMemory, UnknownFeature }!ft.FeatureId {
             const new_id = try self.commitInner(op, meta);
             if (opts.annotations) {
                 if (src.featureName(id)) |n| try self.setFeatureName(new_id, n);
@@ -1516,8 +1646,8 @@ pub fn Timeline(comptime Domain: type) type {
             return out;
         }
 
-        fn reverse(self: *Self, entry: journaling.Journal(Op).Entry) void {
-            switch (entry) {
+        fn reverse(self: *Self, entry: *journaling.Journal(Op).Entry) void {
+            switch (entry.*) {
                 .commit => |e| {
                     const idx = self.indexOf(e.id) orelse return;
                     // LIFO has already unwound any annotations journaled
@@ -1536,34 +1666,29 @@ pub fn Timeline(comptime Domain: type) type {
                     self.list.items[idx].op = e.old_op;
                     self.invalidate(idx);
                 },
-                .remove => |e| {
+                .remove => |*e| {
+                    // Needs no memory: the removal left free slots in the
+                    // list, the index, and the annotation maps.
                     self.listInsert(e.at, .{
                         .id = e.id,
                         .op = e.op,
                         .suppressed = e.suppressed,
+                        .order = e.order,
                     }) catch return;
                     self.afterInsert(e.at);
                     self.marker_pos = @min(e.marker_pre, @as(u32, @intCast(self.list.items.len)));
-                    // Restore the snapshot annotations exactly.
-                    if (e.name) |n| self.ann.setName(e.id, n) catch {};
+                    // The snapshot annotations move back in; redo takes them again.
+                    if (e.name) |n| {
+                        e.name = null;
+                        self.ann.giveName(e.id, n) catch {};
+                    }
                     if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     self.ann.applyFixes(e.chapter_fixes);
                     self.ann.applyGroupFixes(e.group_fixes);
-                    if (e.tags.len > 0) {
-                        var restore: std.ArrayList([]const u8) = .empty;
-                        for (e.tags) |t| {
-                            if (self.gpa.dupe(u8, t) catch null) |d| {
-                                restore.append(self.gpa, d) catch self.gpa.free(d);
-                            }
-                        }
-                        const owned = restore.toOwnedSlice(self.gpa) catch @as([][]const u8, &.{});
-                        if (self.ann.giveTags(e.id, owned)) |_| {
-                            // Strings transferred to the map; free the
-                            // temporary pointer slice.
-                            self.gpa.free(owned);
-                        } else |_| {
-                            self.ann.freeTags(owned);
-                        }
+                    if (e.tags.items.len > 0) {
+                        const list = e.tags;
+                        e.tags = .empty;
+                        self.ann.giveTagList(e.id, list) catch {};
                     }
                     self.annTouch();
                 },
@@ -1589,15 +1714,15 @@ pub fn Timeline(comptime Domain: type) type {
                     self.annTouch();
                 },
                 .tag_remove => |e| {
-                    _ = self.ann.addTag(e.id, e.tag) catch {};
+                    _ = self.ann.insertTagAt(e.id, e.tag, e.at) catch {};
                     self.annTouch();
                 },
                 .group_add => |e| {
-                    self.ann.removeGroup(e.group.id);
+                    _ = self.ann.removeGroup(e.group.id);
                     self.annTouch();
                 },
                 .group_remove => |e| {
-                    self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch {};
+                    self.ann.insertGroupAt(e.group.id, e.group.name, e.group.first, e.group.last, e.at) catch {};
                     self.annTouch();
                 },
                 .group_rename => |e| {
@@ -1608,7 +1733,7 @@ pub fn Timeline(comptime Domain: type) type {
                     _ = self.ptab.remove(e.id);
                 },
                 .param_remove => |e| {
-                    self.ptab.add(e.id, e.name, e.value) catch {};
+                    self.ptab.insertAt(e.id, e.name, e.value, e.at) catch {};
                     self.invalidateReferencing(e.id);
                 },
                 .param_set => |e| {
@@ -1619,11 +1744,11 @@ pub fn Timeline(comptime Domain: type) type {
                     _ = self.ptab.rename(e.id, e.old) catch false;
                 },
                 .chapter_add => |e| {
-                    self.ann.removeChapter(e.chapter.id);
+                    _ = self.ann.removeChapter(e.chapter.id);
                     self.annTouch();
                 },
                 .chapter_remove => |e| {
-                    self.ann.addChapter(e.chapter.id, e.chapter.name, e.chapter.mark) catch {};
+                    self.ann.insertChapterAt(e.chapter.id, e.chapter.name, e.chapter.mark, e.at) catch {};
                     self.annTouch();
                 },
                 .chapter_rename => |e| {
@@ -1633,8 +1758,8 @@ pub fn Timeline(comptime Domain: type) type {
             }
         }
 
-        fn forward(self: *Self, entry: journaling.Journal(Op).Entry) void {
-            switch (entry) {
+        fn forward(self: *Self, entry: *journaling.Journal(Op).Entry) void {
+            switch (entry.*) {
                 .commit => |e| {
                     self.listInsert(e.at, .{ .id = e.id, .op = e.op, .order = e.order }) catch return;
                     self.afterInsert(e.at);
@@ -1646,16 +1771,14 @@ pub fn Timeline(comptime Domain: type) type {
                     self.list.items[idx].op = e.new_op;
                     self.invalidate(idx);
                 },
-                .remove => |e| {
+                .remove => |*e| {
                     const idx = self.indexOf(e.id) orelse return;
-                    const replacement: ?ft.FeatureId = if (idx + 1 < self.list.items.len)
-                        self.list.items[idx + 1].id
-                    else
-                        null;
-                    const fixes = self.ann.reanchorAfterRemove(e.id, replacement) catch @as([]annotations.ChapterFix, &.{});
-                    self.gpa.free(fixes); // the entry keeps the originals
+                    self.ann.applyFixesForward(e.chapter_fixes);
                     self.ann.applyGroupFixesForward(e.group_fixes);
-                    self.ann.removeFeature(e.id); // frees name/tags
+                    // The name and tags return to the entry for the next undo.
+                    e.name = self.ann.takeName(e.id);
+                    e.tags = self.ann.takeTagList(e.id);
+                    self.ann.removeFeature(e.id); // provenance
                     self.resetStatuses(idx);
                     _ = self.listRemove(idx);
                     self.marker_pos = if (e.at < e.marker_pre) e.marker_pre - 1 else e.marker_pre;
@@ -1685,15 +1808,15 @@ pub fn Timeline(comptime Domain: type) type {
                     self.annTouch();
                 },
                 .group_add => |e| {
-                    self.ann.removeGroup(e.group.id);
-                    self.annTouch();
-                },
-                .group_remove => |e| {
                     self.ann.addGroup(e.group.id, e.group.name, e.group.first, e.group.last) catch {};
                     self.annTouch();
                 },
+                .group_remove => |e| {
+                    _ = self.ann.removeGroup(e.group.id);
+                    self.annTouch();
+                },
                 .group_rename => |e| {
-                    self.ann.renameGroup(e.id, e.old) catch {};
+                    self.ann.renameGroup(e.id, e.new) catch {};
                     self.annTouch();
                 },
                 .param_add => |e| {
@@ -1716,7 +1839,7 @@ pub fn Timeline(comptime Domain: type) type {
                     self.annTouch();
                 },
                 .chapter_remove => |e| {
-                    self.ann.removeChapter(e.chapter.id);
+                    _ = self.ann.removeChapter(e.chapter.id);
                     self.annTouch();
                 },
                 .chapter_rename => |e| {
@@ -1726,18 +1849,19 @@ pub fn Timeline(comptime Domain: type) type {
             }
         }
 
-        /// Re-anchor group boundaries when the member at `idx` leaves its
-        /// position (removed, or moved elsewhere): the second member becomes
-        /// `first`, the predecessor becomes `last`. A folder whose only
-        /// member leaves keeps that member as both anchors — removed, the
-        /// anchors go dead (empty folder); moved, the folder travels with it.
-        /// `exempt` (the folder `moveGroup` is relocating) is left alone.
-        /// Returns the fixes needed to undo and redo this exactly; groups
-        /// whose anchors did not change are not reported.
-        fn reanchorGroupBoundaries(self: *Self, leaving_id: ft.FeatureId, idx: u32, exempt: ?ft.annotations.GroupId) error{OutOfMemory}![]annotations.GroupFix {
+        /// Plan the re-anchoring of group boundaries when the member at
+        /// `idx` leaves its position (removed, or moved elsewhere): the
+        /// second member becomes `first`, the predecessor becomes `last`. A
+        /// folder whose only member leaves keeps that member as both anchors
+        /// — removed, the anchors go dead (empty folder); moved, the folder
+        /// travels with it. `exempt` (the folder `moveGroup` is relocating)
+        /// is left alone. Pure: nothing changes until
+        /// `applyGroupFixesForward`. Groups whose anchors would not change
+        /// are not reported.
+        fn planGroupReanchor(self: *const Self, leaving_id: ft.FeatureId, idx: u32, exempt: ?ft.annotations.GroupId) error{OutOfMemory}![]annotations.GroupFix {
             var fixes: std.ArrayList(annotations.GroupFix) = .empty;
             errdefer fixes.deinit(self.gpa);
-            for (self.ann.groupsMut()) |*g| {
+            for (self.ann.groupList()) |g| {
                 if (exempt) |x| {
                     if (g.id == x) continue;
                 }
@@ -1745,21 +1869,21 @@ pub fn Timeline(comptime Domain: type) type {
                 const at_first = idx == span.lo;
                 const at_last = idx == span.hi;
                 if (!at_first and !at_last) continue;
-                const old_first = g.first;
-                const old_last = g.last;
+                var new_first = g.first;
+                var new_last = g.last;
                 if (at_first) {
-                    g.first = if (span.lo + 1 <= span.hi) self.list.items[span.lo + 1].id else leaving_id;
+                    new_first = if (span.lo + 1 <= span.hi) self.list.items[span.lo + 1].id else leaving_id;
                 }
                 if (at_last) {
-                    g.last = if (span.hi >= span.lo + 1) self.list.items[span.hi - 1].id else leaving_id;
+                    new_last = if (span.hi >= span.lo + 1) self.list.items[span.hi - 1].id else leaving_id;
                 }
-                if (g.first == old_first and g.last == old_last) continue;
+                if (new_first == g.first and new_last == g.last) continue;
                 try fixes.append(self.gpa, .{
                     .group_id = g.id,
-                    .old_first = old_first,
-                    .old_last = old_last,
-                    .new_first = g.first,
-                    .new_last = g.last,
+                    .old_first = g.first,
+                    .old_last = g.last,
+                    .new_first = new_first,
+                    .new_last = new_last,
                 });
             }
             return fixes.toOwnedSlice(self.gpa);
@@ -3617,8 +3741,8 @@ test "sync: wire codec round-trips a remove entry with annotations" {
     defer syncing.deinit(ParamDomain.Op, gpa, &env);
     try std.testing.expectEqual(a, env.entry.remove.id);
     try std.testing.expectEqualStrings("gone", env.entry.remove.name.?);
-    try std.testing.expectEqual(@as(usize, 1), env.entry.remove.tags.len);
-    try std.testing.expectEqualStrings("core", env.entry.remove.tags[0]);
+    try std.testing.expectEqual(@as(usize, 1), env.entry.remove.tags.items.len);
+    try std.testing.expectEqualStrings("core", env.entry.remove.tags.items[0]);
     try std.testing.expectEqual(@as(usize, 1), env.entry.remove.chapter_fixes.len);
 }
 

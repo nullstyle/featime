@@ -39,6 +39,7 @@ pub const Chapter = struct {
 pub const ChapterFix = struct {
     chapter_id: ChapterId,
     old_mark: Mark,
+    new_mark: Mark,
 };
 
 pub const GroupId = u64;
@@ -107,9 +108,13 @@ pub const Annotations = struct {
         return self.names.get(id);
     }
 
+    /// Atomic: allocates first, so an allocation failure keeps the old name.
     pub fn setName(self: *Self, id: ft.FeatureId, new: ?[]const u8) error{OutOfMemory}!void {
+        const owned: ?[]const u8 = if (new) |n| try self.gpa.dupe(u8, n) else null;
+        errdefer if (owned) |o| self.gpa.free(o);
+        if (owned != null) try self.names.ensureUnusedCapacity(self.gpa, 1);
         if (self.names.fetchRemove(id)) |old| self.gpa.free(old.value);
-        if (new) |n| try self.names.put(self.gpa, id, try self.gpa.dupe(u8, n));
+        if (owned) |o| self.names.putAssumeCapacity(id, o);
     }
 
     /// Move a feature's name out of the store (ownership transfers to the
@@ -121,9 +126,10 @@ pub const Annotations = struct {
 
     /// Store an already-owned name string (ownership transfers in).
     pub fn giveName(self: *Self, id: ft.FeatureId, owned: []const u8) error{OutOfMemory}!void {
-        if (self.names.fetchRemove(id)) |old| self.gpa.free(old.value);
         errdefer self.gpa.free(owned);
-        try self.names.put(self.gpa, id, owned);
+        try self.names.ensureUnusedCapacity(self.gpa, 1);
+        if (self.names.fetchRemove(id)) |old| self.gpa.free(old.value);
+        self.names.putAssumeCapacity(id, owned);
     }
 
     // -- provenance --------------------------------------------------------
@@ -150,21 +156,30 @@ pub const Annotations = struct {
     }
 
     pub fn addChapter(self: *Self, id: ChapterId, chapter_name: []const u8, mark: Mark) error{OutOfMemory}!void {
-        try self.chapters.append(self.gpa, .{
-            .id = id,
-            .name = try self.gpa.dupe(u8, chapter_name),
-            .mark = mark,
-        });
+        const owned = try self.gpa.dupe(u8, chapter_name);
+        errdefer self.gpa.free(owned);
+        try self.chapters.append(self.gpa, .{ .id = id, .name = owned, .mark = mark });
     }
 
-    pub fn removeChapter(self: *Self, id: ChapterId) void {
+    /// Remove a chapter. Returns the position it held, or null if absent.
+    pub fn removeChapter(self: *Self, id: ChapterId) ?u32 {
         for (self.chapters.items, 0..) |c, i| {
             if (c.id == id) {
                 const dead = self.chapters.orderedRemove(i);
                 self.gpa.free(dead.name);
-                return;
+                return @intCast(i);
             }
         }
+        return null;
+    }
+
+    /// Put a chapter back at position `at` (clamped), so undo restores the
+    /// creation order.
+    pub fn insertChapterAt(self: *Self, id: ChapterId, chapter_name: []const u8, mark: Mark, at: u32) error{OutOfMemory}!void {
+        const owned = try self.gpa.dupe(u8, chapter_name);
+        errdefer self.gpa.free(owned);
+        const pos: usize = @min(at, self.chapters.items.len);
+        try self.chapters.insert(self.gpa, pos, .{ .id = id, .name = owned, .mark = mark });
     }
 
     pub fn renameChapter(self: *Self, id: ChapterId, new_name: []const u8) error{OutOfMemory}!void {
@@ -181,27 +196,33 @@ pub const Annotations = struct {
         return null;
     }
 
-    /// Re-anchor chapters whose mark sits after `removed_id` to the feature
-    /// that shifted into its position (`replacement`, or end-pinned if it was
-    /// the last feature). Returns the fixes needed to undo this exactly;
-    /// caller owns the slice.
-    pub fn reanchorAfterRemove(self: *Self, removed_id: ft.FeatureId, replacement: ?ft.FeatureId) error{OutOfMemory}![]ChapterFix {
+    /// Plan the re-anchoring of chapters whose mark sits after `removed_id`
+    /// to the feature that shifts into its position (`replacement`, or
+    /// end-pinned if it was the last feature). Pure: nothing changes until
+    /// `applyFixesForward`. Caller owns the slice.
+    pub fn planReanchorAfterRemove(self: *const Self, removed_id: ft.FeatureId, replacement: ?ft.FeatureId) error{OutOfMemory}![]ChapterFix {
         var fixes: std.ArrayList(ChapterFix) = .empty;
         errdefer fixes.deinit(self.gpa);
-        for (self.chapters.items) |*c| {
+        for (self.chapters.items) |c| {
             const anchored_here = if (c.mark.after) |a| a == removed_id else false;
             if (anchored_here) {
-                try fixes.append(self.gpa, .{ .chapter_id = c.id, .old_mark = c.mark });
-                c.mark = .{ .after = replacement };
+                try fixes.append(self.gpa, .{ .chapter_id = c.id, .old_mark = c.mark, .new_mark = .{ .after = replacement } });
             }
         }
         return fixes.toOwnedSlice(self.gpa);
     }
 
-    /// Restore marks recorded by `reanchorAfterRemove`.
+    /// Restore the marks recorded by a plan (undo).
     pub fn applyFixes(self: *Self, fixes: []const ChapterFix) void {
         for (fixes) |f| {
             if (self.mutableChapter(f.chapter_id)) |c| c.mark = f.old_mark;
+        }
+    }
+
+    /// Apply the marks a plan computed (do / redo).
+    pub fn applyFixesForward(self: *Self, fixes: []const ChapterFix) void {
+        for (fixes) |f| {
+            if (self.mutableChapter(f.chapter_id)) |c| c.mark = f.new_mark;
         }
     }
 
@@ -220,19 +241,36 @@ pub const Annotations = struct {
         return false;
     }
 
+    /// Put a tag back at position `at` (clamped), so undo restores the
+    /// exact order. No-op if already present. Returns true when added.
+    pub fn insertTagAt(self: *Self, id: ft.FeatureId, tag: []const u8, at: u32) error{OutOfMemory}!bool {
+        if (self.hasTag(id, tag)) return false;
+        const owned = try self.gpa.dupe(u8, tag);
+        errdefer self.gpa.free(owned);
+        const gop = try self.tags.getOrPut(self.gpa, id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        const pos: usize = @min(at, gop.value_ptr.items.len);
+        try gop.value_ptr.insert(self.gpa, pos, owned);
+        return true;
+    }
+
     /// Add a tag (no-op if already present). Returns true when added.
     pub fn addTag(self: *Self, id: ft.FeatureId, tag: []const u8) error{OutOfMemory}!bool {
         if (self.hasTag(id, tag)) return false;
+        const owned = try self.gpa.dupe(u8, tag);
+        errdefer self.gpa.free(owned);
         const gop = try self.tags.getOrPut(self.gpa, id);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(self.gpa, try self.gpa.dupe(u8, tag));
+        // A failed append leaves at most an empty list behind: harmless.
+        try gop.value_ptr.append(self.gpa, owned);
         return true;
     }
 
     /// Remove a tag. Returns true when a tag was removed (the caller
     /// journals the tag string it removed).
-    pub fn removeTag(self: *Self, id: ft.FeatureId, tag: []const u8) bool {
-        const list = self.tags.getPtr(id) orelse return false;
+    /// Remove a tag. Returns the position it held, or null if absent.
+    pub fn removeTag(self: *Self, id: ft.FeatureId, tag: []const u8) ?u32 {
+        const list = self.tags.getPtr(id) orelse return null;
         for (list.items, 0..) |t, i| {
             if (std.mem.eql(u8, t, tag)) {
                 const dead = list.orderedRemove(i);
@@ -241,39 +279,36 @@ pub const Annotations = struct {
                     list.deinit(self.gpa);
                     _ = self.tags.remove(id);
                 }
-                return true;
+                return @intCast(i);
             }
         }
-        return false;
+        return null;
     }
 
     /// Move all of a feature's tags out (ownership transfers to the caller);
     /// used when deleting the feature so undo can restore them.
-    pub fn takeTags(self: *Self, id: ft.FeatureId) error{OutOfMemory}![][]const u8 {
-        var list = self.tags.fetchRemove(id) orelse return &.{};
-        const out = try self.gpa.dupe([]const u8, list.value.items);
-        errdefer self.gpa.free(out);
-        list.value.deinit(self.gpa); // frees the ArrayList buffer; strings move
-        return out;
+    /// Take a feature's whole tag list out (ownership moves; no allocation).
+    pub fn takeTagList(self: *Self, id: ft.FeatureId) std.ArrayList([]const u8) {
+        const kv = self.tags.fetchRemove(id) orelse return .empty;
+        return kv.value;
     }
 
     /// Store already-owned tag strings for a feature (ownership transfers
     /// in). Replaces any existing tags.
-    pub fn giveTags(self: *Self, id: ft.FeatureId, owned: [][]const u8) error{OutOfMemory}!void {
-        var list: std.ArrayList([]const u8) = .empty;
-        errdefer list.deinit(self.gpa);
-        try list.appendSlice(self.gpa, owned);
-        if (self.tags.getPtr(id)) |old| {
-            for (old.items) |t| self.gpa.free(t);
-            old.deinit(self.gpa);
+    pub fn giveTagList(self: *Self, id: ft.FeatureId, list: std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        var incoming = list;
+        errdefer {
+            for (incoming.items) |t| self.gpa.free(t);
+            incoming.deinit(self.gpa);
         }
-        try self.tags.put(self.gpa, id, list);
-    }
-
-    /// Free an owned tag array (the strings and the slice).
-    pub fn freeTags(self: *Self, owned: [][]const u8) void {
-        for (owned) |t| self.gpa.free(@constCast(t));
-        self.gpa.free(owned);
+        // No growth when the slot was freed by `takeTagList`.
+        try self.tags.ensureUnusedCapacity(self.gpa, 1);
+        if (self.tags.fetchRemove(id)) |old| {
+            var dead = old.value;
+            for (dead.items) |t| self.gpa.free(t);
+            dead.deinit(self.gpa);
+        }
+        self.tags.putAssumeCapacity(id, incoming);
     }
 
     // -- groups ----------------------------------------------------------------
@@ -295,22 +330,30 @@ pub const Annotations = struct {
     }
 
     pub fn addGroup(self: *Self, id: GroupId, name: []const u8, first: ft.FeatureId, last: ft.FeatureId) error{OutOfMemory}!void {
-        try self.groups.append(self.gpa, .{
-            .id = id,
-            .name = try self.gpa.dupe(u8, name),
-            .first = first,
-            .last = last,
-        });
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        try self.groups.append(self.gpa, .{ .id = id, .name = owned, .first = first, .last = last });
     }
 
-    pub fn removeGroup(self: *Self, id: GroupId) void {
+    /// Remove a group. Returns the position it held, or null if absent.
+    pub fn removeGroup(self: *Self, id: GroupId) ?u32 {
         for (self.groups.items, 0..) |g, i| {
             if (g.id == id) {
                 const dead = self.groups.orderedRemove(i);
                 self.gpa.free(dead.name);
-                return;
+                return @intCast(i);
             }
         }
+        return null;
+    }
+
+    /// Put a group back at position `at` (clamped), so undo restores the
+    /// creation order.
+    pub fn insertGroupAt(self: *Self, id: GroupId, name: []const u8, first: ft.FeatureId, last: ft.FeatureId, at: u32) error{OutOfMemory}!void {
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        const pos: usize = @min(at, self.groups.items.len);
+        try self.groups.insert(self.gpa, pos, .{ .id = id, .name = owned, .first = first, .last = last });
     }
 
     pub fn renameGroup(self: *Self, id: GroupId, new_name: []const u8) error{OutOfMemory}!void {

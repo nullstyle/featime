@@ -12,12 +12,14 @@ single comptime generic, `Timeline(Domain)`, fully type-checked at compile
 time.
 
 ```sh
-zig build test   # unit + differential tests
+zig build test   # unit, differential, out-of-memory and fuzz tests
 zig build run    # terrain-editor demo exercising every capability
+zig build docs   # API reference into zig-out/docs
 ```
 
-CI runs the same on Linux and macOS (`.github/workflows/ci.yml`): fmt check,
-tests in Debug / ReleaseSafe / ReleaseFast, the examples, and the demo.
+CI runs the same on Linux, macOS and Windows (`.github/workflows/ci.yml`):
+fmt check, tests in Debug / ReleaseSafe / ReleaseFast, the examples, the
+demo, the benchmark and the docs.
 
 Requires Zig `0.17.0` (pinned via `mise`).
 
@@ -241,8 +243,9 @@ through a file when replicas disagree.
 
 **Sequencing.** `applyRemote` answers `.applied`, `.dropped` (unknown ids,
 a no-op, or a commit already present), `.duplicate`, `.gap` (not applied:
-fetch from `expectedSeq(origin)` first) or `.own` (an echo of this
-replica's envelope). `seq == 0` skips the check; `acknowledge(origin, seq)`
+fetch from `expectedSeq(origin)` first), `.own` (an echo of this replica's
+envelope) or `.out_of_memory` (nothing applied, the sequence still
+expected: deliver the same envelope again later). `seq == 0` skips the check; `acknowledge(origin, seq)`
 resets expectations after a resync by other means. Containers persist the
 per-origin bookkeeping and the order keys.
 
@@ -279,7 +282,9 @@ nothing; an unbalanced `endTransaction` is a no-op. The library's own group
 operations (batch suppression, `moveGroup`, `removeGroupContents`) are built
 as transactions over simple entries — there are no special compound journal
 kinds. Journal eviction below `max_journal` removes whole units only, so
-undo boundaries survive memory pressure.
+undo boundaries survive memory pressure. If a call inside your own
+transaction fails, the calls before it stay applied; one `undo` rewinds
+them.
 
 ## History
 
@@ -320,6 +325,20 @@ iterate before the next edit.
   teammate removed the feature) surfaces instead of silently doing nothing.
   Setting a flag or value to what it already is remains a no-op that
   journals nothing and leaves in-flight background jobs valid.
+- **Out of memory leaves the timeline as it was.** Every mutator allocates
+  what it needs before it changes anything (the journal reserves its slot
+  first), so `error.OutOfMemory` means nothing happened; call again later.
+  The multi-step edits (`moveGroup`, `removeGroupContents`, `cherryPick`)
+  unwind what they had done, and the unwinding needs no memory. `undo` and
+  `redo` never fail: the structure always comes back, a removed feature's
+  name and tags come back without allocating, and only the text of an
+  annotation edit (a name, a tag, a chapter or group name) may be missing
+  if memory is exhausted at that moment. Two limits: with `max_journal = 0`
+  there is no journal to unwind a multi-step edit, so it stays partially
+  applied (the error still reports it); and if a record observer is
+  attached, the steps already emitted stay on the feed, like an `undo` —
+  `structureDigest` shows the divergence. `tests/oom.zig` checks all of
+  this with an allocator that fails at every possible point.
 - **Soft failure.** `return ctx.fail("edge {d} gone", .{e})` records a failed
   status and the rebuild *continues* — a failed fillet doesn't hide the
   extrudes after it. `apply` must leave the document unmodified on this path.
@@ -496,6 +515,14 @@ and globe rollback leaving the region untouched.
   statuses, annotations, parameters, and undo/redo availability after
   *every* step. This is the primary net for cache-invalidation, anchor, and
   journal bugs.
+- `tests/oom.zig` is an out-of-memory sweep: every local mutator, every
+  remote entry kind, `load` and `save` run once per allocation index with
+  that allocation failing (`std.testing.FailingAllocator`). After a failure
+  the state must be unchanged, the retried call must match a clean run,
+  and undo and redo must still work.
+- `tests/fuzz.zig` feeds arbitrary bytes to `persistence.load` and to
+  `sync.decode` + `applyRemote`. `zig build test` runs the corpus once;
+  `zig build test --fuzz` keeps generating inputs.
 - `src/main.zig` is a terrain-editor demo that exercises every capability
   end-to-end (`zig build run`).
 - `zig build bench` runs the benchmark suite (always ReleaseFast) at 1k,
@@ -514,11 +541,14 @@ src/journal.zig    undo/redo journal (internal)
 src/annotations.zig names, tags, chapters, groups, provenance store (internal)
 src/params.zig     parameter table (internal)
 src/sync.zig       journal entries as a wire format: encode / decode
-src/persistence.zig save/load container format (FTZ3)
+src/persistence.zig save/load container format (FTZ5; FTZ1–4 still load)
 src/nested_demo.zig two-level globe/region demo (hierarchical timelines)
 src/main.zig       terrain-editor demo
 examples/          focused usage examples (zig build examples)
 tests/oracle.zig   differential tests vs a naive reference model
+tests/oom.zig      out-of-memory sweep (every call, every allocation)
+tests/fuzz.zig     fuzz tests for the decoders (zig build test --fuzz)
+tests/support.zig  shared fixture for the hardening tests
 bench/bench.zig    benchmark suite (zig build bench); BASELINE.md has the numbers
 ```
 

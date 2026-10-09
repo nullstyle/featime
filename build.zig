@@ -5,6 +5,7 @@
 //!   zig build test            unit + differential tests (honors -Doptimize)
 //!   zig build examples        run every usage example; `zig build <name>` runs one
 //!   zig build bench           benchmark suite (always ReleaseFast; -Dbench-max=N caps the size)
+//!   zig build docs            API reference into zig-out/docs
 //!
 //! Consumers import the `featuretree_zig` module:
 //!
@@ -55,10 +56,40 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const test_step = b.step("test", "Run unit and differential tests");
+    // Hardening: the out-of-memory sweep and the fuzz smoke runs
+    // (`zig build test --fuzz` keeps fuzzing).
+    const oom_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/oom.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "featuretree_zig", .module = mod }},
+        }),
+    });
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "featuretree_zig", .module = mod }},
+        }),
+    });
+
+    const test_step = b.step("test", "Run unit, differential, out-of-memory and fuzz tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(demo_tests).step);
     test_step.dependOn(&b.addRunArtifact(oracle_tests).step);
+    test_step.dependOn(&b.addRunArtifact(oom_tests).step);
+    test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
+    // API reference: `zig build docs`, then open zig-out/docs/index.html.
+    const docs_obj = b.addObject(.{ .name = "featuretree_zig", .root_module = mod });
+    const docs_install = b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    b.step("docs", "Generate the API reference into zig-out/docs").dependOn(&docs_install.step);
 
     // Usage examples: small, commented programs that each teach one part of
     // the API. `zig build <name>` runs one; `zig build examples` runs all.

@@ -181,7 +181,7 @@ fn saveUpTo(
     {
         var aw: std.Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
-        try Domain.encodeDoc(&tl.seed_doc, &aw.writer);
+        Domain.encodeDoc(&tl.seed_doc, &aw.writer) catch |err| return scratchError(err);
         try writer.writeInt(u32, @intCast(aw.written().len), .little);
         try writer.writeAll(aw.written());
     }
@@ -194,7 +194,7 @@ fn saveUpTo(
         try writer.writeInt(u64, f.order.origin, .little);
         var aw: std.Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
-        try Domain.encodeOp(f.op, &aw.writer);
+        Domain.encodeOp(f.op, &aw.writer) catch |err| return scratchError(err);
         try writer.writeInt(u32, @intCast(aw.written().len), .little);
         try writer.writeAll(aw.written());
     }
@@ -285,6 +285,12 @@ fn saveUpTo(
         try writer.writeInt(u64, e.value_ptr.author, .little);
         try writer.writeInt(u64, e.value_ptr.ts, .little);
     }
+}
+
+/// An in-memory scratch writer fails only for lack of memory: report that
+/// as `OutOfMemory`, so `WriteFailed` always means the caller's writer.
+pub fn scratchError(err: anyerror) anyerror {
+    return if (err == error.WriteFailed) error.OutOfMemory else err;
 }
 
 fn writeFramed(writer: *std.Io.Writer, bytes: []const u8) !void {
@@ -381,8 +387,7 @@ pub fn load(
             const fr = try framedReader(gpa, reader);
             defer gpa.free(fr.bytes);
             const name_bytes = try gpa.dupe(u8, fr.bytes);
-            errdefer gpa.free(name_bytes);
-            try tl.ann.giveName(fid, name_bytes);
+            try tl.ann.giveName(fid, name_bytes); // owns the bytes, even on failure
         }
 
         const chapter_count = try reader.takeInt(u32, .little);
@@ -412,7 +417,7 @@ pub fn load(
             const fid = try reader.takeInt(u64, .little);
             const fr = try framedReader(gpa, reader);
             defer gpa.free(fr.bytes);
-            _ = tl.ann.addTag(fid, fr.bytes) catch {};
+            _ = try tl.ann.addTag(fid, fr.bytes);
         }
 
         const prov_count = try reader.takeInt(u32, .little);

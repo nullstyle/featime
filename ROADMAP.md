@@ -164,6 +164,29 @@ documented with tests on its edges.
   `Timeline.cherryPick(src, id, opts)`. Merge stays out of scope.
 - **Memory pressure API** — `stats()` and `trim(budget)`.
 
+## Hardening — DELIVERED (unreleased)
+
+- **Out-of-memory policy** — allocate first, then mutate: every mutator
+  either completes or returns `error.OutOfMemory` with nothing changed;
+  the journal reserves its slot before any change; multi-step edits unwind
+  without allocating; `applyRemote` leaves the sequence unacknowledged on
+  `.out_of_memory` so the envelope can be re-delivered. Undo/redo of a
+  removal move the name and tags between journal and annotations instead
+  of copying.
+- **Sweep and fuzz** — `tests/oom.zig` (every call × every allocation
+  index, then retry, undo, redo) and `tests/fuzz.zig` (decoders on
+  arbitrary bytes). The sweep found an inverted remote suppress check,
+  inverted group redo, undo losing list positions and order keys, a
+  use-after-free with `max_journal = 0`, decoder leaks and a load double
+  free.
+- **CI** — Windows added; the mise action pinned by commit; `zig build
+  docs` generates the API reference.
+
+Still open under hardening: undo/redo of annotation *edits* (rename,
+tag add) still copy strings and so can drop the text when memory is
+exhausted at that moment; moving ownership for those too (the pattern
+removals now use) would make undo/redo allocation-free everywhere.
+
 ## Checkpoint placement (partly done)
 
 The benchmark showed that interval checkpoints were cloned at every
@@ -226,6 +249,8 @@ load-bearing), and anything UI-shaped — the library stays headless.
   member carries it along, `moveGroup` relocates the folder as a block; the
   fixups ride the move's journal entry so undo and redo are exact.
 - Unknown ids are errors, never silent no-ops (0.7.0).
+- Out of memory never leaves a half-applied edit: allocate first, then
+  mutate; the journal slot is reserved before the change (unreleased).
 - Sync order model (0.10): a commit carries its predecessor and an order key
   (Lamport clock, origin id); remote placement is RGA-style — after the
   predecessor, past greater keys — so concurrent commits converge. Moves and

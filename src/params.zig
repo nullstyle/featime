@@ -63,11 +63,9 @@ pub const ParamTable = struct {
         for (self.list.items) |p| {
             if (p.id == id or std.mem.eql(u8, p.name, name)) return error.DuplicateParam;
         }
-        try self.list.append(self.gpa, .{
-            .id = id,
-            .name = try self.gpa.dupe(u8, name),
-            .value = value,
-        });
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        try self.list.append(self.gpa, .{ .id = id, .name = owned, .value = value });
     }
 
     /// Set a value; false when the id is unknown.
@@ -82,15 +80,28 @@ pub const ParamTable = struct {
     }
 
     /// Remove a parameter; false when the id is unknown.
-    pub fn remove(self: *Self, id: ParamId) bool {
+    /// Remove a parameter. Returns the position it held, or null if unknown.
+    pub fn remove(self: *Self, id: ParamId) ?u32 {
         for (self.list.items, 0..) |p, i| {
             if (p.id == id) {
                 const dead = self.list.orderedRemove(i);
                 self.gpa.free(dead.name);
-                return true;
+                return @intCast(i);
             }
         }
-        return false;
+        return null;
+    }
+
+    /// Put a parameter back at position `at` (clamped), so undo restores
+    /// the creation order. Same uniqueness rules as `add`.
+    pub fn insertAt(self: *Self, id: ParamId, name: []const u8, value: f64, at: u32) error{ OutOfMemory, DuplicateParam }!void {
+        for (self.list.items) |p| {
+            if (p.id == id or std.mem.eql(u8, p.name, name)) return error.DuplicateParam;
+        }
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        const pos: usize = @min(at, self.list.items.len);
+        try self.list.insert(self.gpa, pos, .{ .id = id, .name = owned, .value = value });
     }
 
     /// Rename in place; false when the id is unknown.
