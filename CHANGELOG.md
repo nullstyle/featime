@@ -3,7 +3,7 @@
 All notable changes to featuretree-zig. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
-## 0.7.0 — 2026-10-07
+## 0.7.0 — 2026-10-09
 
 ### Changed (breaking)
 - Unknown ids are errors instead of silent no-ops. `edit`, `remove`,
@@ -52,6 +52,7 @@ All notable changes to featuretree-zig. The format follows
   binary is now `zig-out/bin/featuretree-demo`.
 
 ### Added
+- MIT license (`LICENSE`, shipped in the package).
 - `cloneDoc` and `deinitDoc` are optional for plain-data documents (no
   pointers or slices anywhere inside `Doc`): a bitwise copy is a deep copy.
   `isPlainData(T)`, `cloneDoc(Domain, ...)` and `deinitDoc(Domain, ...)` are

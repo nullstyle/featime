@@ -392,3 +392,7 @@ feature ids are random-anchored and journal entries are flat and serializable
 so a future sync/merge layer can build on them — but multiuser merge, OT, and
 CRDT behavior, branching timelines, and partial-order feature DAGs are
 explicitly out of scope for this version.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
