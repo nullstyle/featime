@@ -1,10 +1,11 @@
 //! Save/load timelines: a small versioned binary container framing
 //! application-encoded payloads.
 //!
-//! FTZ3 layout (all integers little-endian; "framed" = u32 length + bytes):
+//! FTZ4 layout (all integers little-endian; "framed" = u32 length + bytes):
 //!
-//!   magic "FTZ3"
+//!   magic "FTZ4"
 //!   u64 timeline_id
+//!   u32 format_version                (the app's `Domain.format_version`)
 //!   framed seed document              (bytes from `Domain.encodeDoc`)
 //!   u32 feature_count × { u64 id, u8 suppressed, framed op (`Domain.encodeOp`) }
 //!   u32 marker
@@ -16,8 +17,17 @@
 //!   u32 tag_count     × { u64 feature_id, framed tag }
 //!   u32 provenance_ct × { u64 feature_id, u64 author, u64 ts }
 //!
-//! Older containers still load: FTZ2 has no parameter section; FTZ1 has no
-//! parameters, no annotations, and no timeline_id (a fresh one is generated).
+//! Older containers still load: FTZ3 has no format_version (0 is assumed);
+//! FTZ2 has no parameter section either; FTZ1 has no parameters, no
+//! annotations, and no timeline_id (a fresh one is generated).
+//!
+//! App payload versions: a Domain may declare `pub const format_version:
+//! u32` (0 when absent). The container records it; when a file's version
+//! differs from the Domain's, every op and the seed document are decoded
+//! through `Domain.migrateOp(from_version, reader, gpa)` and
+//! `Domain.migrateDoc(from_version, reader, gpa)` instead of the regular
+//! decoders. Without those hooks a foreign version is
+//! `error.UnsupportedFormatVersion`.
 //!
 //! Frame lengths are never trusted: payloads are read in bounded chunks
 //! (`readFramedAlloc`), so a corrupt or hostile length costs at most one
@@ -36,11 +46,35 @@
 const std = @import("std");
 const ft = @import("root.zig");
 
-pub const magic = "FTZ3";
+pub const magic = "FTZ4";
+pub const magic_v3 = "FTZ3";
 pub const magic_v2 = "FTZ2";
 pub const magic_v1 = "FTZ1";
 
-pub const LoadError = error{BadMagic};
+pub const LoadError = error{ BadMagic, UnsupportedFormatVersion };
+
+/// The Domain's payload schema version (`Domain.format_version`, 0 when
+/// absent). Recorded in containers and on the sync wire.
+pub fn formatVersion(comptime Domain: type) u32 {
+    if (!@hasDecl(Domain, "format_version")) return 0;
+    return @as(u32, Domain.format_version);
+}
+
+/// Decode an op payload written at `stored` format version: the regular
+/// decoder when it matches the Domain's, `migrateOp` otherwise.
+pub fn decodeOpVersioned(comptime Domain: type, stored: u32, r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Domain.Op {
+    if (stored == formatVersion(Domain)) return Domain.decodeOp(r, gpa);
+    if (comptime @hasDecl(Domain, "migrateOp")) return Domain.migrateOp(stored, r, gpa);
+    return error.UnsupportedFormatVersion;
+}
+
+/// Decode a document payload written at `stored` format version: the
+/// regular decoder when it matches the Domain's, `migrateDoc` otherwise.
+pub fn decodeDocVersioned(comptime Domain: type, stored: u32, r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Domain.Doc {
+    if (stored == formatVersion(Domain)) return Domain.decodeDoc(r, gpa);
+    if (comptime @hasDecl(Domain, "migrateDoc")) return Domain.migrateDoc(stored, r, gpa);
+    return error.UnsupportedFormatVersion;
+}
 
 /// Upper bound on a single allocation while reading a framed payload.
 pub const frame_chunk: usize = 64 * 1024;
@@ -76,19 +110,69 @@ fn validateCodecs(comptime Domain: type) void {
     ft.checkHook(Domain, "decodeOp", &.{ *std.Io.Reader, std.mem.Allocator }, Domain.Op, .error_union, "fn (r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Op");
     ft.checkHook(Domain, "encodeDoc", &.{ *const Domain.Doc, *std.Io.Writer }, void, .error_union, "fn (doc: *const Doc, w: *std.Io.Writer) anyerror!void");
     ft.checkHook(Domain, "decodeDoc", &.{ *std.Io.Reader, std.mem.Allocator }, Domain.Doc, .error_union, "fn (r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Doc");
+    if (@hasDecl(Domain, "migrateOp"))
+        ft.checkHook(Domain, "migrateOp", &.{ u32, *std.Io.Reader, std.mem.Allocator }, Domain.Op, .error_union, "fn (from_version: u32, r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Op");
+    if (@hasDecl(Domain, "migrateDoc"))
+        ft.checkHook(Domain, "migrateDoc", &.{ u32, *std.Io.Reader, std.mem.Allocator }, Domain.Doc, .error_union, "fn (from_version: u32, r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Doc");
 }
 
-/// Serialize the timeline (feature list, ids, suppression, marker, seed).
-/// Op/doc payloads are produced by the Domain's encode hooks.
+/// Options for `savePrefix`.
+pub const PrefixOptions = struct {
+    /// Identity written into the file; null keeps the source timeline's id.
+    /// Give a scenario variant its own id so replicas never confuse the two.
+    timeline_id: ?u64 = null,
+};
+
+/// Serialize the timeline (feature list, ids, suppression, marker, seed,
+/// parameters, annotations). Op/doc payloads are produced by the Domain's
+/// encode hooks.
 pub fn save(
     comptime Domain: type,
     tl: *const ft.Timeline(Domain),
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
 ) anyerror!void {
+    try saveUpTo(Domain, tl, gpa, writer, tl.len(), tl.timeline_id);
+}
+
+/// Serialize only `features[0..mark]` — a fork point. The marker is clamped
+/// to `mark`; names, tags and provenance of dropped features go with them;
+/// chapters anchored beyond the mark are dropped (end-pinned ones stay and
+/// follow the new tip); groups that start inside the prefix are kept with
+/// their end clamped to the last kept feature; parameters are all kept.
+/// Load the result like any container to get an independent timeline — a
+/// scenario variant when `opts.timeline_id` gives it a new identity.
+/// `Timeline.markPosition` turns a chapter into a `mark`.
+pub fn savePrefix(
+    comptime Domain: type,
+    tl: *const ft.Timeline(Domain),
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    mark: u32,
+    opts: PrefixOptions,
+) anyerror!void {
+    const upto = @min(mark, tl.len());
+    try saveUpTo(Domain, tl, gpa, writer, upto, opts.timeline_id orelse tl.timeline_id);
+}
+
+fn saveUpTo(
+    comptime Domain: type,
+    tl: *const ft.Timeline(Domain),
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    upto: u32,
+    timeline_id: u64,
+) anyerror!void {
     validateCodecs(Domain);
+    const kept_list = tl.list.items[0..upto];
+    var kept: std.AutoHashMapUnmanaged(ft.FeatureId, void) = .empty;
+    defer kept.deinit(gpa);
+    try kept.ensureTotalCapacity(gpa, upto);
+    for (kept_list) |f| kept.putAssumeCapacity(f.id, {});
+
     try writer.writeAll(magic);
-    try writer.writeInt(u64, tl.timeline_id, .little);
+    try writer.writeInt(u64, timeline_id, .little);
+    try writer.writeInt(u32, formatVersion(Domain), .little);
 
     {
         var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -98,8 +182,8 @@ pub fn save(
         try writer.writeAll(aw.written());
     }
 
-    try writer.writeInt(u32, tl.len(), .little);
-    for (tl.list.items) |*f| {
+    try writer.writeInt(u32, upto, .little);
+    for (kept_list) |*f| {
         try writer.writeInt(u64, f.id, .little);
         try writer.writeAll(&[1]u8{@intFromBool(f.suppressed)});
         var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -109,50 +193,65 @@ pub fn save(
         try writer.writeAll(aw.written());
     }
 
-    try writer.writeInt(u32, tl.marker_pos, .little);
+    try writer.writeInt(u32, @min(tl.marker_pos, upto), .little);
 
-    // Parameters (FTZ3).
+    // Parameters.
     try writer.writeInt(u32, @intCast(tl.ptab.items().len), .little);
-    for (tl.ptab.items()) |p| {
-        try writer.writeInt(u64, p.id, .little);
-        try writer.writeInt(u64, @bitCast(p.value), .little);
-        try writeFramed(writer, p.name);
+    for (tl.ptab.items()) |pm| {
+        try writer.writeInt(u64, pm.id, .little);
+        try writer.writeInt(u64, @bitCast(pm.value), .little);
+        try writeFramed(writer, pm.name);
     }
 
-    // Annotation sections.
+    // Annotation sections, filtered to kept features.
     var name_count: u32 = 0;
     var nit = tl.ann.names.iterator();
-    while (nit.next()) |_| name_count += 1;
+    while (nit.next()) |e| {
+        if (kept.contains(e.key_ptr.*)) name_count += 1;
+    }
     try writer.writeInt(u32, name_count, .little);
     nit = tl.ann.names.iterator();
     while (nit.next()) |e| {
+        if (!kept.contains(e.key_ptr.*)) continue;
         try writer.writeInt(u64, e.key_ptr.*, .little);
         try writeFramed(writer, e.value_ptr.*);
     }
 
-    try writer.writeInt(u32, @intCast(tl.ann.chapters.items.len), .little);
+    var chapter_count: u32 = 0;
     for (tl.ann.chapters.items) |c| {
+        if (c.mark.after == null or kept.contains(c.mark.after.?)) chapter_count += 1;
+    }
+    try writer.writeInt(u32, chapter_count, .little);
+    for (tl.ann.chapters.items) |c| {
+        if (c.mark.after != null and !kept.contains(c.mark.after.?)) continue;
         try writer.writeInt(u64, c.id, .little);
         try writer.writeInt(u64, c.mark.after orelse 0, .little);
         try writeFramed(writer, c.name);
     }
 
-    try writer.writeInt(u32, @intCast(tl.ann.groups.items.len), .little);
+    var group_count: u32 = 0;
     for (tl.ann.groups.items) |g| {
+        if (kept.contains(g.first)) group_count += 1;
+    }
+    try writer.writeInt(u32, group_count, .little);
+    for (tl.ann.groups.items) |g| {
+        if (!kept.contains(g.first)) continue;
+        const last = if (kept.contains(g.last)) g.last else kept_list[upto - 1].id;
         try writer.writeInt(u64, g.id, .little);
         try writer.writeInt(u64, g.first, .little);
-        try writer.writeInt(u64, g.last, .little);
+        try writer.writeInt(u64, last, .little);
         try writeFramed(writer, g.name);
     }
 
     var tag_count: u32 = 0;
     var tag_it = tl.ann.tags.iterator();
     while (tag_it.next()) |e| {
-        tag_count += @intCast(e.value_ptr.items.len);
+        if (kept.contains(e.key_ptr.*)) tag_count += @intCast(e.value_ptr.items.len);
     }
     try writer.writeInt(u32, tag_count, .little);
     tag_it = tl.ann.tags.iterator();
     while (tag_it.next()) |e| {
+        if (!kept.contains(e.key_ptr.*)) continue;
         for (e.value_ptr.items) |t| {
             try writer.writeInt(u64, e.key_ptr.*, .little);
             try writeFramed(writer, t);
@@ -161,10 +260,13 @@ pub fn save(
 
     var prov_count: u32 = 0;
     var pit = tl.ann.prov.iterator();
-    while (pit.next()) |_| prov_count += 1;
+    while (pit.next()) |e| {
+        if (kept.contains(e.key_ptr.*)) prov_count += 1;
+    }
     try writer.writeInt(u32, prov_count, .little);
     pit = tl.ann.prov.iterator();
     while (pit.next()) |e| {
+        if (!kept.contains(e.key_ptr.*)) continue;
         try writer.writeInt(u64, e.key_ptr.*, .little);
         try writer.writeInt(u64, e.value_ptr.author, .little);
         try writer.writeInt(u64, e.value_ptr.ts, .little);
@@ -187,17 +289,22 @@ pub fn load(
 ) anyerror!ft.Timeline(Domain) {
     validateCodecs(Domain);
     const head = try reader.take(4);
-    const v3 = std.mem.eql(u8, head, magic);
+    const v4 = std.mem.eql(u8, head, magic);
+    const v3 = std.mem.eql(u8, head, magic_v3);
     const v2 = std.mem.eql(u8, head, magic_v2);
-    if (!v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
+    if (!v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
         return error.BadMagic;
+    const has_id = v4 or v3 or v2;
+    const has_params = v4 or v3;
+    const has_annotations = v4 or v3 or v2;
 
     var timeline_id: u64 = 0;
-    if (v3 or v2) timeline_id = try reader.takeInt(u64, .little);
+    if (has_id) timeline_id = try reader.takeInt(u64, .little);
+    const stored_format: u32 = if (v4) try reader.takeInt(u32, .little) else 0;
 
     var doc_reader = try framedReader(gpa, reader);
     defer gpa.free(doc_reader.bytes);
-    const seed = try Domain.decodeDoc(&doc_reader.reader, gpa);
+    const seed = try decodeDocVersioned(Domain, stored_format, &doc_reader.reader, gpa);
 
     var tl = try ft.Timeline(Domain).init(gpa, seed, config);
     errdefer tl.deinit();
@@ -213,11 +320,11 @@ pub fn load(
         const suppressed = (try reader.take(1))[0] != 0;
         var op_reader = try framedReader(gpa, reader);
         defer gpa.free(op_reader.bytes);
-        const op = try Domain.decodeOp(&op_reader.reader, gpa);
+        const op = try decodeOpVersioned(Domain, stored_format, &op_reader.reader, gpa);
         try tl.list.append(gpa, .{ .id = id, .op = op, .suppressed = suppressed });
     }
     tl.marker_pos = @min(try reader.takeInt(u32, .little), tl.len());
-    if (v3) {
+    if (has_params) {
         const param_count = try reader.takeInt(u32, .little);
         var pm: u32 = 0;
         while (pm < param_count) : (pm += 1) {
@@ -229,9 +336,9 @@ pub fn load(
         }
     }
 
-    if (v3 or v2) tl.timeline_id = timeline_id;
+    if (has_id) tl.timeline_id = timeline_id;
 
-    if (v3 or v2) {
+    if (has_annotations) {
         const name_count = try reader.takeInt(u32, .little);
         var n: u32 = 0;
         while (n < name_count) : (n += 1) {
@@ -416,9 +523,9 @@ test "frame lengths are not trusted: a hostile length cannot force a huge alloca
     var buf: [64]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try w.writeAll(magic);
-    try w.writeInt(u64, 1, .little);
-    try w.writeInt(u32, 0xFFFF_FFFF, .little);
-    try w.writeInt(u32, 0, .little);
+    try w.writeInt(u64, 1, .little); // timeline_id
+    try w.writeInt(u32, 0, .little); // format_version
+    try w.writeInt(u32, 0xFFFF_FFFF, .little); // seed frame claims 4 GiB
 
     var fba = std.heap.FixedBufferAllocator.init(&hostile_frame_arena);
     var reader = std.Io.Reader.fixed(w.buffered());
@@ -538,4 +645,195 @@ test "FTZ2 files load with annotations but no parameters" {
     try std.testing.expectEqual(@as(usize, 0), loaded.paramsList().len);
     const pid = try loaded.addParam("width", 2.0);
     try std.testing.expectEqual(@as(f64, 2.0), loaded.paramValue(pid).?);
+}
+
+// ---------------------------------------------------------------------------
+// Forks and format migration
+// ---------------------------------------------------------------------------
+
+test "savePrefix keeps the first N features and clamps marker, chapters and groups" {
+    const gpa = std.testing.allocator;
+    var tl = try PersistTimeline.init(gpa, .{}, .{});
+    defer tl.deinit();
+
+    var ids: [5]ft.FeatureId = undefined;
+    for (&ids, 0..) |*slot, i| slot.* = try tl.commit(.{ .add = @intCast(i + 1) });
+    try tl.setFeatureName(ids[1], "second");
+    try tl.setFeatureName(ids[4], "fifth");
+    try tl.addTag(ids[1], "keep");
+    try tl.addTag(ids[4], "drop");
+    _ = try tl.addChapter("after second", .{ .after = ids[1] });
+    _ = try tl.addChapter("after fifth", .{ .after = ids[4] });
+    _ = try tl.addChapter("tip", .{ .after = null });
+    _ = try tl.addGroup("span", ids[1], ids[4]);
+    _ = try tl.addGroup("tail", ids[3], ids[4]);
+    _ = try tl.addParam("p", 1.5);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try savePrefix(PersistDomain, &tl, gpa, &aw.writer, 3, .{ .timeline_id = 4242 });
+
+    var reader = std.Io.Reader.fixed(aw.written());
+    var fork = try load(PersistDomain, gpa, .{}, &reader);
+    defer fork.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), fork.len());
+    try std.testing.expectEqual(@as(u32, 3), fork.marker());
+    try std.testing.expectEqual(@as(i64, 6), fork.state().value);
+    try std.testing.expectEqual(@as(u64, 4242), fork.timelineId());
+    try std.testing.expectEqualStrings("second", fork.featureName(ids[1]).?);
+    try std.testing.expect(fork.featureById(ids[4]) == null);
+    try std.testing.expectEqual(@as(usize, 1), fork.tags(ids[1]).len);
+    try std.testing.expectEqual(@as(usize, 2), fork.chapters().len);
+    try std.testing.expectEqualStrings("after second", fork.chapters()[0].name);
+    try std.testing.expectEqualStrings("tip", fork.chapters()[1].name);
+    try std.testing.expectEqual(@as(u32, 3), fork.markPosition(fork.chapters()[1].mark));
+    try std.testing.expectEqual(@as(usize, 1), fork.groups().len);
+    try std.testing.expectEqual(ids[1], fork.groups()[0].first);
+    try std.testing.expectEqual(ids[2], fork.groups()[0].last); // clamped to the last kept feature
+    try std.testing.expectEqual(@as(usize, 1), fork.paramsList().len);
+
+    // Without an explicit id the prefix keeps the source identity.
+    var aw2: std.Io.Writer.Allocating = .init(gpa);
+    defer aw2.deinit();
+    try savePrefix(PersistDomain, &tl, gpa, &aw2.writer, 99, .{});
+    var reader2 = std.Io.Reader.fixed(aw2.written());
+    var same = try load(PersistDomain, gpa, .{}, &reader2);
+    defer same.deinit();
+    try std.testing.expectEqual(tl.timelineId(), same.timelineId());
+    try std.testing.expectEqual(@as(u32, 5), same.len());
+}
+
+/// `PersistDomain` one schema generation later: op tags moved by 10 and the
+/// document frame gained a leading version byte. Version-0 payloads (the
+/// `PersistDomain` layout) are migrated.
+const MigratingDomain = struct {
+    pub const format_version: u32 = 1;
+    pub const Doc = struct { value: i64 = 0 };
+    pub const Op = union(enum) { add: i64, mul: i32, fail: u32 };
+    pub fn apply(op: Op, doc: *Doc, ctx: *ft.ApplyContext) anyerror!void {
+        switch (op) {
+            .add => |n| doc.value += n,
+            .mul => |n| doc.value *= n,
+            .fail => |code| return ctx.fail("failure code {d}", .{code}),
+        }
+    }
+    pub fn encodeOp(op: Op, w: *std.Io.Writer) anyerror!void {
+        switch (op) {
+            .add => |n| {
+                try w.writeAll(&[1]u8{10});
+                try w.writeInt(i64, n, .little);
+            },
+            .mul => |n| {
+                try w.writeAll(&[1]u8{11});
+                try w.writeInt(i32, n, .little);
+            },
+            .fail => |code| {
+                try w.writeAll(&[1]u8{12});
+                try w.writeInt(u32, code, .little);
+            },
+        }
+    }
+    pub fn decodeOp(r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Op {
+        _ = gpa;
+        return switch ((try r.take(1))[0]) {
+            10 => .{ .add = try r.takeInt(i64, .little) },
+            11 => .{ .mul = try r.takeInt(i32, .little) },
+            12 => .{ .fail = try r.takeInt(u32, .little) },
+            else => error.Malformed,
+        };
+    }
+    pub fn encodeDoc(doc: *const Doc, w: *std.Io.Writer) anyerror!void {
+        try w.writeAll(&[1]u8{1});
+        try w.writeInt(i64, doc.value, .little);
+    }
+    pub fn decodeDoc(r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Doc {
+        _ = gpa;
+        if ((try r.take(1))[0] != 1) return error.Malformed;
+        return .{ .value = try r.takeInt(i64, .little) };
+    }
+    pub fn migrateOp(from: u32, r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Op {
+        if (from != 0) return error.UnsupportedFormatVersion;
+        return switch (try PersistDomain.decodeOp(r, gpa)) {
+            .add => |n| .{ .add = n },
+            .mul => |n| .{ .mul = n },
+            .fail => |code| .{ .fail = code },
+        };
+    }
+    pub fn migrateDoc(from: u32, r: *std.Io.Reader, gpa: std.mem.Allocator) anyerror!Doc {
+        if (from != 0) return error.UnsupportedFormatVersion;
+        const old = try PersistDomain.decodeDoc(r, gpa);
+        return .{ .value = old.value };
+    }
+};
+
+/// Same as `MigratingDomain` but without migration hooks.
+const StrictV1Domain = struct {
+    pub const format_version: u32 = 1;
+    pub const Doc = MigratingDomain.Doc;
+    pub const Op = MigratingDomain.Op;
+    pub const apply = MigratingDomain.apply;
+    pub const encodeOp = MigratingDomain.encodeOp;
+    pub const decodeOp = MigratingDomain.decodeOp;
+    pub const encodeDoc = MigratingDomain.encodeDoc;
+    pub const decodeDoc = MigratingDomain.decodeDoc;
+};
+
+test "format version: a version-0 file loads through migrateOp/migrateDoc at version 1" {
+    const gpa = std.testing.allocator;
+    var old = try PersistTimeline.init(gpa, .{ .value = 7 }, .{});
+    defer old.deinit();
+    _ = try old.commit(.{ .add = 10 });
+    const m = try old.commit(.{ .mul = 3 });
+    try old.setFeatureName(m, "triple");
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try save(PersistDomain, &old, gpa, &aw.writer); // written at format version 0
+
+    var reader = std.Io.Reader.fixed(aw.written());
+    var migrated = try load(MigratingDomain, gpa, .{}, &reader);
+    defer migrated.deinit();
+    try std.testing.expectEqual(@as(u32, 2), migrated.len());
+    try std.testing.expectEqual(@as(i64, 51), migrated.state().value);
+    try std.testing.expectEqualStrings("triple", migrated.featureName(m).?);
+
+    // Saved again, the file is at version 1 and loads with the regular decoders.
+    var aw2: std.Io.Writer.Allocating = .init(gpa);
+    defer aw2.deinit();
+    try save(MigratingDomain, &migrated, gpa, &aw2.writer);
+    var reader2 = std.Io.Reader.fixed(aw2.written());
+    var again = try load(MigratingDomain, gpa, .{}, &reader2);
+    defer again.deinit();
+    try std.testing.expectEqual(@as(i64, 51), again.state().value);
+}
+
+test "format version: a Domain without migration hooks rejects foreign versions" {
+    const gpa = std.testing.allocator;
+    var old = try PersistTimeline.init(gpa, .{}, .{});
+    defer old.deinit();
+    _ = try old.commit(.{ .add = 1 });
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try save(PersistDomain, &old, gpa, &aw.writer);
+
+    var reader = std.Io.Reader.fixed(aw.written());
+    try std.testing.expectError(error.UnsupportedFormatVersion, load(StrictV1Domain, gpa, .{}, &reader));
+}
+
+test "sync entries carry the format version and migrate on decode" {
+    const gpa = std.testing.allocator;
+    const syncing = @import("sync.zig");
+    const entry: ft.Timeline(PersistDomain).Entry = .{ .commit = .{ .id = 9, .op = .{ .add = 5 }, .at = 0 } };
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try syncing.encode(PersistDomain, &entry, gpa, &aw.writer);
+
+    var reader = std.Io.Reader.fixed(aw.written());
+    var got = try syncing.decode(MigratingDomain, gpa, &reader);
+    defer syncing.deinit(MigratingDomain.Op, gpa, &got);
+    try std.testing.expectEqual(@as(i64, 5), got.commit.op.add);
+
+    var reader2 = std.Io.Reader.fixed(aw.written());
+    try std.testing.expectError(error.UnsupportedFormatVersion, syncing.decode(StrictV1Domain, gpa, &reader2));
 }

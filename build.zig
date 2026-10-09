@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
         "annotations",
         "sync",
         "history",
+        "forks",
     };
     for (example_names) |name| {
         const example = b.addExecutable(.{

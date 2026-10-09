@@ -1246,6 +1246,46 @@ pub fn Timeline(comptime Domain: type) type {
         }
 
         // ------------------------------------------------------------------
+        // Cherry-pick
+        // ------------------------------------------------------------------
+
+        pub const CherryPickOptions = struct {
+            /// Copy the source feature's name, tags and provenance too.
+            annotations: bool = true,
+            /// Keep the source feature's suppressed flag.
+            keep_suppressed: bool = true,
+        };
+
+        /// Copy one feature from another timeline of the same Domain (or
+        /// from this one) and commit it at the marker as a new feature with
+        /// a fresh id — one undo unit. Ops are plain data, so this is a
+        /// value copy: ids inside the op are not translated; a dependent op
+        /// whose dependency is absent here simply soft-fails on rebuild,
+        /// like any other. Pairs with `persistence.savePrefix` for scenario
+        /// variants.
+        pub fn cherryPick(self: *Self, src: *const Self, id: ft.FeatureId, opts: CherryPickOptions) error{ OutOfMemory, UnknownFeature }!ft.FeatureId {
+            const view = src.featureById(id) orelse return error.UnknownFeature;
+            const op = view.op.*; // copy before mutating: `src` may be `self`
+            const suppressed = view.suppressed;
+            const meta: ?ft.Meta = if (opts.annotations and view.meta != null)
+                view.meta
+            else if (self.config.now) |now|
+                .{ .ts = now() }
+            else
+                null;
+
+            self.beginTransaction();
+            defer self.endTransaction();
+            const new_id = try self.commitInner(op, meta);
+            if (opts.annotations) {
+                if (src.featureName(id)) |n| try self.setFeatureName(new_id, n);
+                for (src.tags(id)) |t| try self.addTag(new_id, t);
+            }
+            if (opts.keep_suppressed and suppressed) try self.setSuppressed(new_id, true);
+            return new_id;
+        }
+
+        // ------------------------------------------------------------------
         // History introspection
         // ------------------------------------------------------------------
 
@@ -3819,4 +3859,47 @@ test "trim: keeps checkpoints nearest the marker and the newest undo units" {
     try std.testing.expectEqual(@as(u32, 1), t2.journal_entries);
     try std.testing.expect(!tl.canRedo());
     try std.testing.expectEqual(@as(u32, 1), tl.undoDepth());
+}
+
+test "cherryPick copies a feature with its annotations as one undo unit" {
+    const gpa = std.testing.allocator;
+    var src = try makeTimeline(gpa);
+    defer src.deinit();
+    var dst = try makeTimeline(gpa);
+    defer dst.deinit();
+
+    const a = try src.commit(.{ .add = 7 });
+    try src.setFeatureName(a, "seven");
+    try src.addTag(a, "picked");
+    try src.setSuppressed(a, true);
+    const b = try src.commit(.{ .mul = 3 });
+    _ = try dst.commit(.{ .add = 1 });
+
+    const picked = try dst.cherryPick(&src, a, .{});
+    try std.testing.expect(dst.featureById(picked) != null);
+    try std.testing.expectEqualStrings("seven", dst.featureName(picked).?);
+    try std.testing.expectEqual(@as(usize, 1), dst.tags(picked).len);
+    try std.testing.expect(dst.featureById(picked).?.suppressed);
+    try std.testing.expectEqual(@as(i64, 1), dst.state().value); // suppressed: no effect
+
+    const picked2 = try dst.cherryPick(&src, b, .{ .annotations = false, .keep_suppressed = false });
+    try std.testing.expect(dst.featureName(picked2) == null);
+    try std.testing.expectEqual(@as(i64, 3), dst.state().value);
+
+    // Each pick is one undo unit, annotations included.
+    try std.testing.expect(dst.undo());
+    try std.testing.expectEqual(@as(i64, 1), dst.state().value);
+    try std.testing.expect(dst.undo());
+    try std.testing.expectEqual(@as(u32, 1), dst.len());
+    try std.testing.expect(dst.featureName(picked) == null);
+    try std.testing.expect(dst.redo());
+    try std.testing.expectEqualStrings("seven", dst.featureName(picked).?);
+
+    // Unknown source id; and picking from the same timeline duplicates.
+    try std.testing.expectError(error.UnknownFeature, dst.cherryPick(&src, 0xBAD, .{}));
+    const dup = try src.cherryPick(&src, b, .{});
+    try std.testing.expectEqual(@as(u32, 3), src.len());
+    try std.testing.expect(std.meta.eql(src.featureById(dup).?.op.*, TestDomain.Op{ .mul = 3 }));
+    // Source untouched by the copy.
+    try std.testing.expectEqualStrings("seven", src.featureName(a).?);
 }

@@ -26,8 +26,10 @@ const params = @import("params.zig");
 /// `error.UnsupportedWireVersion` instead of misparsing them.
 ///
 /// History: 1 — 0.6.x (implicit, no byte); 2 — 0.7.0 (version byte, move
-/// entries carry group fixes, group fixes carry old and new anchors).
-pub const wire_version: u8 = 2;
+/// entries carry group fixes, group fixes carry old and new anchors);
+/// 3 — 0.8.0 (the app's `format_version` follows the version byte, so a
+/// newer peer migrates older ops through `Domain.migrateOp`).
+pub const wire_version: u8 = 3;
 
 /// True when the remote edit's provenance wins over the local one by
 /// timestamp (ties favor the remote — the caller chose to deliver it).
@@ -76,11 +78,12 @@ fn readOp(
     comptime Domain: type,
     gpa: std.mem.Allocator,
     r: *std.Io.Reader,
+    stored_format: u32,
 ) !Domain.Op {
     const framed = try readFramed(gpa, r);
     defer framed.deinit();
     var orr = framed.reader();
-    return Domain.decodeOp(&orr, gpa);
+    return persistence.decodeOpVersioned(Domain, stored_format, &orr, gpa);
 }
 
 fn readString(gpa: std.mem.Allocator, r: *std.Io.Reader) ![]u8 {
@@ -203,6 +206,7 @@ pub fn encode(
     w: *std.Io.Writer,
 ) !void {
     try w.writeAll(&[1]u8{wire_version});
+    try w.writeInt(u32, persistence.formatVersion(Domain), .little);
     switch (entry.*) {
         .commit => |e| {
             try w.writeAll(&[1]u8{1});
@@ -334,22 +338,23 @@ pub fn decode(
 ) !journaling.Journal(Domain.Op).Entry {
     const version = (try r.take(1))[0];
     if (version != wire_version) return error.UnsupportedWireVersion;
+    const stored_format = try r.takeInt(u32, .little);
     const tag = (try r.take(1))[0];
     switch (tag) {
         1 => return .{ .commit = .{
             .id = try r.takeInt(u64, .little),
-            .op = try readOp(Domain, gpa, r),
+            .op = try readOp(Domain, gpa, r, stored_format),
             .at = try r.takeInt(u32, .little),
             .meta = try readMeta(r),
         } },
         2 => return .{ .edit = .{
             .id = try r.takeInt(u64, .little),
-            .old_op = try readOp(Domain, gpa, r),
-            .new_op = try readOp(Domain, gpa, r),
+            .old_op = try readOp(Domain, gpa, r, stored_format),
+            .new_op = try readOp(Domain, gpa, r, stored_format),
         } },
         3 => return .{ .remove = .{
             .id = try r.takeInt(u64, .little),
-            .op = try readOp(Domain, gpa, r),
+            .op = try readOp(Domain, gpa, r, stored_format),
             .at = try r.takeInt(u32, .little),
             .suppressed = (try r.take(1))[0] != 0,
             .marker_pre = try r.takeInt(u32, .little),
