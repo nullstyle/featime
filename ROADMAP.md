@@ -199,10 +199,11 @@ for byte budgets. Pull when real usage shows mid-history edits dominating.
 
 ## Still parked
 
-- **Disk-backed checkpoints** — session restore without replay. Parked on
-  purpose: the implications (who owns the files, how checkpoints stay valid
-  across edits, what a half-written checkpoint means on crash) are being
-  thought through before any code.
+- **Disk-backed checkpoints** — session restore without replay.
+  `docs/disk-checkpoints.md` now answers the parked questions (the app
+  owns a store; a checkpoint is keyed by a prefix digest; temp-and-rename
+  writes) and compares three file formats on capnp-zig; recommendation:
+  the generic capnp API first, generated code later. Awaiting a decision.
 - **Selective replay** (`touches(op, region)` filters) — parked: the
   hierarchical region-timeline partition is the better answer at the app
   level, and filters would fight the whole-document checkpoint model.
