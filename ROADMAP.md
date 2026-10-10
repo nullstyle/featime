@@ -202,8 +202,9 @@ for byte budgets. Pull when real usage shows mid-history edits dominating.
 - **Disk-backed checkpoints** — session restore without replay.
   `docs/disk-checkpoints.md` now answers the parked questions (the app
   owns a store; a checkpoint is keyed by a prefix digest; temp-and-rename
-  writes) and compares three file formats on capnp-zig; recommendation:
-  the generic capnp API first, generated code later. Awaiting a decision.
+  writes) and compares three file formats on capnp-zig. Decision
+  2026-10-09: generated code (option A). Open: which WASM toolchain path
+  runs the generator (section 7 of the note).
 - **Selective replay** (`touches(op, region)` filters) — parked: the
   hierarchical region-timeline partition is the better answer at the app
   level, and filters would fight the whole-document checkpoint model.

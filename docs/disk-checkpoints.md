@@ -1,8 +1,12 @@
-# Disk-backed checkpoints with capnp-zig — options
+# Disk-backed checkpoints with capnp-zig — design
 
-Status: exploration (2026-10-09). Nothing here is built. The user asked for
-this to be considered with capnp-zig (`/Users/nullstyle/prj/zig/capnp-zig`,
-v0.25.0) as the serialization layer.
+Status: design (2026-10-09). Nothing here is built. The user asked for
+this to be considered with capnp-zig (`/Users/nullstyle/prj/zig/capnp-zig`;
+its checkout says 0.25.0, but the last tag is v0.24.0, 2026-10-08, and
+0.25.0 is a QUIC-only release with the same codegen) as the serialization
+layer. Decision so far: format option **A** (generated code), chosen by the
+user on 2026-10-09. Open: which WASM toolchain path runs the code
+generation (section 7).
 
 ## 1. Why
 
@@ -120,17 +124,84 @@ and no schema tooling. Listed for completeness.
 | Code to write | small | small (~120 lines of layout) | small |
 | Risk | toolchain drift between generator and runtime | layout typos (one struct, testable) | none |
 
-## 6. Recommendation
+## 6. Recommendation and decision
 
-Build the store and the timeline integration (section 4) with **B** for
-the file format, and check the schema file in next to the hand layout. It
-gives capnp-zig a real consumer today without the compiler in CI; **A** can
-take over byte-for-byte when the toolchain is convenient. Keep **C** out.
+The first recommendation was **B** now, **A** later. The user chose **A**
+(2026-10-09): the store and the timeline integration of section 4, with the
+checkpoint file written and read by generated code. Keep **C** out.
 
 Then, as follow-ups: let the geo editor use the store (`save` spills, `load`
 warms: reopen without replay); consider the same path for the FTZ container
 itself, which is where schema evolution pays most.
 
-Decisions to confirm: B now (A later), the prefix digest as the validity
-key, one file per checkpoint, and no spilling for linked documents in the
-first version.
+Decisions still to confirm: the prefix digest as the validity key, one
+file per checkpoint, and no spilling for linked documents in the first
+version.
+
+## 7. Which WASM path runs the code generation
+
+Option A needs the Cap'n Proto schema compiler once per schema change. The
+compiler this project would use is the WebAssembly build published by the
+user's [capnpc-wasm](https://github.com/nullstyle/capnpc-wasm) in both paths
+below; they differ in what else runs in WASM and in which capnp-zig revision
+the generated code is tied to.
+
+### Path 1: capnp-zig's consumer contract (the plan as written)
+
+What capnp-zig documents and verifies in its own CI
+(`docs/build-integration.md`, `docs/capnp-wasm-toolchain.md`):
+
+- Compiler: capnpc-wasm's compiler-only archive `capnp-wasm-tools-0.1.0-rc.2`
+  (`capnp.wasm` plus the standard schemas), pinned by hash in capnp-zig's
+  `tools/capnp-toolchain.json`, run under Wasmtime 48.0.1 by capnp-zig's
+  Python driver `tools/capnp_tool.py` (hash-verified, no network after
+  bootstrap, native Windows). It turns `schema/checkpoint.capnp` into a
+  committed `schema/checkpoint.request.bin`.
+- Generator: the native `capnpc-zig` plugin that featime's `build.zig`
+  builds from the pinned capnp-zig package
+  (`b.dependency("capnpc_zig").artifact("capnpc-zig")` with `--output-dir=`)
+  and runs on the committed request. Generated code and runtime are one pin,
+  so they cannot drift. `zig build` needs only Zig; CI does not change.
+- Regeneration happens on a developer machine, from the capnp-zig checkout
+  (`<checkout>/tools/capnp_tool.py compiler -- compile -o- ...`), or from a
+  copy of the two tool files in `featime/tools/` plus an Ubuntu-only CI job
+  (mise: wasmtime 48.0.1, uv) that recompiles and diffs the request.
+- Pin: capnp-zig **v0.24.0** (Zig 0.17.0 release; v0.25.0 is not tagged).
+
+### Path 2: the capnpc-wasm full SDK
+
+capnpc-wasm's full SDK `capnpc-wasm-0.1.0-rc.5` (2026-10-07) ships
+`wasm/capnp.wasm` and `wasm/capnpc-zig.wasm` (1.67 MB), a Bash launcher
+`bin/capnp-wasm` with `compiler` and `generator` modes, a TypeScript SDK
+(Deno, browsers) and a Go SDK (wazero). The whole `.capnp` to `.zig` step
+runs in WASM: no native plugin, one tool, browser-capable.
+
+The blocker today: `capnpc-zig.wasm` is built from capnp-zig gitlink
+`295ff5e` (`v0.18.0-17-g295ff5e`, untagged), 289 commits behind capnp-zig
+main; the generator sources changed by about 1,400 lines since, and that
+revision predates the `--output-dir=` flag the consumer recipe needs
+(v0.19.0+). capnpc-wasm's README states that generated source compiles only
+against the runtime revision matching the pinned generator. So Path 2
+would pin featime's runtime to a v0.18-era capnp-zig built with a Zig
+development build. To make Path 2 viable, capnpc-wasm must first advance
+`ref/capnp-zig` to v0.24.0 or later, move its Zig pin to tagged 0.17.0,
+and release rc.6. Windows: the launcher is Bash and capnpc-wasm supports
+Windows only through the Go SDK; featime's CI runs Windows, so any CI use
+would be Ubuntu-only in either path.
+
+| | Path 1 (capnp-zig contract) | Path 2 (full SDK) |
+|---|---|---|
+| Uses capnpc-wasm | compiler only (tools rc.2) | compiler + Zig generator (rc.5) |
+| Generator | native plugin from the pinned package | `capnpc-zig.wasm` from capnpc-wasm's gitlink |
+| Runtime pin | v0.24.0, chosen by featime | 295ff5e today; whatever capnpc-wasm pins later |
+| featime CI | unchanged (Zig only) | unchanged if the request and bindings are committed |
+| Dev machine | Wasmtime 48.0.1 + uv + the driver, or the capnp-zig checkout | Wasmtime 48.0.1 + the archive, or Deno |
+| Work before featime can start | none | a capnpc-wasm release that tracks a capnp-zig tag |
+| Risk | the copied driver drifts from capnp-zig's | generator and runtime pinned by two repos |
+
+Recommendation: **Path 1 now**, pinning capnp-zig v0.24.0, regenerating from
+the capnp-zig checkout, with the request (and the generated file, under
+`gen-check`) committed. Path 2 stays open: the generator is the same source
+in both paths, so switching later is a tooling change that `gen-check`
+must show as byte-identical. A capnpc-wasm release tracking a capnp-zig tag
+is the precondition, and featime would be its first Zig consumer.
