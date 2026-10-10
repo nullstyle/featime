@@ -559,3 +559,367 @@ pub fn deinit(comptime Op: type, gpa: std.mem.Allocator, env: *Envelope(Op)) voi
 fn freeOpt(gpa: std.mem.Allocator, s: ?[]const u8) void {
     if (s) |x| gpa.free(@constCast(x));
 }
+
+// ---------------------------------------------------------------------------
+// Session: one link between two replicas, over any byte transport
+// ---------------------------------------------------------------------------
+
+/// Frame tags of the session protocol. On a stream, a frame is a u32
+/// little-endian length, then the tag byte, then the payload.
+pub const FrameTag = enum(u8) {
+    /// Who I am and what I hold: u64 replica id, u64 digest, u32 feature
+    /// count, u64 Lamport clock. Sent at connect (`hello`) and after
+    /// exchanges (`probe`).
+    state = 1,
+    /// One encoded envelope (`encode`).
+    envelope = 2,
+    /// Replay request: u64 origin, u64 first sequence wanted.
+    want = 3,
+    /// Please send your whole state.
+    snapshot_request = 4,
+    /// A whole state: u64 sender sequence, then a container
+    /// (`persistence.save`).
+    snapshot = 5,
+    /// No payload; counted, so lockstep transports can mark a round.
+    ping = 6,
+    _,
+};
+
+/// A link between this replica and one peer. Feed it the peer's bytes with
+/// `receiveStream`; send `outgoingBytes` to the peer. It encodes local edits
+/// as envelopes, keeps the recent ones for replay, holds envelopes that
+/// arrive early until their gap closes, asks for replays, compares digests,
+/// and adopts the peer's snapshot when the two sides disagree. Snapshots
+/// replace the timeline in place: set `on_replaced` to re-attach anything
+/// that pointed at it (registry, environment).
+/// The file-level `deinit` (free an envelope), under a name that does not
+/// clash with the session's own `deinit`.
+const freeEnvelope = deinit;
+
+pub fn Session(comptime Domain: type) type {
+    return struct {
+        const Self = @This();
+        pub const Tl = ft.Timeline(Domain);
+
+        pub const Stats = struct {
+            sent: u32 = 0,
+            received: u32 = 0,
+            applied: u32 = 0,
+            dropped: u32 = 0,
+            duplicates: u32 = 0,
+            gaps: u32 = 0,
+            replayed: u32 = 0,
+            snapshots_sent: u32 = 0,
+            snapshots_loaded: u32 = 0,
+            pings: u32 = 0,
+        };
+
+        pub const Replaced = struct {
+            ctx: ?*anyopaque = null,
+            func: *const fn (ctx: ?*anyopaque, tl: *Tl) void,
+        };
+
+        const Retained = struct { seq: u64, bytes: []u8 };
+
+        gpa: std.mem.Allocator,
+        tl: *Tl,
+        /// The peer's replica id, once it said hello.
+        peer: ?u64 = null,
+        outgoing: std.ArrayList(u8) = .empty,
+        /// This replica's recent envelopes, by sequence, for replay.
+        retained: std.ArrayList(Retained) = .empty,
+        retain_max: usize = 1024,
+        /// Envelopes that arrived before their predecessors.
+        pending: std.ArrayList([]u8) = .empty,
+        pending_max: usize = 256,
+        want_outstanding: bool = false,
+        on_replaced: ?Replaced = null,
+        stats: Stats = .{},
+        /// The digest the peer last reported (`state` frames); compare with
+        /// `tl.structureDigest()` to see whether the two sides agree.
+        peer_digest: ?u64 = null,
+
+        pub fn init(gpa: std.mem.Allocator, tl: *Tl) Self {
+            return .{ .gpa = gpa, .tl = tl };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.tl.setRecordObserver(null);
+            self.outgoing.deinit(self.gpa);
+            self.clearRetained();
+            self.retained.deinit(self.gpa);
+            self.clearPending();
+            self.pending.deinit(self.gpa);
+        }
+
+        /// Start listening to the timeline's edits. Called again by a
+        /// snapshot adoption, which replaces the timeline.
+        pub fn attach(self: *Self) void {
+            self.tl.setRecordObserver(.{ .ctx = self, .func = &observe });
+        }
+
+        fn observe(ctx: ?*anyopaque, env: *const Tl.Envelope) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            defer aw.deinit();
+            encode(Domain, env, self.gpa, &aw.writer) catch return;
+            self.queue(.envelope, aw.written()) catch return;
+            self.retain(env.seq, aw.written()) catch return;
+        }
+
+        fn retain(self: *Self, seq: u64, bytes: []const u8) !void {
+            const owned = try self.gpa.dupe(u8, bytes);
+            errdefer self.gpa.free(owned);
+            try self.retained.append(self.gpa, .{ .seq = seq, .bytes = owned });
+            while (self.retained.items.len > self.retain_max) {
+                const old = self.retained.orderedRemove(0);
+                self.gpa.free(old.bytes);
+            }
+        }
+
+        fn clearRetained(self: *Self) void {
+            for (self.retained.items) |r| self.gpa.free(r.bytes);
+            self.retained.clearRetainingCapacity();
+        }
+
+        fn clearPending(self: *Self) void {
+            for (self.pending.items) |p| self.gpa.free(p);
+            self.pending.clearRetainingCapacity();
+        }
+
+        fn queue(self: *Self, tag: FrameTag, payload: []const u8) !void {
+            try self.outgoing.ensureUnusedCapacity(self.gpa, 5 + payload.len);
+            var len_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_buf, @intCast(1 + payload.len), .little);
+            self.outgoing.appendSliceAssumeCapacity(&len_buf);
+            self.outgoing.appendAssumeCapacity(@backingInt(tag));
+            self.outgoing.appendSliceAssumeCapacity(payload);
+            self.stats.sent += 1;
+        }
+
+        /// Say who we are and what we hold. Send once at connect; the peer
+        /// answers with a replay request for what it misses.
+        pub fn hello(self: *Self) !void {
+            try self.queueState();
+        }
+
+        /// Send our state again, after an exchange. A peer whose digest
+        /// differs settles it: the smaller history adopts the larger one.
+        pub fn probe(self: *Self) !void {
+            try self.queueState();
+        }
+
+        /// A no-op frame the peer counts (`stats.pings`): lockstep
+        /// transports use it to mark the end of a round.
+        pub fn ping(self: *Self) !void {
+            try self.queue(.ping, &.{});
+        }
+
+        fn queueState(self: *Self) !void {
+            var buf: [28]u8 = undefined;
+            std.mem.writeInt(u64, buf[0..8], self.tl.replicaId(), .little);
+            std.mem.writeInt(u64, buf[8..16], self.tl.structureDigest(), .little);
+            std.mem.writeInt(u32, buf[16..20], self.tl.len(), .little);
+            std.mem.writeInt(u64, buf[20..28], self.tl.lamport, .little);
+            try self.queue(.state, &buf);
+        }
+
+        fn queueWant(self: *Self, origin: u64, from: u64) !void {
+            var buf: [16]u8 = undefined;
+            std.mem.writeInt(u64, buf[0..8], origin, .little);
+            std.mem.writeInt(u64, buf[8..16], from, .little);
+            try self.queue(.want, &buf);
+        }
+
+        /// Frames ready for the transport. Send them, then `clearOutgoing`.
+        pub fn outgoingBytes(self: *const Self) []const u8 {
+            return self.outgoing.items;
+        }
+
+        pub fn clearOutgoing(self: *Self) void {
+            self.outgoing.clearRetainingCapacity();
+        }
+
+        /// Consume every complete frame in `bytes`. Returns how many bytes
+        /// were used; a trailing partial frame is left for the caller to
+        /// present again with more data.
+        pub fn receiveStream(self: *Self, bytes: []const u8) !usize {
+            var pos: usize = 0;
+            while (bytes.len - pos >= 4) {
+                const len = std.mem.readInt(u32, bytes[pos..][0..4], .little);
+                if (bytes.len - pos - 4 < len) break;
+                try self.receive(bytes[pos + 4 .. pos + 4 + len]);
+                pos += 4 + len;
+            }
+            return pos;
+        }
+
+        /// One frame, without its length prefix.
+        pub fn receive(self: *Self, frame: []const u8) !void {
+            if (frame.len == 0) return error.Malformed;
+            self.stats.received += 1;
+            const tag: FrameTag = @fromBackingInt(@intCast(frame[0]));
+            const payload = frame[1..];
+            switch (tag) {
+                .state => try self.onState(payload),
+                .envelope => try self.onEnvelope(payload),
+                .want => try self.onWant(payload),
+                .snapshot_request => try self.sendSnapshot(),
+                .snapshot => try self.onSnapshot(payload),
+                .ping => self.stats.pings += 1,
+                _ => return error.Malformed,
+            }
+        }
+
+        fn onState(self: *Self, payload: []const u8) !void {
+            if (payload.len != 28) return error.Malformed;
+            const peer = std.mem.readInt(u64, payload[0..8], .little);
+            const digest = std.mem.readInt(u64, payload[8..16], .little);
+            const len = std.mem.readInt(u32, payload[16..20], .little);
+            const lamport = std.mem.readInt(u64, payload[20..28], .little);
+            if (self.peer) |known| {
+                if (known != peer) {
+                    // The peer adopted a snapshot and is a new replica now:
+                    // what it still owed us as the old one will never come.
+                    self.clearPending();
+                    self.want_outstanding = false;
+                }
+            }
+            const first = self.peer == null or self.peer.? != peer;
+            self.peer = peer;
+            self.peer_digest = digest;
+            if (first) {
+                // Catch up through replay first; digests are compared on
+                // the next probe.
+                try self.queueWant(peer, self.tl.expectedSeq(peer));
+                return;
+            }
+            if (digest == self.tl.structureDigest()) return;
+            // Disagreement: the larger history wins (more features, then
+            // the later clock, then the smaller replica id). The loser
+            // asks for a snapshot.
+            const theirs_win = len > self.tl.len() or
+                (len == self.tl.len() and (lamport > self.tl.lamport or
+                    (lamport == self.tl.lamport and peer < self.tl.replicaId())));
+            if (theirs_win) try self.queue(.snapshot_request, &.{});
+        }
+
+        fn onEnvelope(self: *Self, payload: []const u8) !void {
+            var reader = std.Io.Reader.fixed(payload);
+            var env = try decode(Domain, self.gpa, &reader);
+            defer freeEnvelope(Domain.Op, self.gpa, &env);
+            switch (self.tl.applyRemote(&env)) {
+                .applied, .dropped => |r| {
+                    if (r == .applied) self.stats.applied += 1 else self.stats.dropped += 1;
+                    self.want_outstanding = false;
+                    try self.drainPending();
+                },
+                .duplicate => self.stats.duplicates += 1,
+                .own => {},
+                .gap => {
+                    self.stats.gaps += 1;
+                    try self.holdPending(payload);
+                    if (!self.want_outstanding) {
+                        try self.queueWant(env.origin, self.tl.expectedSeq(env.origin));
+                        self.want_outstanding = true;
+                    }
+                },
+                .out_of_memory => try self.holdPending(payload),
+            }
+        }
+
+        fn holdPending(self: *Self, payload: []const u8) !void {
+            while (self.pending.items.len >= self.pending_max) {
+                const old = self.pending.orderedRemove(0);
+                self.gpa.free(old);
+            }
+            const owned = try self.gpa.dupe(u8, payload);
+            errdefer self.gpa.free(owned);
+            try self.pending.append(self.gpa, owned);
+        }
+
+        /// Retry held envelopes until a pass applies nothing more.
+        fn drainPending(self: *Self) !void {
+            var progress = true;
+            while (progress and self.pending.items.len > 0) {
+                progress = false;
+                var i: usize = 0;
+                while (i < self.pending.items.len) {
+                    const bytes = self.pending.items[i];
+                    var reader = std.Io.Reader.fixed(bytes);
+                    var env = decode(Domain, self.gpa, &reader) catch {
+                        self.gpa.free(bytes);
+                        _ = self.pending.orderedRemove(i);
+                        continue;
+                    };
+                    defer freeEnvelope(Domain.Op, self.gpa, &env);
+                    switch (self.tl.applyRemote(&env)) {
+                        .gap, .out_of_memory => i += 1,
+                        else => |r| {
+                            if (r == .applied) self.stats.applied += 1;
+                            progress = true;
+                            self.gpa.free(bytes);
+                            _ = self.pending.orderedRemove(i);
+                        },
+                    }
+                }
+            }
+        }
+
+        fn onWant(self: *Self, payload: []const u8) !void {
+            if (payload.len != 16) return error.Malformed;
+            const origin = std.mem.readInt(u64, payload[0..8], .little);
+            const from = std.mem.readInt(u64, payload[8..16], .little);
+            if (origin != self.tl.replicaId()) return; // only our own envelopes are here
+            if (from > self.tl.seq) return; // nothing they miss
+            const oldest: ?u64 = if (self.retained.items.len > 0) self.retained.items[0].seq else null;
+            if (oldest == null or oldest.? > from) {
+                // Too far back to replay: send everything instead.
+                try self.sendSnapshot();
+                return;
+            }
+            for (self.retained.items) |r| {
+                if (r.seq >= from) {
+                    try self.queue(.envelope, r.bytes);
+                    self.stats.replayed += 1;
+                }
+            }
+        }
+
+        fn sendSnapshot(self: *Self) !void {
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            defer aw.deinit();
+            try aw.writer.writeInt(u64, self.tl.seq, .little);
+            try persistence.save(Domain, self.tl, self.gpa, &aw.writer);
+            try self.queue(.snapshot, aw.written());
+            self.stats.snapshots_sent += 1;
+        }
+
+        /// Adopt the peer's state. Our timeline is replaced in place: local
+        /// edits the peer never saw are gone. We keep our replica id and
+        /// sequence, so the peer keeps tracking us, and we note where the
+        /// peer's own sequence stood when it took the snapshot.
+        fn onSnapshot(self: *Self, payload: []const u8) !void {
+            if (payload.len < 8) return error.Malformed;
+            const sender_seq = std.mem.readInt(u64, payload[0..8], .little);
+            var reader = std.Io.Reader.fixed(payload[8..]);
+            var loaded = try persistence.load(Domain, self.gpa, self.tl.config, &reader);
+            loaded.replica_id = self.tl.replica_id;
+            loaded.seq = self.tl.seq;
+            if (self.peer) |peer| loaded.acknowledge(peer, sender_seq) catch {
+                loaded.deinit();
+                return error.OutOfMemory;
+            };
+            self.tl.deinit();
+            self.tl.* = loaded;
+            // Our old envelopes describe a state that no longer exists.
+            self.clearRetained();
+            self.clearPending();
+            self.want_outstanding = false;
+            self.attach();
+            self.stats.snapshots_loaded += 1;
+            if (self.on_replaced) |cb| cb.func(cb.ctx, self.tl);
+            try self.queueState();
+        }
+    };
+}

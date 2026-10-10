@@ -251,6 +251,22 @@ live links first, then pins.
 - Snapshots (option C) stay in reserve for containers that must load
   alone or jobs that must run while children are edited.
 
+## Multiuser loop — DELIVERED (unreleased)
+
+- Convergence rules: last-writer-wins keys on edits, suppression and
+  parameter values (`Feature.edit`, `Param.key`, in FTZ7); the digest
+  covers them.
+- Undo travels: with an observer attached, undo/redo emit inverse
+  envelopes, so a shared session stays converged; remote units are flagged
+  in `history()`.
+- `sync.Session`: catch-up at connect, replay on gaps, digest probes,
+  snapshot repair (smaller history adopts the larger one, keeping its
+  identity), transport-agnostic frames; `examples/sync_peers.zig` runs it
+  across two processes over pipes.
+- Not done: relaying envelopes between more than two peers (one session
+  per peer, no hub), convergence for concurrent moves and for names, and
+  a transport beyond pipes.
+
 ## Open after apps/geo
 
 - **A mark at the start.** `Mark{ .after = null }` is the tip, so nothing
@@ -288,6 +304,12 @@ load-bearing), and anything UI-shaped — the library stays headless.
 - Unknown ids are errors, never silent no-ops (0.7.0).
 - Out of memory never leaves a half-applied edit: allocate first, then
   mutate; the journal slot is reserved before the change (0.10.0).
+- Concurrent value changes converge by last-writer-wins keys (clock, then
+  replica id); tags are a set; names and moves stay last-arrival (next).
+- Undo in a shared session is an inverse edit on the feed, not a local
+  rewind; a replica may undo a remote unit, and everyone follows (next).
+- Snapshot repair: the smaller history adopts the larger one's state and
+  keeps its own replica id and sequence (next).
 - Sync order model (0.10): a commit carries its predecessor and an order key
   (Lamport clock, origin id); remote placement is RGA-style — after the
   predecessor, past greater keys — so concurrent commits converge. Moves and

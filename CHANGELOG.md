@@ -5,7 +5,31 @@ All notable changes to featime (featuretree-zig until 0.10.0). The format follow
 
 ## Unreleased
 
+### Changed (breaking)
+- Containers are FTZ7: features carry their edit key and parameters the
+  key of their last value change (FTZ1–FTZ6 still load, with zero keys).
+  `structureDigest()` now also covers edit keys and parameter values, so a
+  divergence in ops shows up. `Timeline.setRecordObserver` takes an
+  optional; null detaches. With an observer attached, `undo` and `redo`
+  emit the inverse of every step to the feed (before, an undo was silent
+  and the replicas diverged).
+
 ### Added
+- Convergence for concurrent value changes. `Feature.edit` and `Param.key`
+  hold the key (writer clock, writer id) of the last change; `applyRemote`
+  applies an edit, a suppression or a parameter set only when its key is
+  greater, so two replicas changing the same thing at once end up equal.
+- `sync.Session(Domain)`: one link to a peer over any byte transport.
+  Frames (`sync.FrameTag`) carry envelopes, a state summary, replay
+  requests, snapshot requests and snapshots. The session keeps recent
+  envelopes for replay, holds early arrivals until their gap closes, asks
+  for what it misses, and on a digest mismatch the smaller history adopts
+  the larger one's snapshot in place (keeping its identity and sequence).
+- `examples/sync_peers.zig`: two processes over pipes walking through
+  concurrent commits, concurrent edits of one feature, an undo, a lost
+  frame replayed on request, and a divergence settled by a snapshot. The
+  `sync` example shows undo travelling and a concurrent edit converging.
+- `history()` units carry `remote`: the unit came from another replica.
 - `apps/geo/`: a small terminal editor over a globe timeline and region
   timelines, written against the public API only — the first real
   consumer. One command script drives live and pinned links, parameters,

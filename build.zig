@@ -74,6 +74,14 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "featime", .module = mod }},
         }),
     });
+    const session_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/session.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "featime", .module = mod }},
+        }),
+    });
 
     const test_step = b.step("test", "Run unit, differential, out-of-memory and fuzz tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
@@ -81,6 +89,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oracle_tests).step);
     test_step.dependOn(&b.addRunArtifact(oom_tests).step);
     test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+    test_step.dependOn(&b.addRunArtifact(session_tests).step);
 
     // API reference: `zig build docs`, then open zig-out/docs/index.html.
     const docs_obj = b.addObject(.{ .name = "featime", .root_module = mod });
@@ -102,6 +111,7 @@ pub fn build(b: *std.Build) void {
         "background_rebuild",
         "annotations",
         "sync",
+        "sync_peers",
         "history",
         "forks",
     };

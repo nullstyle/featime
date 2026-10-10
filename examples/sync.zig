@@ -4,7 +4,8 @@
 //! landing in the same order everywhere, duplicate and gap detection, and
 //! undo of a remote unit.
 //!
-//! Run: zig build sync
+//! Run: zig build sync. For two processes talking over pipes with the
+//! session protocol, see sync_peers.zig.
 
 const std = @import("std");
 const Io = std.Io;
@@ -149,11 +150,22 @@ fn demo(out: *Io.Writer, arena: std.mem.Allocator) !void {
         again.duplicate, skipped.gap, alice.expectedSeq(bob.replicaId()),
     });
 
-    // 4. Undo is uniform: alice undoes the remote unit she received from bob.
+    // 4. Undo travels the feed as the inverse edit: alice undoes the remote
+    //    unit she received from bob, and bob follows.
+    _ = try out_a.deliver(&bob, false); // drain what is pending first
     _ = alice.undo();
-    try out.print("alice undoes one remote unit: total {d} (bob still {d}); digests differ = {}\n", .{
-        alice.state().total, bob.state().total, alice.structureDigest() != bob.structureDigest(),
-    });
+    _ = try out_a.deliver(&bob, false);
+    try report(out, "alice undoes bob's unit; bob follows", &alice, &bob);
+
+    // 5. Concurrent edits of the same feature converge: the greater key
+    //    (sender clock, then replica id) wins on both sides.
+    var first = alice.features();
+    const base = first.next().?.id;
+    try alice.edit(base, .{ .add = 11 });
+    try bob.edit(base, .{ .add = 12 });
+    _ = try out_a.deliver(&bob, false);
+    _ = try out_b.deliver(&alice, false);
+    try report(out, "same feature edited on both sides", &alice, &bob);
 }
 
 pub fn main(init: std.process.Init) !void {

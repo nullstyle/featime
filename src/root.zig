@@ -128,6 +128,10 @@ pub fn Feature(comptime Op: type) type {
         /// Replicated order key (see `OrderKey`); zero on features that
         /// predate 0.10 files.
         order: OrderKey = .{},
+        /// Key of the last edit or suppression change: the writer's Lamport
+        /// clock and id. Across replicas the greater key wins, so concurrent
+        /// edits of one feature converge. Zero until the first edit.
+        edit: OrderKey = .{},
     };
 }
 

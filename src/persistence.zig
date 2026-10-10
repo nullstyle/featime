@@ -1,17 +1,19 @@
 //! Save/load timelines: a small versioned binary container framing
 //! application-encoded payloads.
 //!
-//! FTZ6 layout (all integers little-endian; "framed" = u32 length + bytes):
+//! FTZ7 layout (all integers little-endian; "framed" = u32 length + bytes):
 //!
-//!   magic "FTZ6"
+//!   magic "FTZ7"
 //!   u64 timeline_id
 //!   u32 format_version                (the app's `Domain.format_version`)
 //!   u32 link_count    × u64 timeline_id   (timelines the features link to; `peekHeader`)
 //!   framed seed document              (bytes from `Domain.encodeDoc`)
 //!   u32 feature_count × { u64 id, u8 suppressed, u64 order.lamport,
-//!                         u64 order.origin, framed op (`Domain.encodeOp`) }
+//!                         u64 order.origin, u64 edit.lamport, u64 edit.origin,
+//!                         framed op (`Domain.encodeOp`) }
 //!   u32 marker
-//!   u32 param_count   × { u64 id, u64 value (f64 bit pattern), framed name }
+//!   u32 param_count   × { u64 id, u64 value (f64 bit pattern), u64 key.lamport,
+//!                         u64 key.origin, framed name }
 //!   u32 seen_count    × { u64 origin, u64 seq }   (sync sequence bookkeeping)
 //!   --- annotation sections ---
 //!   u32 name_count    × { u64 feature_id, framed name }
@@ -50,7 +52,8 @@
 const std = @import("std");
 const ft = @import("root.zig");
 
-pub const magic = "FTZ6";
+pub const magic = "FTZ7";
+pub const magic_v6 = "FTZ6";
 pub const magic_v5 = "FTZ5";
 pub const magic_v4 = "FTZ4";
 pub const magic_v3 = "FTZ3";
@@ -201,6 +204,8 @@ fn saveUpTo(
         try writer.writeAll(&[1]u8{@intFromBool(f.suppressed)});
         try writer.writeInt(u64, f.order.lamport, .little);
         try writer.writeInt(u64, f.order.origin, .little);
+        try writer.writeInt(u64, f.edit.lamport, .little);
+        try writer.writeInt(u64, f.edit.origin, .little);
         var aw: std.Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
         Domain.encodeOp(f.op, &aw.writer) catch |err| return scratchError(err);
@@ -215,6 +220,8 @@ fn saveUpTo(
     for (tl.ptab.items()) |pm| {
         try writer.writeInt(u64, pm.id, .little);
         try writer.writeInt(u64, @bitCast(pm.value), .little);
+        try writer.writeInt(u64, pm.key.lamport, .little);
+        try writer.writeInt(u64, pm.key.origin, .little);
         try writeFramed(writer, pm.name);
     }
 
@@ -313,17 +320,18 @@ pub const Header = struct {
 
 pub fn peekHeader(gpa: std.mem.Allocator, reader: *std.Io.Reader) !Header {
     const head = try reader.take(4);
-    const v6 = std.mem.eql(u8, head, magic);
+    const v7 = std.mem.eql(u8, head, magic);
+    const v6 = std.mem.eql(u8, head, magic_v6);
     const v5 = std.mem.eql(u8, head, magic_v5);
     const v4 = std.mem.eql(u8, head, magic_v4);
     const v3 = std.mem.eql(u8, head, magic_v3);
     const v2 = std.mem.eql(u8, head, magic_v2);
-    if (!v6 and !v5 and !v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
+    if (!v7 and !v6 and !v5 and !v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
         return error.BadMagic;
     var h: Header = .{ .timeline_id = 0, .format_version = 0, .links = &.{} };
-    if (v6 or v5 or v4 or v3 or v2) h.timeline_id = try reader.takeInt(u64, .little);
-    if (v6 or v5 or v4) h.format_version = try reader.takeInt(u32, .little);
-    if (v6) {
+    if (v7 or v6 or v5 or v4 or v3 or v2) h.timeline_id = try reader.takeInt(u64, .little);
+    if (v7 or v6 or v5 or v4) h.format_version = try reader.takeInt(u32, .little);
+    if (v7 or v6) {
         // Grown one id at a time: a lying count stops at the end of input.
         const link_count = try reader.takeInt(u32, .little);
         var links: std.ArrayList(u64) = .empty;
@@ -378,19 +386,21 @@ pub fn load(
 ) anyerror!ft.Timeline(Domain) {
     validateCodecs(Domain);
     const head = try reader.take(4);
-    const v6 = std.mem.eql(u8, head, magic);
+    const v7 = std.mem.eql(u8, head, magic);
+    const v6 = std.mem.eql(u8, head, magic_v6);
     const v5 = std.mem.eql(u8, head, magic_v5);
     const v4 = std.mem.eql(u8, head, magic_v4);
     const v3 = std.mem.eql(u8, head, magic_v3);
     const v2 = std.mem.eql(u8, head, magic_v2);
-    if (!v6 and !v5 and !v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
+    if (!v7 and !v6 and !v5 and !v4 and !v3 and !v2 and !std.mem.eql(u8, head, magic_v1))
         return error.BadMagic;
-    const has_id = v6 or v5 or v4 or v3 or v2;
-    const has_format = v6 or v5 or v4;
-    const has_params = v6 or v5 or v4 or v3;
-    const has_annotations = v6 or v5 or v4 or v3 or v2;
-    const has_order = v6 or v5;
-    const has_links = v6;
+    const has_id = v7 or v6 or v5 or v4 or v3 or v2;
+    const has_format = v7 or v6 or v5 or v4;
+    const has_params = v7 or v6 or v5 or v4 or v3;
+    const has_annotations = v7 or v6 or v5 or v4 or v3 or v2;
+    const has_order = v7 or v6 or v5;
+    const has_links = v7 or v6;
+    const has_keys = v7;
 
     var timeline_id: u64 = 0;
     if (has_id) timeline_id = try reader.takeInt(u64, .little);
@@ -425,10 +435,16 @@ pub fn load(
             order.origin = try reader.takeInt(u64, .little);
             if (order.lamport > max_lamport) max_lamport = order.lamport;
         }
+        var edit: ft.OrderKey = .{};
+        if (has_keys) {
+            edit.lamport = try reader.takeInt(u64, .little);
+            edit.origin = try reader.takeInt(u64, .little);
+            if (edit.lamport > max_lamport) max_lamport = edit.lamport;
+        }
         var op_reader = try framedReader(gpa, reader);
         defer gpa.free(op_reader.bytes);
         const op = try decodeOpVersioned(Domain, stored_format, &op_reader.reader, gpa);
-        try tl.list.append(gpa, .{ .id = id, .op = op, .suppressed = suppressed, .order = order });
+        try tl.list.append(gpa, .{ .id = id, .op = op, .suppressed = suppressed, .order = order, .edit = edit });
     }
     try tl.rebuildIndex();
     tl.lamport = max_lamport;
@@ -439,9 +455,16 @@ pub fn load(
         while (pm < param_count) : (pm += 1) {
             const pid = try reader.takeInt(u64, .little);
             const value: f64 = @bitCast(try reader.takeInt(u64, .little));
+            var pkey: ft.OrderKey = .{};
+            if (has_keys) {
+                pkey.lamport = try reader.takeInt(u64, .little);
+                pkey.origin = try reader.takeInt(u64, .little);
+                if (pkey.lamport > max_lamport) max_lamport = pkey.lamport;
+            }
             const fr = try framedReader(gpa, reader);
             defer gpa.free(fr.bytes);
-            tl.ptab.add(pid, fr.bytes, value) catch {};
+            try tl.ptab.add(pid, fr.bytes, value);
+            _ = tl.ptab.setKeyed(pid, value, pkey);
         }
     }
     if (has_order) {
@@ -1093,4 +1116,23 @@ test "FTZ6 header lists the linked timelines; peekHeader reads it without the Do
     var header3 = try peekHeader(gpa, &reader3);
     defer header3.deinit(gpa);
     try std.testing.expectEqualSlices(u64, &.{7}, header3.links);
+}
+
+test "FTZ7 round-trips edit keys and parameter keys" {
+    const gpa = std.testing.allocator;
+    var tl = try ft.Timeline(LinkedDomain).init(gpa, .{}, .{});
+    defer tl.deinit();
+    const a = try tl.commit(.{ .add = 1 });
+    _ = try tl.commit(.{ .add = 2 });
+    try tl.edit(a, .{ .add = 3 });
+    try tl.setSuppressed(a, true);
+    const before = tl.structureDigest();
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try save(LinkedDomain, &tl, gpa, &aw.writer);
+    var reader = std.Io.Reader.fixed(aw.written());
+    var loaded = try load(LinkedDomain, gpa, .{}, &reader);
+    defer loaded.deinit();
+    try std.testing.expectEqual(before, loaded.structureDigest());
 }

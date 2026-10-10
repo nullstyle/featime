@@ -106,6 +106,8 @@ pub fn Journal(comptime Op: type) type {
             /// User label of the unit (`beginLabeledTransaction`); owned,
             /// carried by the unit's first record only.
             label: ?[]const u8 = null,
+            /// True when the record came from another replica (`applyRemote`).
+            remote: bool = false,
         };
 
         /// What a history unit did, for history panels. Multi-entry units
@@ -129,6 +131,8 @@ pub fn Journal(comptime Op: type) type {
             ts: u64,
             /// True when the unit has been undone (it sits in the redo region).
             undone: bool,
+            /// True when the unit was integrated from another replica.
+            remote: bool,
         };
 
         pub const UnitIter = struct {
@@ -152,6 +156,7 @@ pub fn Journal(comptime Op: type) type {
                     .label = first.label,
                     .ts = first.ts,
                     .undone = start >= it.j.head,
+                    .remote = first.remote,
                 };
                 it.i = end;
                 it.n += 1;
@@ -219,6 +224,9 @@ pub fn Journal(comptime Op: type) type {
         /// Open explicit-transaction depth. The first record after the
         /// outermost `beginTxn` carries the boundary flag.
         txn_depth: u32 = 0,
+        /// Set by the timeline while it integrates remote entries: records
+        /// made meanwhile are flagged `remote`.
+        remote_mode: bool = false,
         txn_pending: bool = false,
         /// Owned label waiting for the unit's first record.
         txn_label: ?[]const u8 = null,
@@ -397,7 +405,7 @@ pub fn Journal(comptime Op: type) type {
             for (self.live()[self.head..]) |*r| self.deinitRecord(r);
             self.entries.shrinkRetainingCapacity(self.start + self.head);
             const ts: u64 = if (self.clock) |now| now() else 0;
-            self.entries.append(self.gpa, .{ .e = entry, .txn_start = starts_unit, .ts = ts, .label = label }) catch {
+            self.entries.append(self.gpa, .{ .e = entry, .txn_start = starts_unit, .ts = ts, .label = label, .remote = self.remote_mode }) catch {
                 // Unreachable after `reserve`; kept as belt and braces. Out
                 // of memory here: drop history rather than keep a journal
                 // that lies about the timeline's past.

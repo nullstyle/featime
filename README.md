@@ -124,6 +124,7 @@ zig build persistence_roundtrip # save/load with app-written codecs
 zig build background_rebuild    # worker-thread jobs, cancellation, staleness
 zig build annotations           # names, tags, chapters, groups, provenance
 zig build sync                  # two replicas converging on journal entries
+zig build sync_peers            # two processes over pipes: the session protocol
 zig build history               # labeled transactions, history(), stats(), trim()
 zig build forks                 # savePrefix variants, cherryPick, format migration
 zig build examples              # all of the above
@@ -202,59 +203,83 @@ have.
 
 ## Sync
 
-The multiuser stopping point: journal entries as a wire vocabulary. The
-library ships the feed, deterministic placement of concurrent commits, and
-per-replica sequence bookkeeping; merge semantics beyond that (concurrent
-moves and removes, conflict policy) belong to the application.
+Journal entries are the wire vocabulary; replicas converge by exchanging
+them. The library ships the feed, the convergence rules, undo that travels,
+and a session protocol with catch-up, replay and snapshot repair. Any byte
+transport works: `examples/sync_peers.zig` runs two processes over pipes.
 
 ```zig
-// Producer side: every local edit, in record order, as an envelope
-// { origin: replica id, seq: 1, 2, 3, ..., lamport, entry }.
-tl.setRecordObserver(.{ .ctx = &outbox, .func = Outbox.observe });
+// One session per peer. Send its bytes to the peer; feed it the peer's bytes.
+var session = ft.sync.Session(MyApp).init(gpa, &tl);
+defer session.deinit();
+session.attach();                       // listens to the timeline's edits
+try session.hello();                    // who I am; the peer asks for what it misses
 
-// Consumer side: envelopes cross the wire via the Domain codecs...
-var env = try ft.sync.decode(MyApp, gpa, &reader);
-switch (tl.applyRemote(&env)) {      // journaled locally; observer NOT fired
-    .applied, .dropped, .duplicate, .own => {},
-    .gap => request(env.origin, tl.expectedSeq(env.origin)),
-}
-ft.sync.deinit(MyApp.Op, gpa, &env);
+// transport loop
+try writer.writeAll(session.outgoingBytes());
+session.clearOutgoing();
+const used = try session.receiveStream(bytes_from_peer); // a partial frame stays for next time
+try session.probe();                    // after a round: compare digests, repair if needed
 ```
 
-Every encoded envelope starts with `sync.wire_version` (4) and the app's
-`format_version`; `decode` rejects other wire versions with
-`error.UnsupportedWireVersion` instead of misparsing them.
+Under the session: every local edit reaches the record observer as an
+envelope `{ origin, seq, lamport, entry }` (`setRecordObserver`);
+`sync.encode` / `decode` turn envelopes into bytes; `applyRemote` integrates
+one and answers `.applied`, `.dropped` (unknown ids, a no-op, or an older
+concurrent change), `.duplicate`, `.gap` (not applied: fetch from
+`expectedSeq(origin)` first), `.own` (an echo) or `.out_of_memory` (nothing
+applied; deliver again later). Every encoded envelope starts with
+`sync.wire_version` (4) and the app's `format_version`.
 
 **Identity.** Feature/chapter/group/param ids are random-anchored per
 timeline (seed the anchor from OS randomness with `Config.id_seed` when
 replicas live in different processes). Replicas share a `timelineId`; each
 has its own `replicaId` (a loaded file is a new replica). Remote ids never
 move the local id counter, so two users committing concurrently get
-distinct ids.
+distinct ids. Containers persist the per-origin sequence bookkeeping, the
+order keys and the edit keys.
 
-**Order.** Every commit carries its predecessor and an order key (the
-origin's Lamport clock, origin id as tie-breaker). `applyRemote` places a
-remote commit right after its predecessor and then past every following
-feature whose key is greater — the same rule on every replica — so
-concurrent commits land in the same order everywhere, whatever the
-delivery order. An unknown predecessor (removed, or not received yet)
-falls back to the positional hint. Concurrent *moves* and *removes* are
-not reconciled: compare `structureDigest()` after a sync round and resync
-through a file when replicas disagree.
+**Convergence rules.**
 
-**Sequencing.** `applyRemote` answers `.applied`, `.dropped` (unknown ids,
-a no-op, or a commit already present), `.duplicate`, `.gap` (not applied:
-fetch from `expectedSeq(origin)` first), `.own` (an echo of this replica's
-envelope) or `.out_of_memory` (nothing applied, the sequence still
-expected: deliver the same envelope again later). `seq == 0` skips the check; `acknowledge(origin, seq)`
-resets expectations after a resync by other means. Containers persist the
-per-origin bookkeeping and the order keys.
+- *Commits* carry their predecessor and an order key (the origin's clock,
+  then its id). A remote commit lands after its predecessor and past every
+  following feature with a greater key — the same rule everywhere — so
+  concurrent commits end up in the same order whatever the delivery order.
+- *Edits, suppression and parameter values* carry the writer's key too
+  (`Feature.edit`, `Param.key`). The greater key wins, so two replicas
+  editing the same feature at once end up with the same op; a late envelope
+  with an older key is `.dropped`.
+- *Names, chapter and group names, renames*: last arrival wins. *Tags* are a
+  set; each replica keeps its own insertion order. *Moves* are positional;
+  concurrent moves can disagree.
+- `structureDigest()` covers order, suppression, edit keys and parameter
+  values. Equal digests mean the same features with the same ops and
+  parameters. Names, tags, chapters and groups are not covered.
+
+**Undo travels.** With an observer attached, `undo` and `redo` send the
+inverse of every step as fresh envelopes: a commit's undo is a remove, a
+remove's undo is a commit with its position, flag, name and tags, an edit's
+undo is an edit back with a new key. Replicas follow, so a shared session
+stays converged through undo. A replica may also undo a unit it received
+(`history()` units carry `remote`), which reverts it for everyone. Without
+an observer, undo is local, as before.
+
+**The session.** `Session(Domain)` keeps the last `retain_max` envelopes it
+sent for replay, holds envelopes that arrive early until their gap closes
+(`pending_max`), asks the peer for what it misses, and compares digests on
+`probe`. When they differ, the smaller history (fewer features, then the
+older clock, then the larger replica id) asks for a snapshot and adopts it
+in place, keeping its replica id and sequence; local edits the peer never
+saw are gone. `on_replaced` lets the app re-attach a registry or environment
+to the replaced timeline; `peer_digest` shows whether the two sides agree.
+Frames are `u32 length + tag + payload` (`sync.FrameTag`). One session per
+peer; envelopes are not relayed between peers.
 
 **Marker and jobs.** A remote insert at or before your marker shifts it by
 one so the features you were looking at stay in view (a marker at the tip
 follows the tip); a remote insert in the grey future leaves your slider
-alone. Remote integrations are journaled like local edits so undo is
-uniform, but never re-broadcast: replicas feeding each other cannot loop.
+alone. Remote integrations are journaled like local edits, flagged
+`remote`, and never re-broadcast: replicas feeding each other cannot loop.
 Structural remote entries bump the rebuild generation like local edits, so
 a background job that was in flight is rejected at `integrate` instead of
 being installed over a changed plan. `sync.lastWriterWins(local_meta,

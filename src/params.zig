@@ -8,6 +8,7 @@
 //! numeric scalars in v1.
 
 const std = @import("std");
+const ft = @import("root.zig");
 
 pub const ParamId = u64;
 
@@ -16,6 +17,8 @@ pub const Param = struct {
     /// Owned by the table.
     name: []const u8,
     value: f64,
+    /// Key of the last value change (last writer wins across replicas).
+    key: ft.OrderKey = .{},
 };
 
 pub const ParamTable = struct {
@@ -73,6 +76,18 @@ pub const ParamTable = struct {
         for (self.list.items) |*p| {
             if (p.id == id) {
                 p.value = value;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Set a value and the key of that change; false when the id is unknown.
+    pub fn setKeyed(self: *Self, id: ParamId, value: f64, key: ft.OrderKey) bool {
+        for (self.list.items) |*p| {
+            if (p.id == id) {
+                p.value = value;
+                p.key = key;
                 return true;
             }
         }

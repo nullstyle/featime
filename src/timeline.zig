@@ -277,15 +277,39 @@ pub fn Timeline(comptime Domain: type) type {
             // (with `max_journal = 0` the journal frees the entry's memory
             // at once). The journal then keeps only the strings that are
             // not live in the annotations: see `stripLive`.
-            if (!self.applying_remote) {
-                if (self.observer) |obs| {
-                    self.seq += 1;
-                    obs.func(obs.ctx, &.{ .origin = self.replica_id, .seq = self.seq, .lamport = lamport, .entry = entry });
-                }
-            }
+            self.emit(entry, lamport);
             var stored = entry;
             stripLive(&stored);
             self.journal.record(stored);
+        }
+
+        /// Hand an entry to the record observer as this replica's next
+        /// envelope: a local edit, or the inverse of one that undo or redo
+        /// just performed. Silent while integrating remote entries.
+        fn emit(self: *Self, entry: journaling.Journal(Op).Entry, lamport: u64) void {
+            if (self.applying_remote) return;
+            const obs = self.observer orelse return;
+            self.seq += 1;
+            obs.func(obs.ctx, &.{ .origin = self.replica_id, .seq = self.seq, .lamport = lamport, .entry = entry });
+        }
+
+        /// Emit an inverse entry with a fresh clock tick, if anyone listens.
+        fn emitInverse(self: *Self, entry: journaling.Journal(Op).Entry) void {
+            if (self.applying_remote or self.observer == null) return;
+            self.emit(entry, self.nextLamport());
+        }
+
+        /// The key a local value change gets: this replica's next clock
+        /// tick. Greater than every key seen so far, so the change wins on
+        /// every replica that sees it.
+        fn freshKey(self: *Self) ft.OrderKey {
+            return .{ .lamport = self.nextLamport(), .origin = self.replica_id };
+        }
+
+        fn tagTextAt(self: *const Self, id: ft.FeatureId, at: u32) ?[]const u8 {
+            const list = self.ann.tagList(id);
+            if (list.len == 0) return null;
+            return list[@min(at, list.len - 1)];
         }
 
         /// Strings that live in the annotations while an edit is applied
@@ -448,8 +472,10 @@ pub fn Timeline(comptime Domain: type) type {
             try self.journal.reserve(1);
             self.touch();
             const old_op = self.list.items[idx].op;
-            self.record(.{ .edit = .{ .id = id, .old_op = old_op, .new_op = new_op } });
+            const key = self.freshKey();
+            self.recordAt(.{ .edit = .{ .id = id, .old_op = old_op, .new_op = new_op } }, key.lamport);
             self.list.items[idx].op = new_op;
+            self.list.items[idx].edit = key;
             self.dropDeadLinks(old_op);
             self.invalidate(idx);
         }
@@ -524,8 +550,10 @@ pub fn Timeline(comptime Domain: type) type {
             const prev = self.list.items[idx].suppressed;
             if (prev == suppressed) return;
             self.touch();
-            self.record(.{ .suppress = .{ .id = self.list.items[idx].id, .prev = prev } });
+            const key = self.freshKey();
+            self.recordAt(.{ .suppress = .{ .id = self.list.items[idx].id, .prev = prev } }, key.lamport);
             self.list.items[idx].suppressed = suppressed;
+            self.list.items[idx].edit = key;
             if (suppressed) self.dropDeadLinks(self.list.items[idx].op);
             self.invalidate(idx);
         }
@@ -1270,8 +1298,9 @@ pub fn Timeline(comptime Domain: type) type {
             const old = self.ptab.valueOf(id) orelse return error.UnknownParam;
             if (old == value) return;
             try self.journal.reserve(1);
-            _ = self.ptab.set(id, value);
-            self.record(.{ .param_set = .{ .id = id, .old = old, .new = value } });
+            const key = self.freshKey();
+            _ = self.ptab.setKeyed(id, value, key);
+            self.recordAt(.{ .param_set = .{ .id = id, .old = old, .new = value } }, key.lamport);
             self.touch();
             self.invalidateReferencing(id);
         }
@@ -1389,7 +1418,7 @@ pub fn Timeline(comptime Domain: type) type {
         /// Remote integrations via `applyRemote` do not fire it. The
         /// envelope is borrowed — copy (or encode) what you need inside the
         /// callback.
-        pub fn setRecordObserver(self: *Self, observer: RecordObserver) void {
+        pub fn setRecordObserver(self: *Self, observer: ?RecordObserver) void {
             self.observer = observer;
         }
 
@@ -1465,8 +1494,13 @@ pub fn Timeline(comptime Domain: type) type {
             if (env.lamport > self.lamport) self.lamport = env.lamport;
             const prev = self.applying_remote;
             self.applying_remote = true;
-            defer self.applying_remote = prev;
-            const result = self.applyRemoteInner(&env.entry);
+            const prev_mode = self.journal.remote_mode;
+            self.journal.remote_mode = true;
+            defer {
+                self.applying_remote = prev;
+                self.journal.remote_mode = prev_mode;
+            }
+            const result = self.applyRemoteInner(env);
             if (result == .out_of_memory) {
                 // Nothing changed. The sequence stays unacknowledged, so
                 // the sender can deliver the same envelope again.
@@ -1477,14 +1511,25 @@ pub fn Timeline(comptime Domain: type) type {
             return result;
         }
 
-        /// A hash of the feature order and suppression flags. Replicas that
-        /// agree on it have the same structure; compare after a sync round
-        /// to detect divergence.
+        /// A hash of the feature order, suppression flags and edit keys, and
+        /// of the parameter values. Replicas that agree on it have the same
+        /// structure and the same ops (an op differs only if its edit key
+        /// does); compare after a sync round to detect divergence. Names,
+        /// tags, chapters and groups are not covered.
         pub fn structureDigest(self: *const Self) u64 {
             var h = std.hash.Wyhash.init(0x5EED);
             for (self.list.items) |f| {
                 h.update(std.mem.asBytes(&f.id));
                 h.update(&[1]u8{@intFromBool(f.suppressed)});
+                h.update(std.mem.asBytes(&f.edit.lamport));
+                h.update(std.mem.asBytes(&f.edit.origin));
+            }
+            for (self.ptab.items()) |p| {
+                h.update(std.mem.asBytes(&p.id));
+                const bits: u64 = @bitCast(p.value);
+                h.update(std.mem.asBytes(&bits));
+                h.update(std.mem.asBytes(&p.key.lamport));
+                h.update(std.mem.asBytes(&p.key.origin));
             }
             return h.final();
         }
@@ -1501,10 +1546,14 @@ pub fn Timeline(comptime Domain: type) type {
             return pos;
         }
 
-        fn applyRemoteInner(self: *Self, entry: *const Entry) ApplyResult {
+        fn applyRemoteInner(self: *Self, env: *const Envelope) ApplyResult {
             // Every arm allocates what it needs before it changes anything,
-            // so `.out_of_memory` always means "nothing happened".
-            switch (entry.*) {
+            // so `.out_of_memory` always means "nothing happened". Value
+            // changes (edit, suppress, parameter set) carry the sender's
+            // clock as their key: the greater key wins, so concurrent
+            // changes converge everywhere.
+            const key: ft.OrderKey = .{ .lamport = env.lamport, .origin = env.origin };
+            switch (env.entry) {
                 .commit => |e| {
                     // Re-delivery is possible in any feed protocol: a
                     // commit whose id already exists here was integrated.
@@ -1528,14 +1577,17 @@ pub fn Timeline(comptime Domain: type) type {
                 },
                 .edit => |e| {
                     const idx = self.indexOf(e.id) orelse return .dropped;
+                    const f = &self.list.items[idx];
+                    if (!key.greaterThan(f.edit)) return .dropped; // an older concurrent edit lost
                     self.touch();
-                    const old_op = self.list.items[idx].op;
+                    const old_op = f.op;
                     self.journal.record(.{ .edit = .{
                         .id = e.id,
                         .old_op = old_op,
                         .new_op = e.new_op,
                     } });
-                    self.list.items[idx].op = e.new_op;
+                    f.op = e.new_op;
+                    f.edit = key;
                     self.dropDeadLinks(old_op);
                     self.invalidate(idx);
                 },
@@ -1544,15 +1596,19 @@ pub fn Timeline(comptime Domain: type) type {
                     self.removeAt(idx) catch return .out_of_memory;
                 },
                 .suppress => |e| {
-                    // `prev` is the flag before the edit; a replica that
-                    // already shows the new flag has nothing to do.
                     const idx = self.indexOf(e.id) orelse return .dropped;
-                    const prev_flag = self.list.items[idx].suppressed;
-                    if (prev_flag != e.prev) return .dropped;
+                    const f = &self.list.items[idx];
+                    if (!key.greaterThan(f.edit)) return .dropped; // an older concurrent change lost
+                    if (f.suppressed == !e.prev) {
+                        // Already showing the new flag: just adopt the key.
+                        f.edit = key;
+                        return .dropped;
+                    }
                     self.touch();
-                    self.journal.record(.{ .suppress = .{ .id = e.id, .prev = prev_flag } });
-                    self.list.items[idx].suppressed = !e.prev;
-                    if (!e.prev) self.dropDeadLinks(self.list.items[idx].op);
+                    self.journal.record(.{ .suppress = .{ .id = e.id, .prev = f.suppressed } });
+                    f.suppressed = !e.prev;
+                    f.edit = key;
+                    if (!e.prev) self.dropDeadLinks(f.op);
                     self.invalidate(idx);
                 },
                 .move => |e| {
@@ -1667,11 +1723,15 @@ pub fn Timeline(comptime Domain: type) type {
                     self.invalidateReferencing(e.id);
                 },
                 .param_set => |e| {
-                    const old = self.ptab.valueOf(e.id) orelse return .dropped;
-                    if (old == e.new) return .dropped;
+                    const current = self.ptab.byId(e.id) orelse return .dropped;
+                    if (!key.greaterThan(current.key)) return .dropped;
+                    if (current.value == e.new) {
+                        _ = self.ptab.setKeyed(e.id, e.new, key);
+                        return .dropped;
+                    }
                     self.touch();
-                    _ = self.ptab.set(e.id, e.new);
-                    self.journal.record(.{ .param_set = .{ .id = e.id, .old = old, .new = e.new } });
+                    _ = self.ptab.setKeyed(e.id, e.new, key);
+                    self.journal.record(.{ .param_set = .{ .id = e.id, .old = current.value, .new = e.new } });
                     self.invalidateReferencing(e.id);
                 },
                 .param_rename => |e| {
@@ -1878,6 +1938,9 @@ pub fn Timeline(comptime Domain: type) type {
             return out;
         }
 
+        /// Undo one journal entry. With a record observer attached, the
+        /// inverse goes out on the feed as a fresh envelope, so replicas
+        /// follow an undo like any other edit.
         fn reverse(self: *Self, entry: *journaling.Journal(Op).Entry) void {
             switch (entry.*) {
                 .commit => |e| {
@@ -1893,12 +1956,16 @@ pub fn Timeline(comptime Domain: type) type {
                     self.marker_pos = e.at;
                     self.invalidate(idx);
                     self.annTouch();
+                    self.emitInverse(.{ .remove = .{ .id = e.id, .op = e.op, .at = e.at, .suppressed = false, .marker_pre = e.at } });
                 },
                 .edit => |e| {
                     const idx = self.indexOf(e.id) orelse return;
+                    const key = self.freshKey();
                     self.list.items[idx].op = e.old_op;
+                    self.list.items[idx].edit = key;
                     self.dropDeadLinks(e.new_op);
                     self.invalidate(idx);
+                    if (self.observer != null) self.emit(.{ .edit = .{ .id = e.id, .old_op = e.new_op, .new_op = e.old_op } }, key.lamport);
                 },
                 .remove => |*e| {
                     // Needs no memory: the removal left free slots in the
@@ -1925,12 +1992,28 @@ pub fn Timeline(comptime Domain: type) type {
                         self.ann.giveTagList(e.id, list) catch {};
                     }
                     self.annTouch();
+                    // The inverse for replicas: a commit (placed by its
+                    // predecessor and order key), a move to pin the exact
+                    // position, then the flag and annotations it came with.
+                    const after: ?ft.FeatureId = if (e.at > 0) self.list.items[e.at - 1].id else null;
+                    self.emitInverse(.{ .commit = .{ .id = e.id, .op = e.op, .at = e.at, .meta = e.meta, .after = after, .order = e.order } });
+                    self.emitInverse(.{ .move = .{ .id = e.id, .from = e.at, .to = e.at, .marker_pre = self.marker_pos } });
+                    if (e.suppressed) {
+                        const key = self.freshKey();
+                        if (self.indexOf(e.id)) |idx| self.list.items[idx].edit = key;
+                        if (self.observer != null) self.emit(.{ .suppress = .{ .id = e.id, .prev = false } }, key.lamport);
+                    }
+                    if (self.ann.nameOf(e.id)) |n| self.emitInverse(.{ .name_set = .{ .id = e.id, .old = null, .new = n } });
+                    for (self.ann.tagList(e.id)) |t| self.emitInverse(.{ .tag_add = .{ .id = e.id, .tag = t } });
                 },
                 .suppress => |e| {
                     const idx = self.indexOf(e.id) orelse return;
+                    const key = self.freshKey();
                     self.list.items[idx].suppressed = e.prev;
+                    self.list.items[idx].edit = key;
                     if (e.prev) self.dropDeadLinks(self.list.items[idx].op);
                     self.invalidate(idx);
+                    if (self.observer != null) self.emit(.{ .suppress = .{ .id = e.id, .prev = !e.prev } }, key.lamport);
                 },
                 .move => |e| {
                     self.rawMove(e.id, e.from);
@@ -1939,6 +2022,7 @@ pub fn Timeline(comptime Domain: type) type {
                     // adjustment started from the post-undo marker).
                     self.marker_pos = e.marker_pre;
                     self.annTouch();
+                    self.emitInverse(.{ .move = .{ .id = e.id, .from = e.to, .to = e.from, .marker_pre = e.marker_pre } });
                 },
                 .name_set => |*e| {
                     // Swap, no memory: the live name moves into the entry,
@@ -1947,10 +2031,12 @@ pub fn Timeline(comptime Domain: type) type {
                     e.old = null;
                     e.new = live;
                     self.annTouch();
+                    self.emitInverse(.{ .name_set = .{ .id = e.id, .old = e.new, .new = self.ann.nameOf(e.id) } });
                 },
                 .tag_add => |*e| {
                     e.tag = self.ann.takeTagAt(e.id, e.at);
                     self.annTouch();
+                    if (e.tag) |text| self.emitInverse(.{ .tag_remove = .{ .id = e.id, .tag = text } });
                 },
                 .tag_remove => |*e| {
                     if (e.tag) |text| {
@@ -1958,6 +2044,7 @@ pub fn Timeline(comptime Domain: type) type {
                         self.ann.giveTagAt(e.id, text, e.at) catch {};
                     }
                     self.annTouch();
+                    if (self.tagTextAt(e.id, e.at)) |text| self.emitInverse(.{ .tag_add = .{ .id = e.id, .tag = text } });
                 },
                 .group_add => |*e| {
                     if (self.ann.takeGroup(e.id)) |taken| {
@@ -1965,6 +2052,7 @@ pub fn Timeline(comptime Domain: type) type {
                         e.first = taken.group.first;
                         e.last = taken.group.last;
                         e.at = taken.at;
+                        self.emitInverse(.{ .group_remove = .{ .id = e.id, .first = e.first, .last = e.last, .name = e.name } });
                     }
                     self.annTouch();
                 },
@@ -1974,12 +2062,14 @@ pub fn Timeline(comptime Domain: type) type {
                         self.ann.giveGroupAt(.{ .id = e.id, .name = n, .first = e.first, .last = e.last }, e.at) catch {};
                     }
                     self.annTouch();
+                    if (self.ann.groupById(e.id)) |g| self.emitInverse(.{ .group_add = .{ .id = e.id, .first = g.first, .last = g.last, .name = g.name } });
                 },
                 .group_rename => |*e| {
                     if (e.old) |o| {
                         if (self.ann.swapGroupName(e.id, o)) |live| {
                             e.old = null;
                             e.new = live;
+                            if (self.ann.groupById(e.id)) |g| self.emitInverse(.{ .group_rename = .{ .id = e.id, .old = live, .new = g.name } });
                         }
                     }
                     self.annTouch();
@@ -1988,6 +2078,7 @@ pub fn Timeline(comptime Domain: type) type {
                     if (self.ptab.take(e.id)) |taken| {
                         e.name = taken.param.name;
                         e.at = taken.at;
+                        self.emitInverse(.{ .param_remove = .{ .id = e.id, .name = e.name, .value = taken.param.value } });
                     }
                 },
                 .param_remove => |*e| {
@@ -1996,16 +2087,20 @@ pub fn Timeline(comptime Domain: type) type {
                         self.ptab.giveAt(.{ .id = e.id, .name = n, .value = e.value }, e.at) catch {};
                     }
                     self.invalidateReferencing(e.id);
+                    if (self.ptab.byId(e.id)) |pm| self.emitInverse(.{ .param_add = .{ .id = e.id, .name = pm.name, .value = pm.value } });
                 },
                 .param_set => |e| {
-                    _ = self.ptab.set(e.id, e.old);
+                    const key = self.freshKey();
+                    _ = self.ptab.setKeyed(e.id, e.old, key);
                     self.invalidateReferencing(e.id);
+                    if (self.observer != null) self.emit(.{ .param_set = .{ .id = e.id, .old = e.new, .new = e.old } }, key.lamport);
                 },
                 .param_rename => |*e| {
                     if (e.old) |o| {
                         if (self.ptab.swapName(e.id, o)) |live| {
                             e.old = null;
                             e.new = live;
+                            if (self.ptab.byId(e.id)) |pm| self.emitInverse(.{ .param_rename = .{ .id = e.id, .old = live, .new = pm.name } });
                         }
                     }
                 },
@@ -2014,6 +2109,7 @@ pub fn Timeline(comptime Domain: type) type {
                         e.name = taken.chapter.name;
                         e.mark = taken.chapter.mark;
                         e.at = taken.at;
+                        self.emitInverse(.{ .chapter_remove = .{ .id = e.id, .mark = e.mark, .name = e.name } });
                     }
                     self.annTouch();
                 },
@@ -2023,12 +2119,14 @@ pub fn Timeline(comptime Domain: type) type {
                         self.ann.giveChapterAt(.{ .id = e.id, .name = n, .mark = e.mark }, e.at) catch {};
                     }
                     self.annTouch();
+                    if (self.ann.chapterById(e.id)) |c| self.emitInverse(.{ .chapter_add = .{ .id = e.id, .mark = c.mark, .name = c.name } });
                 },
                 .chapter_rename => |*e| {
                     if (e.old) |o| {
                         if (self.ann.swapChapterName(e.id, o)) |live| {
                             e.old = null;
                             e.new = live;
+                            if (self.ann.chapterById(e.id)) |c| self.emitInverse(.{ .chapter_rename = .{ .id = e.id, .old = live, .new = c.name } });
                         }
                     }
                     self.annTouch();
@@ -2036,6 +2134,7 @@ pub fn Timeline(comptime Domain: type) type {
             }
         }
 
+        /// Redo one journal entry; see `reverse` for the feed behaviour.
         fn forward(self: *Self, entry: *journaling.Journal(Op).Entry) void {
             switch (entry.*) {
                 .commit => |e| {
@@ -2043,12 +2142,19 @@ pub fn Timeline(comptime Domain: type) type {
                     self.afterInsert(e.at);
                     if (e.meta) |m| self.ann.setProvenance(e.id, m) catch {};
                     if (e.meta != null) self.annTouch();
+                    self.emitInverse(entry.*);
+                    // Replicas place the commit by predecessor and key; the
+                    // move pins the exact position this replica has.
+                    self.emitInverse(.{ .move = .{ .id = e.id, .from = e.at, .to = e.at, .marker_pre = self.marker_pos } });
                 },
                 .edit => |e| {
                     const idx = self.indexOf(e.id) orelse return;
+                    const key = self.freshKey();
                     self.list.items[idx].op = e.new_op;
+                    self.list.items[idx].edit = key;
                     self.dropDeadLinks(e.old_op);
                     self.invalidate(idx);
+                    if (self.observer != null) self.emit(.{ .edit = .{ .id = e.id, .old_op = e.old_op, .new_op = e.new_op } }, key.lamport);
                 },
                 .remove => |*e| {
                     const idx = self.indexOf(e.id) orelse return;
@@ -2064,23 +2170,29 @@ pub fn Timeline(comptime Domain: type) type {
                     self.marker_pos = if (e.at < e.marker_pre) e.marker_pre - 1 else e.marker_pre;
                     self.invalidate(idx);
                     self.annTouch();
+                    self.emitInverse(.{ .remove = .{ .id = e.id, .op = e.op, .at = e.at, .suppressed = e.suppressed, .marker_pre = e.marker_pre } });
                 },
                 .suppress => |e| {
                     const idx = self.indexOf(e.id) orelse return;
+                    const key = self.freshKey();
                     self.list.items[idx].suppressed = !e.prev;
+                    self.list.items[idx].edit = key;
                     if (!e.prev) self.dropDeadLinks(self.list.items[idx].op);
                     self.invalidate(idx);
+                    if (self.observer != null) self.emit(.{ .suppress = .{ .id = e.id, .prev = e.prev } }, key.lamport);
                 },
                 .move => |e| {
                     self.rawMove(e.id, e.to);
                     self.ann.applyGroupFixesForward(e.group_fixes);
                     self.annTouch();
+                    self.emitInverse(.{ .move = .{ .id = e.id, .from = e.from, .to = e.to, .marker_pre = e.marker_pre } });
                 },
                 .name_set => |*e| {
                     const live = self.ann.swapName(e.id, e.new);
                     e.new = null;
                     e.old = live;
                     self.annTouch();
+                    self.emitInverse(.{ .name_set = .{ .id = e.id, .old = e.old, .new = self.ann.nameOf(e.id) } });
                 },
                 .tag_add => |*e| {
                     if (e.tag) |text| {
@@ -2088,10 +2200,12 @@ pub fn Timeline(comptime Domain: type) type {
                         self.ann.giveTagAt(e.id, text, e.at) catch {};
                     }
                     self.annTouch();
+                    if (self.tagTextAt(e.id, e.at)) |text| self.emitInverse(.{ .tag_add = .{ .id = e.id, .tag = text } });
                 },
                 .tag_remove => |*e| {
                     e.tag = self.ann.takeTagAt(e.id, e.at);
                     self.annTouch();
+                    if (e.tag) |text| self.emitInverse(.{ .tag_remove = .{ .id = e.id, .tag = text } });
                 },
                 .group_add => |*e| {
                     if (e.name) |n| {
@@ -2099,6 +2213,7 @@ pub fn Timeline(comptime Domain: type) type {
                         self.ann.giveGroupAt(.{ .id = e.id, .name = n, .first = e.first, .last = e.last }, e.at) catch {};
                     }
                     self.annTouch();
+                    if (self.ann.groupById(e.id)) |g| self.emitInverse(.{ .group_add = .{ .id = e.id, .first = g.first, .last = g.last, .name = g.name } });
                 },
                 .group_remove => |*e| {
                     if (self.ann.takeGroup(e.id)) |taken| {
@@ -2106,6 +2221,7 @@ pub fn Timeline(comptime Domain: type) type {
                         e.first = taken.group.first;
                         e.last = taken.group.last;
                         e.at = taken.at;
+                        self.emitInverse(.{ .group_remove = .{ .id = e.id, .first = e.first, .last = e.last, .name = e.name } });
                     }
                     self.annTouch();
                 },
@@ -2114,6 +2230,7 @@ pub fn Timeline(comptime Domain: type) type {
                         if (self.ann.swapGroupName(e.id, n)) |live| {
                             e.new = null;
                             e.old = live;
+                            if (self.ann.groupById(e.id)) |g| self.emitInverse(.{ .group_rename = .{ .id = e.id, .old = live, .new = g.name } });
                         }
                     }
                     self.annTouch();
@@ -2124,24 +2241,29 @@ pub fn Timeline(comptime Domain: type) type {
                         self.ptab.giveAt(.{ .id = e.id, .name = n, .value = e.value }, e.at) catch {};
                     }
                     self.invalidateReferencing(e.id);
+                    if (self.ptab.byId(e.id)) |pm| self.emitInverse(.{ .param_add = .{ .id = e.id, .name = pm.name, .value = pm.value } });
                 },
                 .param_remove => |*e| {
                     if (self.ptab.take(e.id)) |taken| {
                         e.name = taken.param.name;
                         e.value = taken.param.value;
                         e.at = taken.at;
+                        self.emitInverse(.{ .param_remove = .{ .id = e.id, .name = e.name, .value = e.value } });
                     }
                     self.invalidateReferencing(e.id);
                 },
                 .param_set => |e| {
-                    _ = self.ptab.set(e.id, e.new);
+                    const key = self.freshKey();
+                    _ = self.ptab.setKeyed(e.id, e.new, key);
                     self.invalidateReferencing(e.id);
+                    if (self.observer != null) self.emit(.{ .param_set = .{ .id = e.id, .old = e.old, .new = e.new } }, key.lamport);
                 },
                 .param_rename => |*e| {
                     if (e.new) |n| {
                         if (self.ptab.swapName(e.id, n)) |live| {
                             e.new = null;
                             e.old = live;
+                            if (self.ptab.byId(e.id)) |pm| self.emitInverse(.{ .param_rename = .{ .id = e.id, .old = live, .new = pm.name } });
                         }
                     }
                 },
@@ -2151,12 +2273,14 @@ pub fn Timeline(comptime Domain: type) type {
                         self.ann.giveChapterAt(.{ .id = e.id, .name = n, .mark = e.mark }, e.at) catch {};
                     }
                     self.annTouch();
+                    if (self.ann.chapterById(e.id)) |c| self.emitInverse(.{ .chapter_add = .{ .id = e.id, .mark = c.mark, .name = c.name } });
                 },
                 .chapter_remove => |*e| {
                     if (self.ann.takeChapter(e.id)) |taken| {
                         e.name = taken.chapter.name;
                         e.mark = taken.chapter.mark;
                         e.at = taken.at;
+                        self.emitInverse(.{ .chapter_remove = .{ .id = e.id, .mark = e.mark, .name = e.name } });
                     }
                     self.annTouch();
                 },
@@ -2165,6 +2289,7 @@ pub fn Timeline(comptime Domain: type) type {
                         if (self.ann.swapChapterName(e.id, n)) |live| {
                             e.new = null;
                             e.old = live;
+                            if (self.ann.chapterById(e.id)) |c| self.emitInverse(.{ .chapter_rename = .{ .id = e.id, .old = live, .new = c.name } });
                         }
                     }
                     self.annTouch();
@@ -5845,4 +5970,162 @@ test "links: a backward reference into a timeline being evaluated works" {
     _ = b.trim(.{ .checkpoints = 0 });
     try std.testing.expectEqual(@as(i64, 10), a.state().value);
     try std.testing.expectEqual(ft.Status.ok, firstStatus(&a, 1));
+}
+
+// ---------------------------------------------------------------------------
+// Sync: convergence rules and shared undo
+// ---------------------------------------------------------------------------
+
+/// Two replicas agree when their digests, documents, names and tags match.
+fn replicasAgree(a: *SyncTl, b: *SyncTl) bool {
+    if (a.structureDigest() != b.structureDigest()) return false;
+    if (a.state().value != b.state().value) return false;
+    if (a.len() != b.len()) return false;
+    var it = a.features();
+    while (it.next()) |f| {
+        const na = a.featureName(f.id);
+        const nb = b.featureName(f.id);
+        if ((na == null) != (nb == null)) return false;
+        if (na != null and !std.mem.eql(u8, na.?, nb.?)) return false;
+        // Tags are a set: their order is each replica's own insertion order.
+        const ta = a.tags(f.id);
+        const tb = b.tags(f.id);
+        if (ta.len != tb.len) return false;
+        for (ta) |x| {
+            var found = false;
+            for (tb) |y| {
+                if (std.mem.eql(u8, x, y)) found = true;
+            }
+            if (!found) return false;
+        }
+    }
+    return a.paramsList().len == b.paramsList().len;
+}
+
+test "sync: concurrent edits of one feature converge on the greater key" {
+    const gpa = std.testing.allocator;
+    var out_a: Outbox = .{ .gpa = gpa };
+    defer out_a.deinit();
+    var out_b: Outbox = .{ .gpa = gpa };
+    defer out_b.deinit();
+    var alice = try SyncTl.init(gpa, .{}, .{ .id_seed = 1 });
+    defer alice.deinit();
+    var bob = try SyncTl.init(gpa, .{}, .{ .id_seed = 2 });
+    defer bob.deinit();
+    alice.setRecordObserver(.{ .ctx = &out_a, .func = Outbox.observe });
+    bob.setRecordObserver(.{ .ctx = &out_b, .func = Outbox.observe });
+
+    const f = try alice.commit(.{ .add = 1 });
+    const p = try alice.addParam("k", 1.0);
+    try out_a.feed(&bob);
+    try std.testing.expect(replicasAgree(&alice, &bob));
+
+    // Both edit the same feature and the same parameter at the same time.
+    try alice.edit(f, .{ .add = 10 });
+    try alice.setParam(p, 2.0);
+    try bob.edit(f, .{ .add = 20 });
+    try bob.setParam(p, 3.0);
+    try alice.setSuppressed(f, true);
+    try bob.setSuppressed(f, true);
+    try out_a.feed(&bob);
+    try out_b.feed(&alice);
+    try std.testing.expect(replicasAgree(&alice, &bob));
+    try std.testing.expectEqual(alice.paramValue(p).?, bob.paramValue(p).?);
+
+    // Both keep editing after converging: still one answer.
+    try bob.edit(f, .{ .add = 7 });
+    try out_b.feed(&alice);
+    try alice.setSuppressed(f, false);
+    try out_a.feed(&bob);
+    try std.testing.expect(replicasAgree(&alice, &bob));
+    try std.testing.expectEqual(@as(i64, 7), alice.state().value);
+}
+
+test "sync: an edit arriving late with an older key is dropped" {
+    const gpa = std.testing.allocator;
+    var tl = try SyncTl.init(gpa, .{}, .{});
+    defer tl.deinit();
+    const f = try tl.commit(.{ .add = 1 });
+    try tl.edit(f, .{ .add = 5 });
+    const stale: SyncTl.Envelope = .{ .origin = foreign_origin, .seq = 0, .lamport = 1, .entry = .{ .edit = .{ .id = f, .old_op = .{ .add = 1 }, .new_op = .{ .add = 99 } } } };
+    try std.testing.expectEqual(SyncTl.ApplyResult.dropped, tl.applyRemote(&stale));
+    try std.testing.expectEqual(@as(i64, 5), tl.state().value);
+    // A newer one wins.
+    try std.testing.expectEqual(SyncTl.ApplyResult.applied, tl.applyRemote(&remote(.{ .edit = .{ .id = f, .old_op = .{ .add = 5 }, .new_op = .{ .add = 99 } } })));
+    try std.testing.expectEqual(@as(i64, 99), tl.state().value);
+}
+
+test "sync: undo and redo travel the feed as inverse edits" {
+    const gpa = std.testing.allocator;
+    var out_a: Outbox = .{ .gpa = gpa };
+    defer out_a.deinit();
+    var alice = try SyncTl.init(gpa, .{}, .{ .id_seed = 3 });
+    defer alice.deinit();
+    var bob = try SyncTl.init(gpa, .{}, .{ .id_seed = 4 });
+    defer bob.deinit();
+    alice.setRecordObserver(.{ .ctx = &out_a, .func = Outbox.observe });
+
+    const a = try alice.commit(.{ .add = 1 });
+    const b = try alice.commit(.{ .add = 2 });
+    try alice.edit(b, .{ .add = 5 });
+    try alice.setSuppressed(a, true);
+    try alice.setFeatureName(b, "bee");
+    try alice.addTag(b, "t1");
+    try alice.addTag(b, "t2");
+    try alice.removeTag(b, "t1");
+    const p = try alice.addParam("k", 1.0);
+    try alice.setParam(p, 4.0);
+    try alice.move(b, 0);
+    _ = try alice.addChapter("ch", .{ .after = b });
+    try alice.remove(a);
+    try out_a.feed(&bob);
+    try std.testing.expect(replicasAgree(&alice, &bob));
+    const steps = alice.undoDepth();
+
+    // Every undo reaches bob as the inverse edit; every redo as the edit again.
+    var k: u32 = 0;
+    while (k < steps) : (k += 1) {
+        try std.testing.expect(alice.undo());
+        try out_a.feed(&bob);
+        try std.testing.expect(replicasAgree(&alice, &bob));
+    }
+    try std.testing.expectEqual(@as(u32, 0), alice.len());
+    k = 0;
+    while (k < steps) : (k += 1) {
+        try std.testing.expect(alice.redo());
+        try out_a.feed(&bob);
+        try std.testing.expect(replicasAgree(&alice, &bob));
+    }
+    try std.testing.expectEqual(@as(i64, 5), alice.state().value);
+    try std.testing.expectEqualStrings("bee", bob.featureName(b).?);
+}
+
+test "sync: a replica can undo a remote unit and everyone follows" {
+    const gpa = std.testing.allocator;
+    var out_a: Outbox = .{ .gpa = gpa };
+    defer out_a.deinit();
+    var out_b: Outbox = .{ .gpa = gpa };
+    defer out_b.deinit();
+    var alice = try SyncTl.init(gpa, .{}, .{ .id_seed = 5 });
+    defer alice.deinit();
+    var bob = try SyncTl.init(gpa, .{}, .{ .id_seed = 6 });
+    defer bob.deinit();
+    alice.setRecordObserver(.{ .ctx = &out_a, .func = Outbox.observe });
+    bob.setRecordObserver(.{ .ctx = &out_b, .func = Outbox.observe });
+
+    _ = try alice.commit(.{ .add = 1 });
+    try out_a.feed(&bob);
+    _ = try bob.commit(.{ .add = 10 });
+    try out_b.feed(&alice);
+    try std.testing.expectEqual(@as(i64, 11), alice.state().value);
+
+    // Alice undoes bob's commit (the newest unit on her journal, flagged remote).
+    var it = alice.history();
+    var last_remote = false;
+    while (it.next()) |u| last_remote = u.remote;
+    try std.testing.expect(last_remote);
+    try std.testing.expect(alice.undo());
+    try out_a.feed(&bob);
+    try std.testing.expect(replicasAgree(&alice, &bob));
+    try std.testing.expectEqual(@as(i64, 1), bob.state().value);
 }
